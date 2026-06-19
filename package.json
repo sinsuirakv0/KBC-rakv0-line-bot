@@ -1,0 +1,24 @@
+{
+  "name": "kbc-rakv0-line-bot",
+  "version": "0.1.0",
+  "description": "KBC LINE OpenChat bot powered by LINEJS",
+  "main": "dist/main.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "dev": "tsx src/main.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@evex/linejs": "npm:@jsr/evex__linejs@^3.1.4",
+    "dotenv": "^16.4.7",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.10",
+    "@types/qrcode": "^1.5.6",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
