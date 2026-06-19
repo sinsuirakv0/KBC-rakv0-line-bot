@@ -1,8 +1,8 @@
 import { buildEntitySearch, type EntitySearchEntry } from "../search/entitySearch.js";
-import { omoroirieDataPath } from "../search/dataPaths.js";
+import { searchDataPath } from "../search/dataPaths.js";
 import { createEntitySearchCommand } from "./entitySearchCommand.js";
 
-const searchUnits = buildEntitySearch<EntitySearchEntry>(omoroirieDataPath("charaname.json"));
+const searchUnits = buildEntitySearch<EntitySearchEntry>(searchDataPath("charaname.json"));
 
 export const unitCommand = createEntitySearchCommand({
 	name: "unit",

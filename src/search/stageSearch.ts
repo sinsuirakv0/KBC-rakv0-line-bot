@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { normalizeSearchText } from "./entitySearch.js";
-import { OMOROIRIE_DATA_DIR, omoroirieDataPath } from "./dataPaths.js";
+import { SEARCH_DATA_DIR, searchDataPath } from "./dataPaths.js";
 
 export interface StageEntry {
 	stageIdRaw: number;
@@ -70,7 +70,7 @@ function loadData(): { stages: StageEntry[]; maps: MapEntry[] } {
 	const maps: MapEntry[] = [];
 	const mapNames = new Map<number, string>();
 
-	for (const line of fs.readFileSync(omoroirieDataPath("Map_Name.csv"), "utf8").split(/\r?\n/)) {
+	for (const line of fs.readFileSync(searchDataPath("Map_Name.csv"), "utf8").split(/\r?\n/)) {
 		if (!line || line === "@") continue;
 		const comma = line.indexOf(",");
 		if (comma < 0) continue;
@@ -81,14 +81,14 @@ function loadData(): { stages: StageEntry[]; maps: MapEntry[] } {
 		maps.push({ mapIdRaw: raw, mapId: encodeMapId(raw), mapName: name });
 	}
 
-	const files = fs.readdirSync(OMOROIRIE_DATA_DIR)
+	const files = fs.readdirSync(SEARCH_DATA_DIR)
 		.filter((file) => file.startsWith("StageName") && file.endsWith("_ja.csv"))
 		.sort();
 	for (const file of files) {
 		const category = file.replace(/^StageName_?/, "").replace(/_ja\.csv$/, "");
 		if (category === "3") continue;
 		const numericCategory = /^\d+$/.test(category);
-		const lines = fs.readFileSync(path.join(OMOROIRIE_DATA_DIR, file), "utf8").split(/\r?\n/);
+		const lines = fs.readFileSync(path.join(SEARCH_DATA_DIR, file), "utf8").split(/\r?\n/);
 		for (let mapIndex = 0; mapIndex < lines.length; mapIndex++) {
 			const names = lines[mapIndex].split(",").map((name) => name.trim())
 				.filter((name) => name && name !== "@" && name !== "＠");

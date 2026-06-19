@@ -1,9 +1,9 @@
 import path from "node:path";
 
-export const OMOROIRIE_DATA_DIR = path.resolve(
-	process.env.OMOROIRIE_DATA_DIR || "./data/omoroirie",
+export const SEARCH_DATA_DIR = path.resolve(
+	process.env.SEARCH_DATA_DIR || "./data/search",
 );
 
-export function omoroirieDataPath(fileName: string): string {
-	return path.join(OMOROIRIE_DATA_DIR, fileName);
+export function searchDataPath(fileName: string): string {
+	return path.join(SEARCH_DATA_DIR, fileName);
 }
