@@ -32,6 +32,7 @@ COMMAND_PREFIX=!
 ENABLE_TALK=true
 ENABLE_SQUARE=true
 KBC_EVENT_RAW_BASE_URL=https://raw.githubusercontent.com/sinsuirakv0/KBC-rakv0-event/main
+OMOROIRIE_DATA_DIR=/app/data/omoroirie
 ```
 
 `LINE_EMAIL`、`LINE_PASSWORD`、`LINE_AUTH_TOKEN` は secret として扱ってください。`LINE_AUTH_TOKEN` は空で問題ありません。永続 volume に `/app/storage/storage.json` があれば、保存済み auth token と E2EE 鍵で起動します。

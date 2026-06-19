@@ -50,7 +50,20 @@ OpenChat、個人チャット、通常グループで次のコマンドを使え
 !item レアチケット
 !item 827 json
 !item 827 r
+!unit ネコ
+!unit 0
+!unit ネコ origin f
+!enemy わんこ
+!enemy 0
+!enemy わんこ origin
+!stage 日本編
+!stage 0000-000
+!stage 3000
 ```
+
+`unit` / `enemy` / `stage` はそれぞれ `ut` / `tut` / `st` でも呼び出せます。名前検索では全角英数字、ひらがな/カタカナ、長音記号を正規化します。完全な表記で絞りたい場合は検索語の末尾に `-force` または `-f` を付けます。
+
+ユニット・敵ユニット・ステージ検索は [Sugar2550/omoroirie](https://github.com/Sugar2550/omoroirie) の実装とデータを、作者の許可を得てLINE向けに移植しています。詳細は [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) を参照してください。
 
 `gatya` / `sale` / `item` は既定で `https://raw.githubusercontent.com/sinsuirakv0/KBC-rakv0-event/main/data/...` からイベントデータを取得します。別ブランチやローカルミラーを使う場合は `.env` に `KBC_EVENT_RAW_BASE_URL` を設定してください。
 

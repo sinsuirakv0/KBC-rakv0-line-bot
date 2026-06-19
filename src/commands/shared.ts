@@ -29,6 +29,7 @@ export interface CommandContext {
 
 export interface LineCommand {
 	name: string;
+	aliases?: string[];
 	execute(context: CommandContext): Promise<void>;
 }
 

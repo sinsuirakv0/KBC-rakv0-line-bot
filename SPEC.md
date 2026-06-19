@@ -157,6 +157,13 @@ D:\KBC\KBC-rakv0-line-bot
 - `!item 827` -> giftType 詳細。giftType に無い場合は eventId でフォールバック検索
 - `!item レアチケット` -> アイテム名検索
 - `!item 827 json` / `!item 827 r` -> JSON / raw 表示
+- `!unit ネコ` / `!ut ネコ` -> ユニット名・ID検索
+- `!unit ネコ origin f` -> 指定形態のユニット画像URL
+- `!enemy わんこ` / `!tut わんこ` -> 敵ユニット名・ID検索
+- `!enemy わんこ origin` -> 敵ユニット画像URL
+- `!stage 日本編` / `!st 日本編` -> マップ・ステージ名・ID検索
+
+ユニット・敵ユニット・ステージ検索は、作者の許可を得て `Sugar2550/omoroirie` の検索規則とデータをLINE向けに移植している。候補選択はDiscordリアクションではなく、ID付き一覧を返して再検索する方式とする。出典の詳細は `THIRD_PARTY_NOTICES.md` に記録する。
 
 `gatya` / `sale` / `item` は `KBC_EVENT_RAW_BASE_URL` または既定の GitHub raw URL から `KBC-rakv0-event/data` を取得する。返信が長い場合は複数メッセージへ分割する。
 
