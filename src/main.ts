@@ -4,6 +4,8 @@ import { handleLineCommand } from "./commands/index.js";
 import type { ReplyableLineMessage } from "./commands/shared.js";
 import { handlePing } from "./handlers/ping.js";
 import { createLineClient } from "./lineClient.js";
+import { startEventUpdateServer } from "./server/eventUpdateServer.js";
+import { pushSubscriptionStore } from "./subscriptions/store.js";
 
 interface RawTalkMessage {
 	id: string;
@@ -42,15 +44,47 @@ async function dispatchText(
 async function handleSquareMessage(message: SquareMessage): Promise<void> {
 	if (await message.isMyMessage()) return;
 	if (typeof message.text !== "string") return;
-	await dispatchText("square", message.text, message);
+	await dispatchText("square", message.text, new SquareReplyTarget(message));
+}
+
+class SquareReplyTarget implements ReplyableLineMessage {
+	readonly destination;
+
+	constructor(private readonly message: SquareMessage) {
+		this.destination = {
+			kind: "square" as const,
+			chatMid: message.to.id,
+			chatType: "SQUARE" as const,
+			senderMid: message.from.id,
+			encrypted: false,
+		};
+	}
+
+	async reply(text: string): Promise<void> {
+		await this.message.reply(text);
+	}
+
+	async send(text: string): Promise<void> {
+		await this.message.send(text);
+	}
 }
 
 class RawTalkReplyTarget implements ReplyableLineMessage {
+	readonly destination;
+
 	constructor(
 		private readonly client: Client,
 		private readonly raw: RawTalkMessage,
 		private readonly ownMid: string,
-	) {}
+	) {
+		this.destination = {
+			kind: "talk" as const,
+			chatMid: this.sendTo(),
+			chatType: this.chatType(),
+			senderMid: raw.from,
+			encrypted: this.isEncrypted(),
+		};
+	}
 
 	async reply(text: string): Promise<void> {
 		await this.sendTalk(text, this.raw.id);
@@ -70,6 +104,12 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 			return this.raw.to;
 		}
 		return this.raw.from === this.ownMid ? this.raw.to : this.raw.from;
+	}
+
+	private chatType(): "USER" | "GROUP" | "ROOM" {
+		if (this.raw.toType === "GROUP" || this.raw.to.startsWith("c")) return "GROUP";
+		if (this.raw.toType === "ROOM" || this.raw.to.startsWith("r")) return "ROOM";
+		return "USER";
 	}
 
 	private async sendTalk(text: string, relatedMessageId?: string): Promise<void> {
@@ -143,6 +183,7 @@ function listenRawTalkEvents(client: Client, ownMid: string, signal: AbortSignal
 
 async function main(): Promise<void> {
 	const client = await createLineClient();
+	await pushSubscriptionStore.initialize();
 	const profile = await client.getMyProfile();
 	console.log(`[line] logged in as ${profile.displayName} (${profile.mid})`);
 	try {
@@ -153,9 +194,11 @@ async function main(): Promise<void> {
 	}
 
 	const controller = new AbortController();
+	const eventUpdateServer = startEventUpdateServer(client);
 	const shutdown = () => {
 		console.log("[app] shutting down");
 		controller.abort();
+		eventUpdateServer.close();
 	};
 
 	process.once("SIGINT", shutdown);

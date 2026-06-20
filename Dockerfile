@@ -23,7 +23,9 @@ COPY data ./data
 
 RUN mkdir -p /app/storage /app/logs
 
+EXPOSE 3000
+
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-	CMD node -e "const fs=require('fs'); const cmd=fs.readFileSync('/proc/1/cmdline','utf8'); process.exit(cmd.includes('dist/main.js') ? 0 : 1)"
+	CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 CMD ["node", "dist/main.js"]

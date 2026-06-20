@@ -19,6 +19,15 @@ const cache = new Map<string, { expiresAt: number; value: unknown }>();
 export interface ReplyableLineMessage {
 	reply(text: string): Promise<void>;
 	send(text: string): Promise<void>;
+	destination: LineDestination;
+}
+
+export interface LineDestination {
+	kind: "talk" | "square";
+	chatMid: string;
+	chatType: "USER" | "GROUP" | "ROOM" | "SQUARE";
+	senderMid: string;
+	encrypted: boolean;
 }
 
 export interface CommandContext {

@@ -35,6 +35,18 @@ export const appConfig = {
 	commandPrefix: process.env.COMMAND_PREFIX || "!",
 	enableTalk: boolEnv("ENABLE_TALK", true),
 	enableSquare: boolEnv("ENABLE_SQUARE", true),
+	port: Number(process.env.PORT || process.env.EVENT_UPDATE_PORT || 3000),
+	eventUpdateSecret: process.env.EVENT_UPDATE_SECRET || "",
+	pushSubscriptionsFile: path.resolve(
+		process.env.PUSH_SUBSCRIPTIONS_FILE || "./storage/push-subscriptions.json",
+	),
+	pushSubscriptionsGithubRepo: process.env.PUSH_SUBSCRIPTIONS_GITHUB_REPO || "",
+	pushSubscriptionsGithubPath:
+		process.env.PUSH_SUBSCRIPTIONS_GITHUB_PATH || "push-subscriptions.json",
+	pushSubscriptionsGithubBranch:
+		process.env.PUSH_SUBSCRIPTIONS_GITHUB_BRANCH || "main",
+	pushSubscriptionsGithubToken:
+		process.env.PUSH_SUBSCRIPTIONS_GITHUB_TOKEN || "",
 };
 
 export function getPasswordCredentials(): { email: string; password: string } {

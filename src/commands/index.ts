@@ -3,6 +3,7 @@ import type { LineCommand, ReplyableLineMessage } from "./shared.js";
 import { enemyCommand } from "./enemy.js";
 import { gatyaCommand } from "./gatya.js";
 import { itemCommand } from "./item.js";
+import { pushskdCommand } from "./pushskd.js";
 import { saleCommand } from "./sale.js";
 import { stageCommand } from "./stage.js";
 import { unitCommand } from "./unit.js";
@@ -16,6 +17,7 @@ for (const command of [
 	unitCommand,
 	enemyCommand,
 	stageCommand,
+	pushskdCommand,
 ]) {
 	commands.set(command.name, command);
 	for (const alias of command.aliases ?? []) commands.set(alias, command);
