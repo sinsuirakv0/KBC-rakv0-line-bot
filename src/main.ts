@@ -41,16 +41,19 @@ async function dispatchText(
 	}
 }
 
-async function handleSquareMessage(message: SquareMessage): Promise<void> {
+async function handleSquareMessage(client: Client, message: SquareMessage): Promise<void> {
 	if (await message.isMyMessage()) return;
 	if (typeof message.text !== "string") return;
-	await dispatchText("square", message.text, new SquareReplyTarget(message));
+	await dispatchText("square", message.text, new SquareReplyTarget(client, message));
 }
 
 class SquareReplyTarget implements ReplyableLineMessage {
 	readonly destination;
 
-	constructor(private readonly message: SquareMessage) {
+	constructor(
+		readonly client: Client,
+		private readonly message: SquareMessage,
+	) {
 		this.destination = {
 			kind: "square" as const,
 			chatMid: message.to.id,
@@ -73,7 +76,7 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 	readonly destination;
 
 	constructor(
-		private readonly client: Client,
+		readonly client: Client,
 		private readonly raw: RawTalkMessage,
 		private readonly ownMid: string,
 	) {
@@ -205,7 +208,7 @@ async function main(): Promise<void> {
 	process.once("SIGTERM", shutdown);
 
 	client.on("square:message", (message) => {
-		void handleSquareMessage(message);
+		void handleSquareMessage(client, message);
 	});
 
 	client.on("square:event", (event) => {

@@ -6,6 +6,7 @@ import { itemCommand } from "./item.js";
 import { pushskdCommand } from "./pushskd.js";
 import { saleCommand } from "./sale.js";
 import { stageCommand } from "./stage.js";
+import { testCommand } from "./test.js";
 import { unitCommand } from "./unit.js";
 
 const commands = new Map<string, LineCommand>();
@@ -18,6 +19,7 @@ for (const command of [
 	enemyCommand,
 	stageCommand,
 	pushskdCommand,
+	testCommand,
 ]) {
 	commands.set(command.name, command);
 	for (const alias of command.aliases ?? []) commands.set(alias, command);

@@ -19,6 +19,7 @@ const cache = new Map<string, { expiresAt: number; value: unknown }>();
 export interface ReplyableLineMessage {
 	reply(text: string): Promise<void>;
 	send(text: string): Promise<void>;
+	client: Client;
 	destination: LineDestination;
 }
 
@@ -218,3 +219,4 @@ export async function sendLong(message: ReplyableLineMessage, text: string, lang
 export async function sendError(message: ReplyableLineMessage, text: string): Promise<void> {
 	await message.reply(`エラー: ${text}`);
 }
+import type { Client } from "@evex/linejs";

@@ -57,7 +57,7 @@ export async function notifyScheduleUpdate(
 	payload: EventUpdatePayload,
 ): Promise<{ sent: number; skipped: boolean }> {
 	// The detected phase has no finalized history URL. Notify only after files are saved.
-	if (payload.phase !== "updated" || payload.test === true) return { sent: 0, skipped: true };
+	if (payload.phase !== "updated") return { sent: 0, skipped: true };
 
 	const types = normalizeTypes(payload.types);
 	if (types.length === 0) throw new Error("updated types are empty");
@@ -65,11 +65,12 @@ export async function notifyScheduleUpdate(
 		throw new Error("historyUrl is required for an updated notification");
 	}
 
+	const isTest = payload.test === true;
 	const key = notificationKey(payload, types);
-	if (pushSubscriptionStore.hasNotified(key)) return { sent: 0, skipped: true };
+	if (!isTest && pushSubscriptionStore.hasNotified(key)) return { sent: 0, skipped: true };
 
 	const text = [
-		"スケジュール更新を検知しました。",
+		`${isTest ? "【テスト】" : ""}スケジュール更新を検知しました。`,
 		`更新種類: ${types.map((type) => TYPE_LABELS[type] ?? type).join("、")}`,
 		`検知時間: ${formatDetectedAt(payload.detectedAt)}`,
 		`履歴: ${payload.historyUrl}`,
@@ -94,7 +95,7 @@ export async function notifyScheduleUpdate(
 		}
 	}
 
-	if (sent > 0) await pushSubscriptionStore.markNotified(key);
+	if (sent > 0 && !isTest) await pushSubscriptionStore.markNotified(key);
 	for (const failure of failures) console.error(`[event-update] delivery failed: ${failure}`);
 	if (failures.length > 0 && sent === 0) throw new Error("all LINE notification deliveries failed");
 	return { sent, skipped: false };
