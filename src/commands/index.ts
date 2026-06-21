@@ -3,6 +3,7 @@ import type { LineCommand, ReplyableLineMessage } from "./shared.js";
 import { enemyCommand } from "./enemy.js";
 import { gatyaCommand } from "./gatya.js";
 import { itemCommand } from "./item.js";
+import { pushCommand } from "./push.js";
 import { pushskdCommand } from "./pushskd.js";
 import { saleCommand } from "./sale.js";
 import { stageCommand } from "./stage.js";
@@ -19,6 +20,7 @@ for (const command of [
 	enemyCommand,
 	stageCommand,
 	pushskdCommand,
+	pushCommand,
 	testCommand,
 ]) {
 	commands.set(command.name, command);

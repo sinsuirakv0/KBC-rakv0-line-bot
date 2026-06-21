@@ -4,6 +4,8 @@ import { handleLineCommand } from "./commands/index.js";
 import type { ReplyableLineMessage } from "./commands/shared.js";
 import { handlePing } from "./handlers/ping.js";
 import { createLineClient, isAuthenticationError } from "./lineClient.js";
+import { startEventPushScheduler } from "./eventPush/scheduler.js";
+import { eventPushStore } from "./eventPush/store.js";
 import { startEventUpdateServer } from "./server/eventUpdateServer.js";
 import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineStorage.js";
 import { pushSubscriptionStore } from "./subscriptions/store.js";
@@ -81,7 +83,10 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	}
 
 	async send(text: string): Promise<void> {
-		await this.message.send(text);
+		await this.client.base.square.sendMessage({
+			squareChatMid: this.destination.chatMid,
+			text,
+		});
 	}
 }
 
@@ -316,7 +321,11 @@ async function main(): Promise<void> {
 	process.once("SIGINT", shutdown);
 	process.once("SIGTERM", shutdown);
 
-	await pushSubscriptionStore.initialize();
+	await Promise.all([
+		pushSubscriptionStore.initialize(),
+		eventPushStore.initialize(),
+	]);
+	startEventPushScheduler(() => activeClient, shutdownController.signal);
 	const storage = await initializeLineStorage();
 	while (!shutdownController.signal.aborted) {
 		try {

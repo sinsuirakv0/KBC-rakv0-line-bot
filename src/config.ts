@@ -64,6 +64,18 @@ export const appConfig = {
 	lineStorageBackupKey: process.env.LINE_STORAGE_BACKUP_KEY || "",
 	loginRetryMs: Number(process.env.LINE_LOGIN_RETRY_MS || 15_000),
 	authWatchdogMs: Number(process.env.LINE_AUTH_WATCHDOG_MS || 60_000),
+	eventPushSubscriptionsFile: path.resolve(
+		process.env.EVENT_PUSH_SUBSCRIPTIONS_FILE || "./storage/event-push-subscriptions.json",
+	),
+	eventPushStateFile: path.resolve(
+		process.env.EVENT_PUSH_STATE_FILE || "./storage/event-push-state.json",
+	),
+	eventPushSubscriptionsGithubPath:
+		process.env.EVENT_PUSH_SUBSCRIPTIONS_GITHUB_PATH || "subscriptions/event-start.json",
+	eventPushStateGithubPath:
+		process.env.EVENT_PUSH_STATE_GITHUB_PATH || "state/event-start-notifications.json",
+	eventPushIntervalMs: Number(process.env.EVENT_PUSH_INTERVAL_MS || 15_000),
+	eventPushLookbackMs: Number(process.env.EVENT_PUSH_LOOKBACK_MS || 10 * 60_000),
 };
 
 export function getPasswordCredentials(): { email: string; password: string } {
