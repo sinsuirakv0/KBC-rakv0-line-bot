@@ -64,6 +64,8 @@ export const appConfig = {
 	lineStorageBackupKey: process.env.LINE_STORAGE_BACKUP_KEY || "",
 	loginRetryMs: Number(process.env.LINE_LOGIN_RETRY_MS || 15_000),
 	authWatchdogMs: Number(process.env.LINE_AUTH_WATCHDOG_MS || 60_000),
+	talkPollTimeoutMs: Number(process.env.LINE_TALK_POLL_TIMEOUT_MS || 5_000),
+	talkPollIntervalMs: Number(process.env.LINE_TALK_POLL_INTERVAL_MS || 250),
 	eventPushSubscriptionsFile: path.resolve(
 		process.env.EVENT_PUSH_SUBSCRIPTIONS_FILE || "./storage/event-push-subscriptions.json",
 	),

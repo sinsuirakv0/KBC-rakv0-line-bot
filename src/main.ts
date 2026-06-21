@@ -16,6 +16,7 @@ interface RawTalkMessage {
 	from: string;
 	to: string;
 	toType: string;
+	createdTime?: number | bigint;
 	text?: string;
 	chunks?: unknown;
 	contentMetadata?: Record<string, string>;
@@ -23,7 +24,19 @@ interface RawTalkMessage {
 
 interface RawTalkEvent {
 	type: string;
+	revision?: number | bigint;
 	message?: RawTalkMessage;
+}
+
+interface RawTalkSyncResponse {
+	fullSyncResponse?: {
+		nextRevision?: number | bigint;
+	};
+	operationResponse?: {
+		globalEvents?: { lastRevision?: number | bigint };
+		individualEvents?: { lastRevision?: number | bigint };
+		operations?: RawTalkEvent[];
+	};
 }
 
 interface ParsedTalkText {
@@ -44,6 +57,7 @@ interface RawSquareEvent {
 }
 
 let warnedEncryptedTalk = false;
+let activeHandlers = 0;
 const senderNames = new Map<string, string>();
 const senderNameRequests = new Map<string, Promise<string | undefined>>();
 const squareScopeRequests = new Map<string, Promise<string>>();
@@ -57,6 +71,8 @@ async function dispatchText(
 	messageText: string,
 	message: ReplyableLineMessage,
 ): Promise<void> {
+	const startedAt = Date.now();
+	activeHandlers += 1;
 	try {
 		if (messageText === `${appConfig.commandPrefix}ping`) {
 			rankingStore.record(message.destination);
@@ -65,6 +81,13 @@ async function dispatchText(
 		if (await handleLineCommand(messageText, message)) return;
 	} catch (error) {
 		console.error(`[${channel}:message] handler failed`, error);
+	} finally {
+		const elapsedMs = Date.now() - startedAt;
+		if (elapsedMs >= 1_000 || messageText === `${appConfig.commandPrefix}ping`) {
+			const command = messageText.slice(appConfig.commandPrefix.length).trim().split(/\s+/, 1)[0] || "unknown";
+			console.log(`[perf] ${channel} !${command} handler=${elapsedMs}ms concurrent=${activeHandlers}`);
+		}
+		activeHandlers -= 1;
 	}
 }
 
@@ -72,29 +95,38 @@ async function handleSquareMessage(client: Client, message: SquareMessage): Prom
 	if (await message.isMyMessage()) return;
 	if (typeof message.text !== "string") return;
 	if (!message.text.startsWith(appConfig.commandPrefix)) return;
-	const scopeMid = await resolveSquareScope(client, message.to.id);
+	const scopeMid = await resolveSquareScope(client, message.to.id, message.from.id);
 	const target = new SquareReplyTarget(
 		client,
 		message,
 		scopeMid,
 		senderNames.get(`square:${message.from.id}`),
 	);
+	await dispatchText("square", message.text, target);
 	void resolveSenderName(client, "square", message.from.id)
 		.then((name) => {
 			if (name) rankingStore.updateName("square", message.from.id, name);
 		});
-	await dispatchText("square", message.text, target);
 }
 
-function resolveSquareScope(client: Client, squareChatMid: string): Promise<string> {
+function resolveSquareScope(client: Client, squareChatMid: string, senderMid: string): Promise<string> {
 	let request = squareScopeRequests.get(squareChatMid);
 	if (!request) {
-		request = client.base.square.getSquareChat({ squareChatMid })
-			.then((response) => response.squareChat.squareMid)
+		request = client.base.square.getSquareMember({ squareMemberMid: senderMid })
+			.then((response) => {
+				const member = response.squareMember;
+				if (member.displayName) senderNames.set(`square:${senderMid}`, member.displayName);
+				return member.squareMid;
+			})
 			.catch((error) => {
-				squareScopeRequests.delete(squareChatMid);
-				console.warn(`[ranking] failed to resolve parent OpenChat for ${squareChatMid}`, error);
-				return squareChatMid;
+				console.warn(`[ranking] member lookup failed for ${senderMid}; falling back to chat lookup`, error);
+				return client.base.square.getSquareChat({ squareChatMid })
+					.then((response) => response.squareChat.squareMid)
+					.catch((fallbackError) => {
+						squareScopeRequests.delete(squareChatMid);
+						console.warn(`[ranking] failed to resolve parent OpenChat for ${squareChatMid}`, fallbackError);
+						return squareChatMid;
+					});
 			});
 		squareScopeRequests.set(squareChatMid, request);
 	}
@@ -280,16 +312,22 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 	const parsed = await readTalkText(client, raw);
 	if (parsed === null) return;
 	if (!parsed.text.startsWith(appConfig.commandPrefix)) return;
-	void resolveSenderName(client, "talk", raw.from)
-		.then((name) => {
-			if (name) rankingStore.updateName("talk", raw.from, name);
-		});
-
+	const createdAt = Number(raw.createdTime);
+	if (Number.isFinite(createdAt) && createdAt > 1_500_000_000_000) {
+		const receiveLagMs = Math.max(0, Date.now() - createdAt);
+		if (receiveLagMs >= 1_000 || parsed.text === `${appConfig.commandPrefix}ping`) {
+			console.log(`[perf] talk receiveLag=${receiveLagMs}ms`);
+		}
+	}
 	await dispatchText(
 		"talk",
 		parsed.text,
 		new RawTalkReplyTarget(client, raw, ownMid, parsed.mentionMids),
 	);
+	void resolveSenderName(client, "talk", raw.from)
+		.then((name) => {
+			if (name) rankingStore.updateName("talk", raw.from, name);
+		});
 }
 
 function handlePollingError(
@@ -304,21 +342,53 @@ function handlePollingError(
 	console.error(`[${channel}:event] polling error`, error);
 }
 
+function isTimeoutError(error: unknown): boolean {
+	const detail = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+	return /timeout|timed out|aborted due to timeout/i.test(detail);
+}
+
 async function listenRawTalkEvents(
 	client: Client,
 	ownMid: string,
 	signal: AbortSignal,
 	onFatal: (error: unknown) => void,
 ): Promise<void> {
-	const polling = client.base.createPolling();
-	for await (const event of polling._listenTalkEvents({
-		signal,
-		pollingInterval: 500,
-		onError: (error) => handlePollingError("talk", error, onFatal),
-	}) as AsyncIterable<RawTalkEvent>) {
-		if (signal.aborted) break;
-		void handleRawTalkEvent(client, ownMid, event)
-			.catch((error) => handlePollingError("talk", error, onFatal));
+	let revision: number | bigint = 0;
+	let globalRev: number | bigint = 0;
+	let individualRev: number | bigint = 0;
+	// Keep the wait bounded: LINEJS defaults sync() to a 180-second long poll.
+	while (!signal.aborted) {
+		try {
+			const pollStartedAt = Date.now();
+			const response = await client.base.talk.sync({
+				revision,
+				globalRev,
+				individualRev,
+				limit: 100,
+				timeout: appConfig.talkPollTimeoutMs,
+			}) as RawTalkSyncResponse;
+			const nextRevision = response.fullSyncResponse?.nextRevision;
+			if (nextRevision !== undefined) revision = nextRevision;
+			const nextGlobalRev = response.operationResponse?.globalEvents?.lastRevision;
+			if (nextGlobalRev !== undefined) globalRev = nextGlobalRev;
+			const nextIndividualRev = response.operationResponse?.individualEvents?.lastRevision;
+			if (nextIndividualRev !== undefined) individualRev = nextIndividualRev;
+
+			const operations = response.operationResponse?.operations ?? [];
+			if (operations.length > 0) {
+				console.log(`[perf] talk poll=${Date.now() - pollStartedAt}ms events=${operations.length}`);
+			}
+			for (const event of operations) {
+				if (event.revision !== undefined) revision = event.revision;
+				void handleRawTalkEvent(client, ownMid, event)
+					.catch((error) => handlePollingError("talk", error, onFatal));
+			}
+		} catch (error) {
+			if (!signal.aborted && !isTimeoutError(error)) {
+				handlePollingError("talk", error, onFatal);
+			}
+		}
+		await sleepUntilRetry(appConfig.talkPollIntervalMs, signal);
 	}
 }
 
@@ -340,10 +410,10 @@ async function listenRawSquareEvents(
 				? event.payload?.receiveMessage?.squareMessage
 				: undefined;
 		if (!rawMessage) continue;
-		await handleSquareMessage(client, new SquareMessage({
+		void handleSquareMessage(client, new SquareMessage({
 			client,
 			raw: rawMessage as never,
-		}));
+		})).catch((error) => handlePollingError("square", error, onFatal));
 	}
 }
 
@@ -396,6 +466,13 @@ async function runSession(
 	}
 
 	console.log("[app] bot is listening");
+	let eventLoopCheckedAt = Date.now();
+	const eventLoopMonitor = setInterval(() => {
+		const now = Date.now();
+		const lagMs = Math.max(0, now - eventLoopCheckedAt - 10_000);
+		if (lagMs >= 1_000) console.warn(`[perf] event-loop lag=${lagMs}ms`);
+		eventLoopCheckedAt = now;
+	}, 10_000);
 	let watchdogRunning = false;
 	const watchdog = setInterval(() => {
 		if (watchdogRunning || controller.signal.aborted) return;
@@ -414,6 +491,7 @@ async function runSession(
 		await Promise.race([waitForAbort(shutdownSignal), sessionFailure]);
 	} finally {
 		clearInterval(watchdog);
+		clearInterval(eventLoopMonitor);
 		controller.abort();
 		shutdownSignal.removeEventListener("abort", relayShutdown);
 	}

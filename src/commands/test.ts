@@ -13,6 +13,7 @@ interface GitTreeEntry {
 
 async function fetchLatestHistory(): Promise<{ unix: number; types: string[] }> {
 	const response = await fetch(EVENT_REPO_TREE_API, {
+		signal: AbortSignal.timeout(10_000),
 		headers: {
 			Accept: "application/vnd.github.v3+json",
 			"User-Agent": "KBC-rakv0-line-bot",

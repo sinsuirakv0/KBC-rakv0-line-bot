@@ -15,6 +15,36 @@ export const WEEKDAY_JA_MAP: Record<string, string> = {
 };
 
 const cache = new Map<string, { expiresAt: number; value: unknown }>();
+const pendingFetches = new Map<string, Promise<unknown>>();
+const FETCH_TIMEOUT_MS = 10_000;
+
+async function cachedFetch<T>(
+	key: string,
+	ttlMs: number,
+	loader: () => Promise<T>,
+): Promise<T> {
+	const cached = cache.get(key);
+	if (cached && cached.expiresAt > Date.now()) return cached.value as T;
+
+	let pending = pendingFetches.get(key) as Promise<T> | undefined;
+	if (!pending) {
+		pending = loader().then((value) => {
+			cache.set(key, { expiresAt: Date.now() + ttlMs, value });
+			return value;
+		}).finally(() => {
+			pendingFetches.delete(key);
+		});
+		pendingFetches.set(key, pending);
+	}
+
+	if (cached) {
+		void pending.catch((error) => {
+			console.warn(`[data] background refresh failed for ${key}`, error);
+		});
+		return cached.value as T;
+	}
+	return pending;
+}
 
 export interface ReplyableLineMessage {
 	reply(text: string): Promise<void>;
@@ -132,26 +162,20 @@ export function formatTimeBlock(block: TimeBlock): string {
 
 export async function fetchText(path: string, ttlMs = 60_000): Promise<string> {
 	const url = `${RAW_BASE_URL}/${path}`;
-	const cached = cache.get(url);
-	if (cached && cached.expiresAt > Date.now()) return cached.value as string;
-
-	const response = await fetch(url);
-	if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status}`);
-	const value = await response.text();
-	cache.set(url, { expiresAt: Date.now() + ttlMs, value });
-	return value;
+	return cachedFetch(`text:${url}`, ttlMs, async () => {
+		const response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+		if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status}`);
+		return response.text();
+	});
 }
 
 export async function fetchJson<T>(path: string, ttlMs = 60_000): Promise<T> {
 	const url = `${RAW_BASE_URL}/${path}`;
-	const cached = cache.get(url);
-	if (cached && cached.expiresAt > Date.now()) return cached.value as T;
-
-	const response = await fetch(url);
-	if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status}`);
-	const value = await response.json() as T;
-	cache.set(url, { expiresAt: Date.now() + ttlMs, value });
-	return value;
+	return cachedFetch(`json:${url}`, ttlMs, async () => {
+		const response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+		if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status}`);
+		return response.json() as Promise<T>;
+	});
 }
 
 export async function fetchCsvMap(path: string): Promise<Map<number, string>> {
