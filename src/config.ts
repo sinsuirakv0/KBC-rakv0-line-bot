@@ -23,11 +23,24 @@ function loginMethod(): LoginMethod {
 	throw new Error(`Invalid LINE_LOGIN_METHOD: ${value}`);
 }
 
+function loginPin(): string {
+	const value = process.env.LINE_LOGIN_PIN || "114514";
+	if (!/^\d{6}$/.test(value)) throw new Error("LINE_LOGIN_PIN must be exactly 6 digits");
+	return value;
+}
+
+function subscriptionsGithubPath(): string {
+	const value = process.env.PUSH_SUBSCRIPTIONS_GITHUB_PATH || "subscriptions/push-subscriptions.json";
+	// Migrate the path used by the first deployment to the folder layout.
+	return value === "push-subscriptions.json" ? "subscriptions/push-subscriptions.json" : value;
+}
+
 export const appConfig = {
 	loginMethod: loginMethod(),
 	email: process.env.LINE_EMAIL || "",
 	password: process.env.LINE_PASSWORD || "",
 	authToken: process.env.LINE_AUTH_TOKEN || "",
+	loginPin: loginPin(),
 	device: process.env.LINE_DEVICE || "DESKTOPWIN",
 	storageFile: path.resolve(process.env.LINE_STORAGE_FILE || "./storage/storage.json"),
 	forceLogin: boolEnv("LINE_FORCE_LOGIN", false),
@@ -41,12 +54,16 @@ export const appConfig = {
 		process.env.PUSH_SUBSCRIPTIONS_FILE || "./storage/push-subscriptions.json",
 	),
 	pushSubscriptionsGithubRepo: process.env.PUSH_SUBSCRIPTIONS_GITHUB_REPO || "",
-	pushSubscriptionsGithubPath:
-		process.env.PUSH_SUBSCRIPTIONS_GITHUB_PATH || "push-subscriptions.json",
+	pushSubscriptionsGithubPath: subscriptionsGithubPath(),
 	pushSubscriptionsGithubBranch:
 		process.env.PUSH_SUBSCRIPTIONS_GITHUB_BRANCH || "main",
 	pushSubscriptionsGithubToken:
 		process.env.PUSH_SUBSCRIPTIONS_GITHUB_TOKEN || "",
+	lineStorageGithubPath:
+		process.env.LINE_STORAGE_GITHUB_PATH || "line-auth/storage.enc.json",
+	lineStorageBackupKey: process.env.LINE_STORAGE_BACKUP_KEY || "",
+	loginRetryMs: Number(process.env.LINE_LOGIN_RETRY_MS || 15_000),
+	authWatchdogMs: Number(process.env.LINE_AUTH_WATCHDOG_MS || 60_000),
 };
 
 export function getPasswordCredentials(): { email: string; password: string } {

@@ -26,11 +26,16 @@ function isAuthorized(req: http.IncomingMessage): boolean {
 	return req.headers["x-event-update-secret"] === appConfig.eventUpdateSecret;
 }
 
-export function startEventUpdateServer(client: Client): http.Server {
+export function startEventUpdateServer(
+	clientOrProvider: Client | (() => Client | null),
+): http.Server {
+	const getClient = typeof clientOrProvider === "function"
+		? clientOrProvider
+		: () => clientOrProvider;
 	const server = http.createServer(async (req, res) => {
 		if (req.method === "GET" && req.url === "/health") {
 			res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-			res.end(JSON.stringify({ ok: true }));
+			res.end(JSON.stringify({ ok: true, lineReady: Boolean(getClient()) }));
 			return;
 		}
 
@@ -47,6 +52,12 @@ export function startEventUpdateServer(client: Client): http.Server {
 		}
 
 		try {
+			const client = getClient();
+			if (!client) {
+				res.writeHead(503, { "Content-Type": "application/json; charset=utf-8" });
+				res.end(JSON.stringify({ ok: false, error: "LINE client is reconnecting" }));
+				return;
+			}
 			const raw = await readBody(req);
 			const payload = (raw ? JSON.parse(raw) : {}) as EventUpdatePayload;
 			const result = await notifyScheduleUpdate(client, payload);

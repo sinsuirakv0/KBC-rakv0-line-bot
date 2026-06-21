@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { appConfig } from "../config.js";
 import type { LineDestination } from "../commands/shared.js";
+import { githubContentsClient } from "../storage/githubContents.js";
 
 export interface PushSubscription {
 	kind: "talk" | "square";
@@ -16,12 +17,6 @@ interface SubscriptionData {
 	version: 1;
 	subscriptions: PushSubscription[];
 	notifiedKeys: string[];
-}
-
-interface GithubFileResponse {
-	content?: string;
-	encoding?: string;
-	sha?: string;
 }
 
 const EMPTY_DATA: SubscriptionData = {
@@ -57,13 +52,33 @@ class PushSubscriptionStore {
 
 	async initialize(): Promise<void> {
 		await fs.mkdir(path.dirname(appConfig.pushSubscriptionsFile), { recursive: true });
-		if (this.githubEnabled()) {
+		if (githubContentsClient.enabled) {
 			try {
-				const remote = await this.readGithub();
+				let remote = await this.readGithub(appConfig.pushSubscriptionsGithubPath);
+				let migrated = false;
+				if (!remote && appConfig.pushSubscriptionsGithubPath !== "push-subscriptions.json") {
+					remote = await this.readGithub("push-subscriptions.json");
+					migrated = Boolean(remote);
+				}
 				if (remote) {
 					this.data = remote.data;
-					this.githubSha = remote.sha;
+					this.githubSha = migrated ? undefined : remote.sha;
 					await this.writeLocal();
+					if (migrated) {
+						await this.writeGithub();
+						if (remote.sha) {
+							try {
+								await githubContentsClient.delete(
+									"push-subscriptions.json",
+									"Remove migrated LINE push subscriptions",
+									remote.sha,
+								);
+							} catch (error) {
+								console.warn("[pushskd] old GitHub data could not be removed", error);
+							}
+						}
+						console.log(`[pushskd] migrated GitHub data to ${appConfig.pushSubscriptionsGithubPath}`);
+					}
 					console.log(`[pushskd] restored ${this.data.subscriptions.length} subscription(s) from GitHub`);
 					return;
 				}
@@ -130,16 +145,10 @@ class PushSubscriptionStore {
 		await this.save();
 	}
 
-	private githubEnabled(): boolean {
-		return Boolean(
-			appConfig.pushSubscriptionsGithubRepo && appConfig.pushSubscriptionsGithubToken,
-		);
-	}
-
 	private async save(): Promise<void> {
 		const operation = this.saveQueue.then(async () => {
 			await this.writeLocal();
-			if (this.githubEnabled()) await this.writeGithub();
+			if (githubContentsClient.enabled) await this.writeGithub();
 		});
 		this.saveQueue = operation.catch(() => {});
 		await operation;
@@ -151,54 +160,19 @@ class PushSubscriptionStore {
 		await fs.rename(temporary, appConfig.pushSubscriptionsFile);
 	}
 
-	private githubUrl(): string {
-		const encodedPath = appConfig.pushSubscriptionsGithubPath
-			.split("/")
-			.map(encodeURIComponent)
-			.join("/");
-		return `https://api.github.com/repos/${appConfig.pushSubscriptionsGithubRepo}/contents/${encodedPath}`;
-	}
-
-	private githubHeaders(): Record<string, string> {
-		return {
-			Accept: "application/vnd.github+json",
-			Authorization: `Bearer ${appConfig.pushSubscriptionsGithubToken}`,
-			"X-GitHub-Api-Version": "2022-11-28",
-			"User-Agent": "KBC-rakv0-line-bot",
-		};
-	}
-
-	private async readGithub(): Promise<{ data: SubscriptionData; sha?: string } | null> {
-		const url = new URL(this.githubUrl());
-		url.searchParams.set("ref", appConfig.pushSubscriptionsGithubBranch);
-		const response = await fetch(url, { headers: this.githubHeaders() });
-		if (response.status === 404) return null;
-		if (!response.ok) throw new Error(`GitHub read failed: HTTP ${response.status}`);
-		const file = await response.json() as GithubFileResponse;
-		if (file.encoding !== "base64" || !file.content) {
-			throw new Error("GitHub subscription file is not base64 content");
-		}
-		const content = Buffer.from(file.content.replace(/\s/g, ""), "base64").toString("utf8");
-		return { data: parseData(JSON.parse(content)), sha: file.sha };
+	private async readGithub(filePath: string): Promise<{ data: SubscriptionData; sha?: string } | null> {
+		const file = await githubContentsClient.read(filePath);
+		if (!file) return null;
+		return { data: parseData(JSON.parse(file.content)), sha: file.sha };
 	}
 
 	private async writeGithub(): Promise<void> {
-		const response = await fetch(this.githubUrl(), {
-			method: "PUT",
-			headers: { ...this.githubHeaders(), "Content-Type": "application/json" },
-			body: JSON.stringify({
-				message: "Update LINE push subscriptions",
-				content: Buffer.from(`${JSON.stringify(this.data, null, 2)}\n`, "utf8").toString("base64"),
-				branch: appConfig.pushSubscriptionsGithubBranch,
-				...(this.githubSha ? { sha: this.githubSha } : {}),
-			}),
-		});
-		if (!response.ok) {
-			const detail = await response.text();
-			throw new Error(`GitHub write failed: HTTP ${response.status} ${detail.slice(0, 300)}`);
-		}
-		const result = await response.json() as { content?: { sha?: string } };
-		this.githubSha = result.content?.sha;
+		this.githubSha = await githubContentsClient.write(
+			appConfig.pushSubscriptionsGithubPath,
+			`${JSON.stringify(this.data, null, 2)}\n`,
+			"Update LINE push subscriptions",
+			this.githubSha,
+		);
 	}
 }
 

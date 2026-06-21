@@ -1,10 +1,11 @@
-import type { Client, SquareMessage } from "@evex/linejs";
+import { SquareMessage, type Client } from "@evex/linejs";
 import { appConfig } from "./config.js";
 import { handleLineCommand } from "./commands/index.js";
 import type { ReplyableLineMessage } from "./commands/shared.js";
 import { handlePing } from "./handlers/ping.js";
-import { createLineClient } from "./lineClient.js";
+import { createLineClient, isAuthenticationError } from "./lineClient.js";
 import { startEventUpdateServer } from "./server/eventUpdateServer.js";
+import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineStorage.js";
 import { pushSubscriptionStore } from "./subscriptions/store.js";
 
 interface RawTalkMessage {
@@ -20,6 +21,18 @@ interface RawTalkMessage {
 interface RawTalkEvent {
 	type: string;
 	message?: RawTalkMessage;
+}
+
+interface RawSquareEvent {
+	type: string;
+	payload?: {
+		notificationMessage?: {
+			squareMessage: unknown;
+		};
+		receiveMessage?: {
+			squareMessage: unknown;
+		};
+	};
 }
 
 let warnedEncryptedTalk = false;
@@ -165,28 +178,74 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 	await dispatchText("talk", text, new RawTalkReplyTarget(client, raw, ownMid));
 }
 
-function listenRawTalkEvents(client: Client, ownMid: string, signal: AbortSignal): void {
-	void (async () => {
-		const polling = client.base.createPolling();
-		while (!signal.aborted) {
-			try {
-				for await (const event of polling.listenTalkEvents() as AsyncIterable<RawTalkEvent>) {
-					if (signal.aborted) break;
-					await handleRawTalkEvent(client, ownMid, event);
-				}
-			} catch (error) {
-				if (!signal.aborted) {
-					console.error("[talk:event] listener failed", error);
-					await sleep(3000);
-				}
-			}
-		}
-	})();
+function handlePollingError(
+	channel: "talk" | "square",
+	error: unknown,
+	onFatal: (error: unknown) => void,
+): void {
+	if (isAuthenticationError(error)) {
+		onFatal(error);
+		return;
+	}
+	console.error(`[${channel}:event] polling error`, error);
 }
 
-async function main(): Promise<void> {
-	const client = await createLineClient();
-	await pushSubscriptionStore.initialize();
+async function listenRawTalkEvents(
+	client: Client,
+	ownMid: string,
+	signal: AbortSignal,
+	onFatal: (error: unknown) => void,
+): Promise<void> {
+	const polling = client.base.createPolling();
+	for await (const event of polling._listenTalkEvents({
+		signal,
+		pollingInterval: 500,
+		onError: (error) => handlePollingError("talk", error, onFatal),
+	}) as AsyncIterable<RawTalkEvent>) {
+		if (signal.aborted) break;
+		await handleRawTalkEvent(client, ownMid, event);
+	}
+}
+
+async function listenRawSquareEvents(
+	client: Client,
+	signal: AbortSignal,
+	onFatal: (error: unknown) => void,
+): Promise<void> {
+	const polling = client.base.createPolling();
+	for await (const event of polling._listenSquareEvents({
+		signal,
+		pollingInterval: 1_000,
+		onError: (error) => handlePollingError("square", error, onFatal),
+	}) as AsyncIterable<RawSquareEvent>) {
+		if (signal.aborted) break;
+		const rawMessage = event.type === "NOTIFICATION_MESSAGE"
+			? event.payload?.notificationMessage?.squareMessage
+			: event.type === "RECEIVE_MESSAGE"
+				? event.payload?.receiveMessage?.squareMessage
+				: undefined;
+		if (!rawMessage) continue;
+		await handleSquareMessage(client, new SquareMessage({
+			client,
+			raw: rawMessage as never,
+		}));
+	}
+}
+
+function waitForAbort(signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return Promise.resolve();
+	return new Promise((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+}
+
+async function sleepUntilRetry(ms: number, signal: AbortSignal): Promise<void> {
+	await Promise.race([sleep(ms), waitForAbort(signal)]);
+}
+
+async function runSession(
+	client: Client,
+	storage: SyncedLineStorage,
+	shutdownSignal: AbortSignal,
+): Promise<void> {
 	const profile = await client.getMyProfile();
 	console.log(`[line] logged in as ${profile.displayName} (${profile.mid})`);
 	try {
@@ -196,36 +255,87 @@ async function main(): Promise<void> {
 		console.warn("[line] E2EE self key is not available; encrypted Talk messages cannot be read yet");
 	}
 
+	await storage.flushBackup();
 	const controller = new AbortController();
-	const eventUpdateServer = startEventUpdateServer(client);
-	const shutdown = () => {
-		console.log("[app] shutting down");
+	const relayShutdown = () => controller.abort();
+	shutdownSignal.addEventListener("abort", relayShutdown, { once: true });
+	let rejectSession!: (error: unknown) => void;
+	let failed = false;
+	const sessionFailure = new Promise<never>((_resolve, reject) => {
+		rejectSession = reject;
+	});
+	const onFatal = (error: unknown) => {
+		if (failed || controller.signal.aborted) return;
+		failed = true;
 		controller.abort();
-		eventUpdateServer.close();
+		rejectSession(error);
 	};
 
+	if (appConfig.enableTalk) {
+		void listenRawTalkEvents(client, profile.mid, controller.signal, onFatal)
+			.catch(onFatal);
+	}
+	if (appConfig.enableSquare) {
+		void listenRawSquareEvents(client, controller.signal, onFatal)
+			.catch(onFatal);
+	}
+
+	console.log("[app] bot is listening");
+	let watchdogRunning = false;
+	const watchdog = setInterval(() => {
+		if (watchdogRunning || controller.signal.aborted) return;
+		watchdogRunning = true;
+		void client.getMyProfile()
+			.catch((error) => {
+				if (isAuthenticationError(error)) onFatal(error);
+				else console.warn("[line] authentication watchdog request failed", error);
+			})
+			.finally(() => {
+				watchdogRunning = false;
+			});
+	}, appConfig.authWatchdogMs);
+
+	try {
+		await Promise.race([waitForAbort(shutdownSignal), sessionFailure]);
+	} finally {
+		clearInterval(watchdog);
+		controller.abort();
+		shutdownSignal.removeEventListener("abort", relayShutdown);
+	}
+}
+
+async function main(): Promise<void> {
+	let activeClient: Client | null = null;
+	const shutdownController = new AbortController();
+	const eventUpdateServer = startEventUpdateServer(() => activeClient);
+	const shutdown = () => {
+		if (shutdownController.signal.aborted) return;
+		console.log("[app] shutting down");
+		shutdownController.abort();
+	};
 	process.once("SIGINT", shutdown);
 	process.once("SIGTERM", shutdown);
 
-	client.on("square:message", (message) => {
-		void handleSquareMessage(client, message);
-	});
-
-	client.on("square:event", (event) => {
-		console.log(`[square:event] ${event.type}`);
-	});
-
-	if (appConfig.enableTalk) {
-		listenRawTalkEvents(client, profile.mid, controller.signal);
+	await pushSubscriptionStore.initialize();
+	const storage = await initializeLineStorage();
+	while (!shutdownController.signal.aborted) {
+		try {
+			const client = await createLineClient(storage);
+			activeClient = client;
+			await runSession(client, storage, shutdownController.signal);
+		} catch (error) {
+			activeClient = null;
+			if (shutdownController.signal.aborted) break;
+			console.error("[line] session stopped; automatic login will retry", error);
+			await storage.flushBackup().catch(() => {});
+			await sleepUntilRetry(appConfig.loginRetryMs, shutdownController.signal);
+		} finally {
+			activeClient = null;
+		}
 	}
 
-	client.listen({
-		talk: false,
-		square: appConfig.enableSquare,
-		signal: controller.signal,
-	});
-
-	console.log("[app] bot is listening");
+	await storage.flushBackup().catch(() => {});
+	await new Promise<void>((resolve) => eventUpdateServer.close(() => resolve()));
 }
 
 main().catch((error) => {

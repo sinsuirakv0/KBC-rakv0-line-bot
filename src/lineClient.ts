@@ -7,8 +7,8 @@ import {
 	loginWithQR,
 } from "@evex/linejs";
 import { BaseClient } from "@evex/linejs/base";
-import { FileStorage } from "@evex/linejs/storage";
 import { appConfig, getPasswordCredentials } from "./config.js";
+import type { SyncedLineStorage } from "./storage/lineStorage.js";
 
 const STORAGE_AUTH_KEY = ".auth";
 
@@ -25,10 +25,15 @@ async function writeQrCode(url: string): Promise<void> {
 	console.log(`[line] QR image saved: ${qrPath}`);
 }
 
-export async function createLineClient(): Promise<Client> {
-	fs.mkdirSync(path.dirname(appConfig.storageFile), { recursive: true });
+export function isAuthenticationError(error: unknown): boolean {
+	let detail = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+	try {
+		detail += ` ${JSON.stringify(error)}`;
+	} catch { /* best-effort error inspection */ }
+	return /NOT_AUTHORIZED|AUTHENTICATION_DIVESTED|INVALID_AUTH|EXPIRED_AUTH/i.test(detail);
+}
 
-	const storage = new FileStorage(appConfig.storageFile);
+export async function createLineClient(storage: SyncedLineStorage): Promise<Client> {
 	const storedToken = await storage.get(STORAGE_AUTH_KEY);
 	const envToken = appConfig.authToken.trim();
 
@@ -42,24 +47,38 @@ export async function createLineClient(): Promise<Client> {
 		console.log("[line] auth token updated and saved to FileStorage");
 	};
 
-	let client: Client;
+	let client: Client | undefined;
 	if (appConfig.forceLogin) {
 		console.log("[line] LINE_FORCE_LOGIN=true; skipping stored auth token for this login");
 	}
-	if (!appConfig.forceLogin && envToken) {
-		console.log("[line] logging in with LINE_AUTH_TOKEN");
-		client = await loginWithAuthToken(envToken, init);
-	} else if (!appConfig.forceLogin && typeof storedToken === "string" && storedToken.trim()) {
-		console.log("[line] logging in with stored auth token");
-		client = await loginWithAuthToken(storedToken, init);
-	} else if (appConfig.loginMethod === "password") {
+	if (!appConfig.forceLogin) {
+		const candidates = [
+			typeof storedToken === "string" && storedToken.trim()
+				? { source: "stored auth token", token: storedToken.trim() }
+				: null,
+			envToken ? { source: "LINE_AUTH_TOKEN", token: envToken } : null,
+		].filter((candidate): candidate is { source: string; token: string } => Boolean(candidate));
+		const tried = new Set<string>();
+		for (const candidate of candidates) {
+			if (tried.has(candidate.token)) continue;
+			tried.add(candidate.token);
+			try {
+				console.log(`[line] logging in with ${candidate.source}`);
+				client = await loginWithAuthToken(candidate.token, init);
+				break;
+			} catch (error) {
+				if (!isAuthenticationError(error)) throw error;
+				console.warn(`[line] ${candidate.source} was rejected; falling back to a fresh login`);
+			}
+		}
+	}
+
+	const canUsePassword = Boolean(appConfig.email && appConfig.password);
+	if (!client && (appConfig.loginMethod === "password" || canUsePassword)) {
 		const credentials = getPasswordCredentials();
 		console.log("[line] logging in with email/password");
+		console.log(`[line] login PIN: ${appConfig.loginPin}`);
 		console.log(`[line] password E2EE login: ${appConfig.e2eeLogin ? "enabled" : "disabled"}`);
-		if (appConfig.forceLogin && appConfig.e2eeLogin) {
-			await storage.delete(`cert:${credentials.email}`);
-			console.log("[line] cleared stored password login certificate for E2EE re-login");
-		}
 		const base = new BaseClient(init);
 		base.on("pincall", (pin) => {
 			console.log(`[line] enter this pincode in LINE app: ${pin}`);
@@ -69,10 +88,11 @@ export async function createLineClient(): Promise<Client> {
 			...credentials,
 			v3: false,
 			e2ee: appConfig.e2eeLogin,
+			pincode: appConfig.loginPin,
 		});
 		await base.loginProcess.ready();
 		client = new Client(base);
-	} else {
+	} else if (!client) {
 		console.log("[line] logging in with QR");
 		client = await loginWithQR({
 			async onReceiveQRUrl(url) {
@@ -87,6 +107,7 @@ export async function createLineClient(): Promise<Client> {
 
 	client.base.on("update:authtoken", saveToken);
 	await saveToken(client.authToken);
+	await storage.flushBackup();
 
 	return client;
 }
