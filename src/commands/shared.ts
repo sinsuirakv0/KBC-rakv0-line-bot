@@ -21,6 +21,7 @@ export interface ReplyableLineMessage {
 	send(text: string): Promise<void>;
 	client: Client;
 	destination: LineDestination;
+	mentionMids: string[];
 }
 
 export interface LineDestination {

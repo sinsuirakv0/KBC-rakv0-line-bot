@@ -2,6 +2,7 @@ import { appConfig } from "../config.js";
 import type { LineCommand, ReplyableLineMessage } from "./shared.js";
 import { enemyCommand } from "./enemy.js";
 import { gatyaCommand } from "./gatya.js";
+import { idCommand } from "./id.js";
 import { itemCommand } from "./item.js";
 import { pushCommand } from "./push.js";
 import { pushskdCommand } from "./pushskd.js";
@@ -14,6 +15,7 @@ const commands = new Map<string, LineCommand>();
 
 for (const command of [
 	gatyaCommand,
+	idCommand,
 	saleCommand,
 	itemCommand,
 	unitCommand,

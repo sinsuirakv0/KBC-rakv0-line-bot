@@ -25,6 +25,11 @@ interface RawTalkEvent {
 	message?: RawTalkMessage;
 }
 
+interface ParsedTalkText {
+	text: string;
+	mentionMids: string[];
+}
+
 interface RawSquareEvent {
 	type: string;
 	payload?: {
@@ -64,11 +69,14 @@ async function handleSquareMessage(client: Client, message: SquareMessage): Prom
 
 class SquareReplyTarget implements ReplyableLineMessage {
 	readonly destination;
+	readonly mentionMids: string[];
 
 	constructor(
 		readonly client: Client,
 		private readonly message: SquareMessage,
 	) {
+		this.mentionMids = message.getMentions()
+			.flatMap((mention) => mention.all ? [] : [mention.mid]);
 		this.destination = {
 			kind: "square" as const,
 			chatMid: message.to.id,
@@ -92,12 +100,15 @@ class SquareReplyTarget implements ReplyableLineMessage {
 
 class RawTalkReplyTarget implements ReplyableLineMessage {
 	readonly destination;
+	readonly mentionMids: string[];
 
 	constructor(
 		readonly client: Client,
 		private readonly raw: RawTalkMessage,
 		private readonly ownMid: string,
+		mentionMids: string[],
 	) {
+		this.mentionMids = mentionMids;
 		this.destination = {
 			kind: "talk" as const,
 			chatMid: this.sendTo(),
@@ -147,13 +158,34 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 	}
 }
 
-async function readTalkText(client: Client, raw: RawTalkMessage): Promise<string | null> {
-	if (typeof raw.text === "string") return raw.text;
+function talkMentionMids(raw: RawTalkMessage): string[] {
+	const value = raw.contentMetadata?.MENTION;
+	if (!value) return [];
+	try {
+		const parsed = JSON.parse(value) as {
+			MENTIONEES?: Array<{ M?: unknown }>;
+		};
+		return [...new Set(
+			(parsed.MENTIONEES ?? []).flatMap((mention) =>
+				typeof mention.M === "string" ? [mention.M] : []
+			),
+		)];
+	} catch {
+		return [];
+	}
+}
+
+async function readTalkText(client: Client, raw: RawTalkMessage): Promise<ParsedTalkText | null> {
+	if (typeof raw.text === "string") {
+		return { text: raw.text, mentionMids: talkMentionMids(raw) };
+	}
 	if (!raw.chunks && !raw.contentMetadata?.e2eeVersion) return null;
 
 	try {
 		const decrypted = await client.base.e2ee.decryptE2EEMessage(raw as never) as RawTalkMessage;
-		if (typeof decrypted.text === "string") return decrypted.text;
+		if (typeof decrypted.text === "string") {
+			return { text: decrypted.text, mentionMids: talkMentionMids(decrypted) };
+		}
 	} catch (error) {
 		if (!warnedEncryptedTalk) {
 			warnedEncryptedTalk = true;
@@ -177,10 +209,14 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 	if (!raw) return;
 	if (raw.from === ownMid) return;
 
-	const text = await readTalkText(client, raw);
-	if (text === null) return;
+	const parsed = await readTalkText(client, raw);
+	if (parsed === null) return;
 
-	await dispatchText("talk", text, new RawTalkReplyTarget(client, raw, ownMid));
+	await dispatchText(
+		"talk",
+		parsed.text,
+		new RawTalkReplyTarget(client, raw, ownMid, parsed.mentionMids),
+	);
 }
 
 function handlePollingError(
