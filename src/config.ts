@@ -62,6 +62,7 @@ export const appConfig = {
 	lineStorageGithubPath:
 		process.env.LINE_STORAGE_GITHUB_PATH || "line-auth/storage.enc.json",
 	lineStorageBackupKey: process.env.LINE_STORAGE_BACKUP_KEY || "",
+	lineStorageBackupIntervalMs: Number(process.env.LINE_STORAGE_BACKUP_INTERVAL_MS || 30_000),
 	loginRetryMs: Number(process.env.LINE_LOGIN_RETRY_MS || 15_000),
 	authWatchdogMs: Number(process.env.LINE_AUTH_WATCHDOG_MS || 60_000),
 	talkPollTimeoutMs: Number(process.env.LINE_TALK_POLL_TIMEOUT_MS || 5_000),

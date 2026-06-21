@@ -102,11 +102,11 @@ class LineStorageBackup {
 
 	schedule(): void {
 		if (!this.enabled) return;
-		if (this.timer) clearTimeout(this.timer);
+		if (this.timer) return;
 		this.timer = setTimeout(() => {
 			this.timer = undefined;
 			void this.enqueueUpload();
-		}, 2_000);
+		}, appConfig.lineStorageBackupIntervalMs);
 	}
 
 	async flush(): Promise<void> {
