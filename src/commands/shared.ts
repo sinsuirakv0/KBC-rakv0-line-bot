@@ -27,8 +27,11 @@ export interface ReplyableLineMessage {
 export interface LineDestination {
 	kind: "talk" | "square";
 	chatMid: string;
+	/** Ranking scope: Talk chat MID or the parent OpenChat square MID. */
+	scopeMid: string;
 	chatType: "USER" | "GROUP" | "ROOM" | "SQUARE";
 	senderMid: string;
+	senderName?: string;
 	encrypted: boolean;
 }
 

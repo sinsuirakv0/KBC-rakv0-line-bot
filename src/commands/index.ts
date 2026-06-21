@@ -6,10 +6,12 @@ import { idCommand } from "./id.js";
 import { itemCommand } from "./item.js";
 import { pushCommand } from "./push.js";
 import { pushskdCommand } from "./pushskd.js";
+import { rankingCommand } from "./ranking.js";
 import { saleCommand } from "./sale.js";
 import { stageCommand } from "./stage.js";
 import { testCommand } from "./test.js";
 import { unitCommand } from "./unit.js";
+import { rankingStore } from "../ranking/store.js";
 
 const commands = new Map<string, LineCommand>();
 
@@ -23,6 +25,7 @@ for (const command of [
 	stageCommand,
 	pushskdCommand,
 	pushCommand,
+	rankingCommand,
 	testCommand,
 ]) {
 	commands.set(command.name, command);
@@ -37,6 +40,7 @@ export async function handleLineCommand(messageText: string, message: ReplyableL
 	const name = nameRaw.toLowerCase();
 	const command = commands.get(name);
 	if (!command) return false;
+	rankingStore.record(message.destination);
 	await command.execute({ message, command: name, args });
 	return true;
 }

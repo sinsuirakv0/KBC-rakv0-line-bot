@@ -9,6 +9,7 @@ import { eventPushStore } from "./eventPush/store.js";
 import { startEventUpdateServer } from "./server/eventUpdateServer.js";
 import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineStorage.js";
 import { pushSubscriptionStore } from "./subscriptions/store.js";
+import { rankingStore } from "./ranking/store.js";
 
 interface RawTalkMessage {
 	id: string;
@@ -43,6 +44,9 @@ interface RawSquareEvent {
 }
 
 let warnedEncryptedTalk = false;
+const senderNames = new Map<string, string>();
+const senderNameRequests = new Map<string, Promise<string | undefined>>();
+const squareScopeRequests = new Map<string, Promise<string>>();
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -54,7 +58,10 @@ async function dispatchText(
 	message: ReplyableLineMessage,
 ): Promise<void> {
 	try {
-		if (await handlePing(messageText, message)) return;
+		if (messageText === `${appConfig.commandPrefix}ping`) {
+			rankingStore.record(message.destination);
+			if (await handlePing(messageText, message)) return;
+		}
 		if (await handleLineCommand(messageText, message)) return;
 	} catch (error) {
 		console.error(`[${channel}:message] handler failed`, error);
@@ -64,7 +71,62 @@ async function dispatchText(
 async function handleSquareMessage(client: Client, message: SquareMessage): Promise<void> {
 	if (await message.isMyMessage()) return;
 	if (typeof message.text !== "string") return;
-	await dispatchText("square", message.text, new SquareReplyTarget(client, message));
+	if (!message.text.startsWith(appConfig.commandPrefix)) return;
+	const scopeMid = await resolveSquareScope(client, message.to.id);
+	const target = new SquareReplyTarget(
+		client,
+		message,
+		scopeMid,
+		senderNames.get(`square:${message.from.id}`),
+	);
+	void resolveSenderName(client, "square", message.from.id)
+		.then((name) => {
+			if (name) rankingStore.updateName("square", message.from.id, name);
+		});
+	await dispatchText("square", message.text, target);
+}
+
+function resolveSquareScope(client: Client, squareChatMid: string): Promise<string> {
+	let request = squareScopeRequests.get(squareChatMid);
+	if (!request) {
+		request = client.base.square.getSquareChat({ squareChatMid })
+			.then((response) => response.squareChat.squareMid)
+			.catch((error) => {
+				squareScopeRequests.delete(squareChatMid);
+				console.warn(`[ranking] failed to resolve parent OpenChat for ${squareChatMid}`, error);
+				return squareChatMid;
+			});
+		squareScopeRequests.set(squareChatMid, request);
+	}
+	return request;
+}
+
+function resolveSenderName(
+	client: Client,
+	kind: "talk" | "square",
+	mid: string,
+): Promise<string | undefined> {
+	const key = `${kind}:${mid}`;
+	const cached = senderNames.get(key);
+	if (cached) return Promise.resolve(cached);
+	let request = senderNameRequests.get(key);
+	if (!request) {
+		request = (kind === "square"
+			? client.base.square.getSquareMember({ squareMemberMid: mid })
+				.then((response) => response.squareMember.displayName)
+			: client.getUser(mid).then((user) => user.raw.targetProfileDetail.profileName)
+		).then((name) => {
+			if (name) senderNames.set(key, name);
+			return name || undefined;
+		}).catch((error) => {
+			console.warn(`[ranking] failed to resolve ${kind} name for ${mid}`, error);
+			return undefined;
+		}).finally(() => {
+			senderNameRequests.delete(key);
+		});
+		senderNameRequests.set(key, request);
+	}
+	return request;
 }
 
 class SquareReplyTarget implements ReplyableLineMessage {
@@ -74,14 +136,18 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	constructor(
 		readonly client: Client,
 		private readonly message: SquareMessage,
+		scopeMid: string,
+		senderName?: string,
 	) {
 		this.mentionMids = message.getMentions()
 			.flatMap((mention) => mention.all ? [] : [mention.mid]);
 		this.destination = {
 			kind: "square" as const,
 			chatMid: message.to.id,
+			scopeMid,
 			chatType: "SQUARE" as const,
 			senderMid: message.from.id,
+			senderName,
 			encrypted: false,
 		};
 	}
@@ -112,8 +178,10 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 		this.destination = {
 			kind: "talk" as const,
 			chatMid: this.sendTo(),
+			scopeMid: this.sendTo(),
 			chatType: this.chatType(),
 			senderMid: raw.from,
+			senderName: senderNames.get(`talk:${raw.from}`),
 			encrypted: this.isEncrypted(),
 		};
 	}
@@ -211,6 +279,11 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 
 	const parsed = await readTalkText(client, raw);
 	if (parsed === null) return;
+	if (!parsed.text.startsWith(appConfig.commandPrefix)) return;
+	void resolveSenderName(client, "talk", raw.from)
+		.then((name) => {
+			if (name) rankingStore.updateName("talk", raw.from, name);
+		});
 
 	await dispatchText(
 		"talk",
@@ -244,7 +317,8 @@ async function listenRawTalkEvents(
 		onError: (error) => handlePollingError("talk", error, onFatal),
 	}) as AsyncIterable<RawTalkEvent>) {
 		if (signal.aborted) break;
-		await handleRawTalkEvent(client, ownMid, event);
+		void handleRawTalkEvent(client, ownMid, event)
+			.catch((error) => handlePollingError("talk", error, onFatal));
 	}
 }
 
@@ -360,6 +434,7 @@ async function main(): Promise<void> {
 	await Promise.all([
 		pushSubscriptionStore.initialize(),
 		eventPushStore.initialize(),
+		rankingStore.initialize(),
 	]);
 	startEventPushScheduler(() => activeClient, shutdownController.signal);
 	const storage = await initializeLineStorage();
@@ -380,6 +455,7 @@ async function main(): Promise<void> {
 	}
 
 	await storage.flushBackup().catch(() => {});
+	await rankingStore.flush().catch(() => {});
 	await new Promise<void>((resolve) => eventUpdateServer.close(() => resolve()));
 }
 
