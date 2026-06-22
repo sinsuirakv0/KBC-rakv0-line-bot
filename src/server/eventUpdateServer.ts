@@ -61,6 +61,10 @@ export function startEventUpdateServer(
 			const raw = await readBody(req);
 			const payload = (raw ? JSON.parse(raw) : {}) as EventUpdatePayload;
 			const result = await notifyScheduleUpdate(client, payload);
+			console.log(
+				`[event-update] accepted phase=${String(payload.phase)} test=${payload.test === true} ` +
+				`sent=${result.sent} skipped=${result.skipped}`,
+			);
 			res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
 			res.end(JSON.stringify({ ok: true, ...result }));
 		} catch (error) {
