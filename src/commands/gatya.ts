@@ -211,6 +211,26 @@ function detailText(id: number, mode: Mode | null, json: GachaJson, csv: CsvSet)
 export const gatyaCommand: LineCommand = {
 	name: "gatya",
 	async execute({ message, args }) {
+		if (args[0]?.toLowerCase() === "help") {
+			await message.reply([
+				"!gatya",
+				"",
+				"!gatya",
+				"  今後のガチャスケジュールを一覧表示します。",
+				"!gatya R / !gatya E / !gatya N",
+				"  R=レア、E=イベント、N=ノーマルに絞って表示します。",
+				"!gatya <ID>",
+				"  指定したガチャIDの開催期間、レート、確定情報などを表示します。",
+				"!gatya <検索語>",
+				"  ガチャ名で検索します。",
+				"!gatya <ID> json",
+				"  元データをJSON形式で表示します。",
+				"!gatya <ID> r",
+				"  rawデータを表示します。",
+			].join("\n"));
+			return;
+		}
+
 		try {
 			const { json, csv } = await loadGatya();
 			let mode: Mode | null = null;

@@ -1,7 +1,7 @@
 import { SquareMessage, type Client } from "@evex/linejs";
 import { appConfig } from "./config.js";
 import { handleLineCommand } from "./commands/index.js";
-import type { ReplyableLineMessage } from "./commands/shared.js";
+import type { OutgoingImage, ReplyableLineMessage } from "./commands/shared.js";
 import { handlePing } from "./handlers/ping.js";
 import { createLineClient, isAuthenticationError } from "./lineClient.js";
 import { startEventPushScheduler } from "./eventPush/scheduler.js";
@@ -74,7 +74,7 @@ async function dispatchText(
 	const startedAt = Date.now();
 	activeHandlers += 1;
 	try {
-		if (messageText === `${appConfig.commandPrefix}ping`) {
+		if (messageText === `${appConfig.commandPrefix}ping` || messageText === `${appConfig.commandPrefix}ping help`) {
 			rankingStore.record(message.destination);
 			if (await handlePing(messageText, message)) return;
 		}
@@ -194,6 +194,22 @@ class SquareReplyTarget implements ReplyableLineMessage {
 			text,
 		});
 	}
+
+	async sendImage(image: OutgoingImage): Promise<void> {
+		const sent = await this.client.base.square.sendMessage({
+			squareChatMid: this.destination.chatMid,
+			contentType: "IMAGE" as never,
+		});
+		const messageId = messageIdFromSquareSendResult(sent);
+		if (!messageId) throw new Error("画像メッセージIDを取得できませんでした");
+		await this.client.base.obs.uploadObjTalk(
+			this.destination.chatMid,
+			"image",
+			image.blob,
+			messageId,
+			image.filename,
+		);
+	}
 }
 
 class RawTalkReplyTarget implements ReplyableLineMessage {
@@ -226,6 +242,26 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 		await this.sendTalk(text);
 	}
 
+	async sendImage(image: OutgoingImage): Promise<void> {
+		const to = this.sendTo();
+		if (this.isEncrypted() && (to.startsWith("u") || to.startsWith("c"))) {
+			await this.client.base.obs.uploadMediaByE2EE({
+				to,
+				oType: "image",
+				data: image.blob,
+				filename: image.filename,
+			});
+			return;
+		}
+
+		const sent = await this.client.base.talk.sendMessage({
+			to,
+			contentType: "IMAGE" as never,
+		});
+		if (!sent.id) throw new Error("画像メッセージIDを取得できませんでした");
+		await this.client.base.obs.uploadObjTalk(to, "image", image.blob, sent.id, image.filename);
+	}
+
 	private sendTo(): string {
 		if (
 			this.raw.toType === "GROUP" ||
@@ -256,6 +292,15 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 	private isEncrypted(): boolean {
 		return Boolean(this.raw.chunks || this.raw.contentMetadata?.e2eeVersion);
 	}
+}
+
+function messageIdFromSquareSendResult(value: unknown): string | undefined {
+	const result = value as {
+		squareMessage?: { message?: { id?: string } };
+		message?: { id?: string };
+		id?: string;
+	};
+	return result.squareMessage?.message?.id ?? result.message?.id ?? result.id;
 }
 
 function talkMentionMids(raw: RawTalkMessage): string[] {

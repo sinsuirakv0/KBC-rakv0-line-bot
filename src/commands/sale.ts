@@ -88,6 +88,24 @@ function detailText(entry: SaleEntry, names: Map<number, string>): string {
 export const saleCommand: LineCommand = {
 	name: "sale",
 	async execute({ message, args }) {
+		if (args[0]?.toLowerCase() === "help") {
+			await message.reply([
+				"!sale",
+				"",
+				"!sale",
+				"  今後のセール/イベントスケジュールを一覧表示します。",
+				"!sale <ID>",
+				"  指定したイベントIDの開催期間や開催時間を表示します。",
+				"!sale <検索語>",
+				"  イベント名で検索します。",
+				"!sale <ID> json",
+				"  元データをJSON形式で表示します。",
+				"!sale <ID> r",
+				"  rawデータを表示します。",
+			].join("\n"));
+			return;
+		}
+
 		try {
 			const { json, names } = await loadSale();
 			if (args.length === 0) {
@@ -137,4 +155,3 @@ export const saleCommand: LineCommand = {
 		}
 	},
 };
-

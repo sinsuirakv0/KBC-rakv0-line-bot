@@ -49,9 +49,15 @@ async function cachedFetch<T>(
 export interface ReplyableLineMessage {
 	reply(text: string): Promise<void>;
 	send(text: string): Promise<void>;
+	sendImage(image: OutgoingImage): Promise<void>;
 	client: Client;
 	destination: LineDestination;
 	mentionMids: string[];
+}
+
+export interface OutgoingImage {
+	blob: Blob;
+	filename: string;
 }
 
 export interface LineDestination {
@@ -215,12 +221,7 @@ export function isExactInteger(value: string): boolean {
 	return String(parseInt(value, 10)) === value.trim();
 }
 
-export function codeBlock(text: string, lang = ""): string {
-	const safe = text.replace(/```/g, "`\u200b``");
-	return lang ? `\`\`\`${lang}\n${safe}\n\`\`\`` : `\`\`\`\n${safe}\n\`\`\``;
-}
-
-export async function sendLong(message: ReplyableLineMessage, text: string, lang = ""): Promise<void> {
+export async function sendLong(message: ReplyableLineMessage, text: string, _lang = ""): Promise<void> {
 	const lines = text.split("\n");
 	const chunks: string[] = [];
 	let current = "";
@@ -238,7 +239,7 @@ export async function sendLong(message: ReplyableLineMessage, text: string, lang
 	if (current) chunks.push(current);
 
 	for (let i = 0; i < chunks.length; i++) {
-		const body = codeBlock(chunks[i], lang);
+		const body = chunks[i];
 		if (i === 0) await message.reply(body);
 		else await message.send(body);
 	}

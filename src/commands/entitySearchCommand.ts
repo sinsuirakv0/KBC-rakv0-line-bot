@@ -12,6 +12,27 @@ interface EntityCommandOptions {
 	forms?: string[];
 }
 
+const IMAGE_TIMEOUT_MS = 10_000;
+
+function helpText(options: EntityCommandOptions): string {
+	const aliases = options.aliases.length ? ` / !${options.aliases.join(" / !")}` : "";
+	const formLine = options.forms
+		? "\n!unit <名前またはID> origin f/c/s/u\n  指定した形態の画像を送信します。f=第一、c=第二、s=第三、u=特殊です。"
+		: "";
+	return [
+		`!${options.name}${aliases}`,
+		"",
+		`!${options.name}`,
+		"  検索ページのURLを表示します。",
+		`!${options.name} <名前またはID>`,
+		`  ${options.label}を検索します。候補が少ない時は詳細ページURL、多い時は一覧を返します。`,
+		options.originImageUrl
+			? `!${options.name} <名前またはID> origin\n  検索結果の先頭に一致した${options.label}の画像を送信します。`
+			: "",
+		formLine,
+	].filter(Boolean).join("\n");
+}
+
 function formatList(label: string, query: string, entries: EntitySearchEntry[]): string {
 	const shown = entries.slice(0, 20);
 	const lines = [
@@ -22,11 +43,29 @@ function formatList(label: string, query: string, entries: EntitySearchEntry[]):
 	return lines.join("\n");
 }
 
+function imageFilename(url: string): string {
+	const pathname = new URL(url).pathname;
+	const name = pathname.split("/").filter(Boolean).at(-1);
+	return name || "origin.png";
+}
+
+async function fetchImage(url: string): Promise<Blob> {
+	const response = await fetch(url, { signal: AbortSignal.timeout(IMAGE_TIMEOUT_MS) });
+	if (!response.ok) throw new Error(`画像の取得に失敗しました: HTTP ${response.status}`);
+	const type = response.headers.get("content-type") || "image/png";
+	return new Blob([await response.arrayBuffer()], { type });
+}
+
 export function createEntitySearchCommand(options: EntityCommandOptions): LineCommand {
 	return {
 		name: options.name,
 		aliases: options.aliases,
 		async execute({ message, args }) {
+			if (args[0]?.toLowerCase() === "help") {
+				await message.reply(helpText(options));
+				return;
+			}
+
 			if (args.length === 0) {
 				await message.reply(options.searchPageUrl);
 				return;
@@ -52,7 +91,12 @@ export function createEntitySearchCommand(options: EntityCommandOptions): LineCo
 
 			if (hasOrigin && queryArgs.length === 1 && options.originImageUrl) {
 				const entry = result[0];
-				await message.reply(`${entry.id} ${entry.names[0]}\n${options.originImageUrl(entry, form)}`);
+				const imageUrl = options.originImageUrl(entry, form);
+				await message.reply(`${entry.id} ${entry.names[0]}`);
+				await message.sendImage({
+					blob: await fetchImage(imageUrl),
+					filename: imageFilename(imageUrl),
+				});
 				return;
 			}
 

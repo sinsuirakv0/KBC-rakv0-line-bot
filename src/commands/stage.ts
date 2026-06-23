@@ -22,14 +22,24 @@ export const stageCommand: LineCommand = {
 	name: "stage",
 	aliases: ["st"],
 	async execute({ message, args }) {
+		if (args[0]?.toLowerCase() === "help") {
+			await message.reply([
+				"!stage / !st",
+				"",
+				"!stage",
+				"  ステージ検索ページのURLを表示します。",
+				"!stage <名前またはID>",
+				"  マップ名やステージ名を検索します。候補が少ない時は詳細ページURL、多い時は一覧を返します。",
+			].join("\n"));
+			return;
+		}
+
 		if (args.length === 0) {
 			await message.reply("https://jarjarblink.github.io/JDB/map_search.html?cc=ja");
 			return;
 		}
 
-		const hasOrigin = args.some((arg) => arg.toLowerCase() === "origin");
-		const queryArgs = args.filter((arg) => arg.toLowerCase() !== "origin");
-		const query = queryArgs.join(" ").trim();
+		const query = args.join(" ").trim();
 		if (!query) {
 			await sendError(message, "検索語を指定してください");
 			return;
@@ -42,14 +52,6 @@ export const stageCommand: LineCommand = {
 		];
 		if (results.length === 0) {
 			await sendError(message, "該当するステージが見つかりませんでした");
-			return;
-		}
-
-		if (hasOrigin && queryArgs.length === 1 && results[0].type === "map") {
-			const result = results[0];
-			await message.reply(
-				`${result.id} ${result.name}\nhttps://ponosgames.com/information/appli/battlecats/stage/${result.id}.html`,
-			);
 			return;
 		}
 

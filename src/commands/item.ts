@@ -110,6 +110,24 @@ function scheduleText(json: ItemJson, names: Map<number, string>): string {
 export const itemCommand: LineCommand = {
 	name: "item",
 	async execute({ message, args }) {
+		if (args[0]?.toLowerCase() === "help") {
+			await message.reply([
+				"!item",
+				"",
+				"!item",
+				"  今後のアイテム配布スケジュールを一覧表示します。",
+				"!item <ID>",
+				"  giftTypeまたはeventIdで配布内容を表示します。giftTypeで見つからない場合はeventIdでも検索します。",
+				"!item <検索語>",
+				"  アイテム名で検索します。",
+				"!item <ID> json",
+				"  元データをJSON形式で表示します。",
+				"!item <ID> r",
+				"  rawデータを表示します。",
+			].join("\n"));
+			return;
+		}
+
 		try {
 			const { json, names } = await loadItem();
 			if (args.length === 0) {
@@ -184,4 +202,3 @@ export const itemCommand: LineCommand = {
 		}
 	},
 };
-

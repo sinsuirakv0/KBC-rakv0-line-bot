@@ -2,10 +2,10 @@ import { appConfig } from "../config.js";
 import type { LineCommand, ReplyableLineMessage } from "./shared.js";
 import { enemyCommand } from "./enemy.js";
 import { gatyaCommand } from "./gatya.js";
+import { helpCommand } from "./help.js";
 import { idCommand } from "./id.js";
 import { itemCommand } from "./item.js";
 import { pushCommand } from "./push.js";
-import { pushskdCommand } from "./pushskd.js";
 import { rankingCommand } from "./ranking.js";
 import { saleCommand } from "./sale.js";
 import { stageCommand } from "./stage.js";
@@ -23,10 +23,10 @@ for (const command of [
 	unitCommand,
 	enemyCommand,
 	stageCommand,
-	pushskdCommand,
 	pushCommand,
 	rankingCommand,
 	testCommand,
+	helpCommand,
 ]) {
 	commands.set(command.name, command);
 	for (const alias of command.aliases ?? []) commands.set(alias, command);

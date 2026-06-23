@@ -74,16 +74,16 @@ class PushSubscriptionStore {
 									remote.sha,
 								);
 							} catch (error) {
-								console.warn("[pushskd] old GitHub data could not be removed", error);
+								console.warn("[push:skd] old GitHub data could not be removed", error);
 							}
 						}
-						console.log(`[pushskd] migrated GitHub data to ${appConfig.pushSubscriptionsGithubPath}`);
+						console.log(`[push:skd] migrated GitHub data to ${appConfig.pushSubscriptionsGithubPath}`);
 					}
-					console.log(`[pushskd] restored ${this.data.subscriptions.length} subscription(s) from GitHub`);
+					console.log(`[push:skd] restored ${this.data.subscriptions.length} subscription(s) from GitHub`);
 					return;
 				}
 			} catch (error) {
-				console.warn("[pushskd] GitHub restore failed; using local storage", error);
+				console.warn("[push:skd] GitHub restore failed; using local storage", error);
 			}
 		}
 
@@ -91,11 +91,11 @@ class PushSubscriptionStore {
 			this.data = parseData(JSON.parse(await fs.readFile(appConfig.pushSubscriptionsFile, "utf8")));
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-				console.warn("[pushskd] local subscription file could not be read", error);
+				console.warn("[push:skd] local subscription file could not be read", error);
 			}
 			await this.writeLocal();
 		}
-		console.log(`[pushskd] loaded ${this.data.subscriptions.length} subscription(s)`);
+		console.log(`[push:skd] loaded ${this.data.subscriptions.length} subscription(s)`);
 	}
 
 	list(): PushSubscription[] {
@@ -109,7 +109,7 @@ class PushSubscriptionStore {
 
 	async subscribe(destination: LineDestination): Promise<boolean> {
 		if (destination.chatType === "USER") {
-			throw new Error("個人チャットはpushskdの通知先に登録できません");
+			throw new Error("個人チャットはスケジュール更新通知の通知先に登録できません");
 		}
 		const key = targetKey(destination);
 		if (this.data.subscriptions.some((item) => targetKey(item) === key)) return false;

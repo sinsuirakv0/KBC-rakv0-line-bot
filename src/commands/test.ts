@@ -50,12 +50,23 @@ function buildHistoryUrl(unix: number): string {
 export const testCommand: LineCommand = {
 	name: "test",
 	async execute({ message, args }) {
+		if (args[0]?.toLowerCase() === "help") {
+			await message.reply([
+				"!test",
+				"",
+				"!test event-update",
+				"  最新のスケジュール更新履歴を使って、登録済みの通知先へテスト通知を送信します。",
+				"  このトークで使う前に !push skd を実行して通知先へ登録してください。",
+			].join("\n"));
+			return;
+		}
+
 		if (args[0]?.toLowerCase() !== "event-update") {
 			await message.reply("使い方: !test event-update");
 			return;
 		}
 		if (!pushSubscriptionStore.has(message.destination)) {
-			await message.reply("このトークを先に !pushskd で通知先へ登録してください。");
+			await message.reply("このトークを先に !push skd で通知先へ登録してください。");
 			return;
 		}
 

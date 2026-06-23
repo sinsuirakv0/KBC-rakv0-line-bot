@@ -18,6 +18,21 @@ function parseRange(value: string | undefined): { start: number; end: number } |
 export const rankingCommand: LineCommand = {
 	name: "ranking",
 	async execute({ message, args }) {
+		if (args[0]?.toLowerCase() === "help") {
+			await message.send([
+				"!ranking",
+				"",
+				"!ranking",
+				"  このトーク内のコマンド実行回数ランキングを1位から10位まで表示します。",
+				"!ranking 4~14",
+				"  指定した順位範囲を表示します。1回に表示できるのは最大50人までです。",
+				"",
+				"ランキングはMIDで集計し、表示名は後から取得した名前に更新されます。",
+				"OpenChatではサブトークも親OpenChat単位で合算します。",
+			].join("\n"));
+			return;
+		}
+
 		const range = parseRange(args[0]);
 		if (!range || args.length > 1) {
 			await message.send("使い方: !ranking または !ranking 4~14\n一度に表示できるのは50人までです。");
