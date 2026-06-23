@@ -5,7 +5,7 @@ import {
 	formatEventSchedule,
 	formatNextEventOccurrence,
 } from "../eventPush/format.js";
-import type { SaleEntry, SaleJson } from "../eventPush/schedule.js";
+import { isIgnoredEventEntry, type SaleEntry, type SaleJson } from "../eventPush/schedule.js";
 import { eventPushStore } from "../eventPush/store.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
 
@@ -22,7 +22,7 @@ async function loadEventDetails(eventId: number): Promise<EventDetails> {
 	return {
 		name: names.get(eventId) || "名称不明",
 		entries: sale.data.filter((entry) =>
-			!entry.stageIds.includes(104) && entry.stageIds.includes(eventId)
+			!isIgnoredEventEntry(entry) && entry.stageIds.includes(eventId)
 		),
 	};
 }
@@ -145,7 +145,7 @@ export const pushCommand: LineCommand = {
 					"  この個人/グループ/OCをイベント開始通知先として登録します。",
 					"!push event <イベントID>",
 					"  通知するイベントIDを追加します。イベントIDはsale.jsonのstageIdsから判定します。",
-					"  stageIdsに104を含むイベントは通知対象外です。",
+					"  stageIdsに102、104、112のいずれかを含むイベントは通知対象外です。",
 					"!push event <イベントID> del",
 					"  指定したイベントIDの通知を解除します。",
 					"!push event del",

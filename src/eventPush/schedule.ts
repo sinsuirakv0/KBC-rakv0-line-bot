@@ -3,6 +3,7 @@ import type { TimeBlock } from "../commands/shared.js";
 const JST_MS = 9 * 60 * 60 * 1_000;
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const IGNORED_STAGE_IDS = [102, 104, 112];
 
 export interface SaleHeader {
 	startDate: string;
@@ -20,6 +21,10 @@ export interface SaleEntry {
 export interface SaleJson {
 	updatedAt: string;
 	data: SaleEntry[];
+}
+
+export function isIgnoredEventEntry(entry: SaleEntry): boolean {
+	return IGNORED_STAGE_IDS.some((id) => entry.stageIds.includes(id));
 }
 
 export interface EventOccurrence {
@@ -192,8 +197,7 @@ export function collectEventOccurrences(
 ): EventOccurrence[] {
 	const occurrences = new Map<string, { startAt: Date; endAt: Date; eventIds: Set<number> }>();
 	for (const entry of sale.data) {
-		// 104 marks entries that must not participate in event-start notifications.
-		if (entry.stageIds.includes(104)) continue;
+		if (isIgnoredEventEntry(entry)) continue;
 		const entryStart = parseHeaderPoint(entry.header.startDate, entry.header.startTime);
 		const entryEnd = parseHeaderPoint(entry.header.endDate, entry.header.endTime);
 		if (!Number.isFinite(entryStart.getTime()) || !Number.isFinite(entryEnd.getTime())) continue;
