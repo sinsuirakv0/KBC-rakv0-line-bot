@@ -24,11 +24,11 @@ export const stageCommand: LineCommand = {
 	async execute({ message, args }) {
 		if (args[0]?.toLowerCase() === "help") {
 			await message.reply([
-				"!stage / !st",
+				"!st",
 				"",
-				"!stage",
+				"!st",
 				"  ステージ検索ページのURLを表示します。",
-				"!stage <名前またはID>",
+				"!st <名前またはID>",
 				"  マップ名やステージ名を検索します。候補が少ない時は詳細ページURL、多い時は一覧を返します。",
 			].join("\n"));
 			return;

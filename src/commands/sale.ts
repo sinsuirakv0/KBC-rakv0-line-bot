@@ -99,7 +99,7 @@ export const saleCommand: LineCommand = {
 				"!sale <検索語>",
 				"  イベント名で検索します。",
 				"!sale <ID> json",
-				"  元データをJSON形式で表示します。",
+				"  元データをKBC独自のJSON形式で表示します。",
 				"!sale <ID> r",
 				"  rawデータを表示します。",
 			].join("\n"));

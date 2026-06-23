@@ -17,7 +17,7 @@ const IMAGE_TIMEOUT_MS = 10_000;
 function helpText(options: EntityCommandOptions): string {
 	const aliases = options.aliases.length ? ` / !${options.aliases.join(" / !")}` : "";
 	const formLine = options.forms
-		? "\n!unit <名前またはID> origin f/c/s/u\n  指定した形態の画像を送信します。f=第一、c=第二、s=第三、u=特殊です。"
+		? "\n!ut <名前またはID> origin f/c/s/u\n  指定した形態の画像を送信します。f=第一、c=第二、s=第三、u=特殊です。"
 		: "";
 	return [
 		`!${options.name}${aliases}`,

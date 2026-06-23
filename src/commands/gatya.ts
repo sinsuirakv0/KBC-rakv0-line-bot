@@ -64,10 +64,10 @@ interface ScheduleRow {
 }
 
 const FLAGS_MAP: Record<number, string> = {
-	4: "Step up",
-	20600: "超国王祭",
-	16384: "確定",
-	4216: "超国王祭",
+	4: "【step up】",
+	20600: "＋福引＆かけら",
+	16384: "＋かけら",
+	4216: "＋福引",
 };
 
 function typeTag(type: number): string {
@@ -224,7 +224,7 @@ export const gatyaCommand: LineCommand = {
 				"!gatya <検索語>",
 				"  ガチャ名で検索します。",
 				"!gatya <ID> json",
-				"  元データをJSON形式で表示します。",
+				"  元データをKBC独自のJSON形式で表示します。",
 				"!gatya <ID> r",
 				"  rawデータを表示します。",
 			].join("\n"));

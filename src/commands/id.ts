@@ -11,8 +11,6 @@ export const idCommand: LineCommand = {
 				"  自分のMIDを表示します。",
 				"!id @メンション",
 				"  メンションした相手のMIDを表示します。",
-				"",
-				"個人/グループのMIDと、OpenChat内のMIDは別物です。OpenChatのMIDはOCごとに変わります。",
 			].join("\n"));
 			return;
 		}
