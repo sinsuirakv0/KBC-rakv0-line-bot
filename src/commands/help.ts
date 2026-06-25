@@ -9,6 +9,7 @@ const COMMAND_LINES = [
 	"!tut/敵検索",
 	"!st/ステージ検索",
 	"!ranking/ランキング",
+	"!id/ID確認",
 	"!push/プッシュ通知",
 	"!bot/bot状態確認",
 	"!コマンド helpでそのコマンドの使い方を表示します",

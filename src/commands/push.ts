@@ -7,7 +7,6 @@ import {
 } from "../eventPush/format.js";
 import { isIgnoredEventEntry, type SaleEntry, type SaleJson } from "../eventPush/schedule.js";
 import { eventPushStore } from "../eventPush/store.js";
-import { newMemberGreetingStore } from "../newMembers/store.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
 
 interface EventDetails {
@@ -43,10 +42,6 @@ function pushHelpText(): string {
 		"  このグループ/OCを、gatya/sale/item更新検知の通知先に登録します。個人チャットは登録できません。",
 		"!push skd del",
 		"  このトークのスケジュール更新通知を解除します。",
-		"!push newmember",
-		"  このOpenChatで新規参加者へ「よろしく！」を送信します。",
-		"!push newmember del",
-		"  このOpenChatの参加挨拶を解除します。",
 		"!push event",
 		"  この個人/グループ/OCを、イベント開始通知先として登録します。",
 		"!push event <イベントID>",
@@ -61,12 +56,10 @@ function pushHelpText(): string {
 async function statusText(destination: LineDestination): Promise<string> {
 	const skdEnabled = pushSubscriptionStore.has(destination);
 	const event = eventPushStore.get(destination);
-	const newMemberEnabled = newMemberGreetingStore.has(destination);
 	const lines = [
 		"通知設定",
 		`スケジュール更新通知: ${skdEnabled ? "有効" : "無効"}`,
 		`イベント開始通知: ${event ? "有効" : "無効"}`,
-		`参加挨拶: ${newMemberEnabled ? "有効" : "無効"}`,
 	];
 
 	if (event) {
@@ -137,46 +130,9 @@ export const pushCommand: LineCommand = {
 			return;
 		}
 
-		if (action === "newmember") {
-			const newMemberAction = args[1]?.toLowerCase() || "on";
-			if (newMemberAction === "help") {
-				await message.send([
-					"!push newmember",
-					"",
-					"!push newmember",
-					"  このOpenChatで新規参加者へ「よろしく！」を送信します。",
-					"!push newmember del",
-					"  このOpenChatの参加挨拶を解除します。",
-					"!push status",
-					"  現在の通知設定を確認します。",
-				].join("\n"));
-				return;
-			}
-			if (newMemberAction === "del" || newMemberAction === "off" || newMemberAction === "remove" ||
-				newMemberAction === "disable") {
-				const removed = await newMemberGreetingStore.disable(message.destination);
-				await message.send(removed
-					? "このOpenChatの参加挨拶を解除しました。"
-					: "このOpenChatは参加挨拶に登録されていません。");
-				return;
-			}
-			if (newMemberAction !== "on") {
-				await message.send("使い方: !push newmember [del]");
-				return;
-			}
-			try {
-				const added = await newMemberGreetingStore.enable(message.destination);
-				await message.send(added
-					? "このOpenChatで新規参加者へ「よろしく！」を送信します。"
-					: "このOpenChatはすでに参加挨拶が有効です。");
-			} catch (error) {
-				await message.send(error instanceof Error ? error.message : String(error));
-			}
-			return;
-		}
 
 		if (action !== "event") {
-			await message.send("使い方: !push [status|skd|newmember|event]\n詳しくは !push help");
+			await message.send("使い方: !push [status|skd|event]\n詳しくは !push help");
 			return;
 		}
 

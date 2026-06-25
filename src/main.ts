@@ -12,7 +12,6 @@ import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineSto
 import { pushSubscriptionStore } from "./subscriptions/store.js";
 import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
-import { newMemberGreetingStore } from "./newMembers/store.js";
 
 interface RawTalkMessage {
 	id: string;
@@ -474,7 +473,6 @@ async function listenRawSquareEvents(
 		onError: (error) => handlePollingError("square", error, onFatal),
 	}) as AsyncIterable<RawSquareEvent>) {
 		if (signal.aborted) break;
-		if (await handleSquareJoinEvent(client, event)) continue;
 		const rawMessage = event.type === "NOTIFICATION_MESSAGE"
 			? event.payload?.notificationMessage?.squareMessage
 			: event.type === "RECEIVE_MESSAGE"
@@ -486,59 +484,6 @@ async function listenRawSquareEvents(
 			raw: rawMessage as never,
 		})).catch((error) => handlePollingError("square", error, onFatal));
 	}
-}
-
-function isSquareJoinEvent(event: RawSquareEvent): boolean {
-	const type = event.type.toUpperCase();
-	return type.includes("JOIN_SQUARE_CHAT") ||
-		type.includes("CREATE_SQUARE_CHAT_MEMBER") ||
-		type.includes("NEW_CHAT_MEMBER");
-}
-
-function findStringValue(value: unknown, keyNames: Set<string>): string | undefined {
-	if (!value || typeof value !== "object") return undefined;
-	for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-		if (keyNames.has(key) && typeof child === "string") return child;
-		const found = findStringValue(child, keyNames);
-		if (found) return found;
-	}
-	return undefined;
-}
-
-function findNumberValue(value: unknown, keyNames: Set<string>): number | undefined {
-	if (!value || typeof value !== "object") return undefined;
-	for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-		if (keyNames.has(key)) {
-			if (typeof child === "number") return child;
-			if (typeof child === "bigint") return Number(child);
-			if (typeof child === "string" && /^\d+$/.test(child)) return Number(child);
-		}
-		const found = findNumberValue(child, keyNames);
-		if (found !== undefined) return found;
-	}
-	return undefined;
-}
-
-async function handleSquareJoinEvent(client: Client, event: RawSquareEvent): Promise<boolean> {
-	if (!isSquareJoinEvent(event)) return false;
-	const squareChatMid = findStringValue(event, new Set(["squareChatMid"]));
-	if (!squareChatMid) {
-		console.warn(`[square:join] squareChatMid not found in ${event.type}`);
-		return false;
-	}
-	const setting = newMemberGreetingStore.get({ kind: "square", chatMid: squareChatMid });
-	if (!setting) return true;
-	const createdAt = findNumberValue(event, new Set(["createdAt", "createdTime", "timestamp", "time"]));
-	if (!createdAt || createdAt < Date.parse(setting.registeredAt)) {
-		console.log(`[square:join] skipped stale or undated event ${event.type} for ${squareChatMid}`);
-		return true;
-	}
-	try {
-		await client.base.square.sendMessage({ squareChatMid, text: "よろしく！" });
-	} catch (error) {
-		console.error("[square:join] welcome message failed", error);
-	}
-	return true;
 }
 
 function waitForAbort(signal: AbortSignal): Promise<void> {
@@ -648,7 +593,6 @@ async function main(): Promise<void> {
 		eventPushStore.initialize(),
 		rankingStore.initialize(),
 		runtimeStore.initialize(),
-		newMemberGreetingStore.initialize(),
 	]);
 	startEventPushScheduler(() => activeClient, shutdownController.signal);
 	const storage = await initializeLineStorage();
