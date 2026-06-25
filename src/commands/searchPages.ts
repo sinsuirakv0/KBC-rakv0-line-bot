@@ -7,19 +7,28 @@ interface SearchPageSession {
 	title: string;
 	rows: string[];
 	destinationKey: string;
+	senderMid: string;
 	expiresAt: number;
 }
 
 const sessions = new Map<string, SearchPageSession>();
+const recentSessions = new Map<string, SearchPageSession>();
 
 function destinationKey(message: ReplyableLineMessage): string {
 	return `${message.destination.kind}:${message.destination.chatMid}`;
+}
+
+function recentKey(message: ReplyableLineMessage): string {
+	return `${destinationKey(message)}:${message.destination.senderMid}`;
 }
 
 function cleanup(): void {
 	const now = Date.now();
 	for (const [messageId, session] of sessions) {
 		if (session.expiresAt <= now) sessions.delete(messageId);
+	}
+	for (const [key, session] of recentSessions) {
+		if (session.expiresAt <= now) recentSessions.delete(key);
 	}
 }
 
@@ -46,10 +55,12 @@ export async function sendSearchResults(
 		title,
 		rows,
 		destinationKey: destinationKey(message),
+		senderMid: message.destination.senderMid,
 		expiresAt: Date.now() + EXPIRES_MS,
 	};
 	const messageId = await message.send(formatPage(temporarySession, 1));
 	if (messageId && rows.length > PAGE_SIZE) sessions.set(messageId, temporarySession);
+	if (rows.length > PAGE_SIZE) recentSessions.set(recentKey(message), temporarySession);
 }
 
 export async function handleSearchPageReply(
@@ -57,12 +68,12 @@ export async function handleSearchPageReply(
 	message: ReplyableLineMessage,
 ): Promise<boolean> {
 	cleanup();
-	const targetId = message.replyToMessageId;
-	if (!targetId) return false;
 	const page = Number.parseInt(messageText.trim(), 10);
 	if (!Number.isInteger(page) || String(page) !== messageText.trim() || page < 2) return false;
-	const session = sessions.get(targetId);
-	if (!session || session.destinationKey !== destinationKey(message)) return false;
+	const targetId = message.replyToMessageId;
+	const session = targetId ? sessions.get(targetId) : recentSessions.get(recentKey(message));
+	if (!session || session.destinationKey !== destinationKey(message) ||
+		session.senderMid !== message.destination.senderMid) return false;
 	const maxPage = Math.ceil(session.rows.length / PAGE_SIZE);
 	if (page > maxPage) {
 		await message.send(`ページは1~${maxPage}までです。`);
@@ -70,6 +81,10 @@ export async function handleSearchPageReply(
 	}
 	const messageId = await message.send(formatPage(session, page));
 	if (messageId && page < maxPage) sessions.set(messageId, {
+		...session,
+		expiresAt: Date.now() + EXPIRES_MS,
+	});
+	if (page < maxPage) recentSessions.set(recentKey(message), {
 		...session,
 		expiresAt: Date.now() + EXPIRES_MS,
 	});

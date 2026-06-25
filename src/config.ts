@@ -83,6 +83,11 @@ export const appConfig = {
 	rankingGithubPath: process.env.RANKING_GITHUB_PATH || "stats/ranking.json",
 	botStatusFile: path.resolve(process.env.BOT_STATUS_FILE || "./storage/bot-status.json"),
 	botStatusGithubPath: process.env.BOT_STATUS_GITHUB_PATH || "stats/bot-status.json",
+	newMemberGreetingsFile: path.resolve(
+		process.env.NEW_MEMBER_GREETINGS_FILE || "./storage/new-member-greetings.json",
+	),
+	newMemberGreetingsGithubPath:
+		process.env.NEW_MEMBER_GREETINGS_GITHUB_PATH || "settings/new-member-greetings.json",
 };
 
 export function getPasswordCredentials(): { email: string; password: string } {
