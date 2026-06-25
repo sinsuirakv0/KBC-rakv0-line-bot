@@ -47,12 +47,13 @@ async function cachedFetch<T>(
 }
 
 export interface ReplyableLineMessage {
-	reply(text: string): Promise<void>;
-	send(text: string): Promise<void>;
+	reply(text: string): Promise<string | undefined>;
+	send(text: string): Promise<string | undefined>;
 	sendImage(image: OutgoingImage): Promise<void>;
 	client: Client;
 	destination: LineDestination;
 	mentionMids: string[];
+	replyToMessageId?: string;
 }
 
 export interface OutgoingImage {

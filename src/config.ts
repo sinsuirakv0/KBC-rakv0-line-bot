@@ -81,6 +81,8 @@ export const appConfig = {
 	eventPushLookbackMs: Number(process.env.EVENT_PUSH_LOOKBACK_MS || 10 * 60_000),
 	rankingFile: path.resolve(process.env.RANKING_FILE || "./storage/ranking.json"),
 	rankingGithubPath: process.env.RANKING_GITHUB_PATH || "stats/ranking.json",
+	botStatusFile: path.resolve(process.env.BOT_STATUS_FILE || "./storage/bot-status.json"),
+	botStatusGithubPath: process.env.BOT_STATUS_GITHUB_PATH || "stats/bot-status.json",
 };
 
 export function getPasswordCredentials(): { email: string; password: string } {

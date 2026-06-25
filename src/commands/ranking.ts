@@ -26,7 +26,15 @@ export const rankingCommand: LineCommand = {
 				"  このトーク内のコマンド実行回数ランキングを1位から10位まで表示します。",
 				"!ranking 4~14",
 				"  指定した順位範囲を表示します。1回に表示できるのは最大50人までです。",
+				"!ranking updatede",
+				"  現在のランキングJSONをline-dataへ手動保存します。",
 			].join("\n"));
+			return;
+		}
+
+		if (args[0]?.toLowerCase() === "updatede" || args[0]?.toLowerCase() === "update") {
+			await rankingStore.flush();
+			await message.send("ランキングJSONを手動更新しました。");
 			return;
 		}
 

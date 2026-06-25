@@ -1,21 +1,12 @@
 import { getStageUrl, searchStages } from "../search/stageSearch.js";
 import type { LineCommand } from "./shared.js";
-import { sendError, sendLong } from "./shared.js";
+import { sendError } from "./shared.js";
+import { sendSearchResults } from "./searchPages.js";
 
 interface StageResult {
 	id: string;
 	name: string;
 	type: "map" | "stage";
-}
-
-function formatList(query: string, results: StageResult[]): string {
-	const shown = results.slice(0, 20);
-	const lines = [
-		`ステージ「${query}」検索結果 (${results.length}件)`,
-		...shown.map((result) => `${result.id} ${result.name}`),
-	];
-	if (results.length > shown.length) lines.push(`...ほか ${results.length - shown.length}件`);
-	return lines.join("\n");
 }
 
 export const stageCommand: LineCommand = {
@@ -30,6 +21,8 @@ export const stageCommand: LineCommand = {
 				"  ステージ検索ページのURLを表示します。",
 				"!st <名前またはID>",
 				"  マップ名やステージ名を検索します。候補が少ない時は詳細ページURL、多い時は一覧を返します。",
+				"!st <検索語> -f",
+				"  正規化せずに元の名前へ直接検索します。通常検索で拾えない表記を探す時に使います。",
 			].join("\n"));
 			return;
 		}
@@ -65,6 +58,10 @@ export const stageCommand: LineCommand = {
 			return;
 		}
 
-		await sendLong(message, formatList(query, results));
+		await sendSearchResults(
+			message,
+			`ステージ「${query}」検索結果`,
+			results.map((result) => `${result.id} ${result.name}`),
+		);
 	},
 };

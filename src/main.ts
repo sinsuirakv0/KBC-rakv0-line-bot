@@ -2,6 +2,7 @@ import { SquareMessage, type Client } from "@evex/linejs";
 import { appConfig } from "./config.js";
 import { handleLineCommand } from "./commands/index.js";
 import type { OutgoingImage, ReplyableLineMessage } from "./commands/shared.js";
+import { handleSearchPageReply } from "./commands/searchPages.js";
 import { handlePing } from "./handlers/ping.js";
 import { createLineClient, isAuthenticationError } from "./lineClient.js";
 import { startEventPushScheduler } from "./eventPush/scheduler.js";
@@ -10,6 +11,7 @@ import { startEventUpdateServer } from "./server/eventUpdateServer.js";
 import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineStorage.js";
 import { pushSubscriptionStore } from "./subscriptions/store.js";
 import { rankingStore } from "./ranking/store.js";
+import { runtimeStore } from "./runtime/store.js";
 
 interface RawTalkMessage {
 	id: string;
@@ -20,6 +22,8 @@ interface RawTalkMessage {
 	text?: string;
 	chunks?: unknown;
 	contentMetadata?: Record<string, string>;
+	relatedMessageId?: string;
+	messageRelationType?: string | number;
 }
 
 interface RawTalkEvent {
@@ -53,7 +57,7 @@ interface RawSquareEvent {
 		receiveMessage?: {
 			squareMessage: unknown;
 		};
-	};
+	} & Record<string, unknown>;
 }
 
 let warnedEncryptedTalk = false;
@@ -94,7 +98,6 @@ async function dispatchText(
 async function handleSquareMessage(client: Client, message: SquareMessage): Promise<void> {
 	if (await message.isMyMessage()) return;
 	if (typeof message.text !== "string") return;
-	if (!message.text.startsWith(appConfig.commandPrefix)) return;
 	const scopeMid = await resolveSquareScope(client, message.to.id, message.from.id);
 	const target = new SquareReplyTarget(
 		client,
@@ -102,6 +105,10 @@ async function handleSquareMessage(client: Client, message: SquareMessage): Prom
 		scopeMid,
 		senderNames.get(`square:${message.from.id}`),
 	);
+	if (!message.text.startsWith(appConfig.commandPrefix)) {
+		await handleSearchPageReply(message.text, target);
+		return;
+	}
 	await dispatchText("square", message.text, target);
 	void resolveSenderName(client, "square", message.from.id)
 		.then((name) => {
@@ -164,6 +171,7 @@ function resolveSenderName(
 class SquareReplyTarget implements ReplyableLineMessage {
 	readonly destination;
 	readonly mentionMids: string[];
+	readonly replyToMessageId?: string;
 
 	constructor(
 		readonly client: Client,
@@ -173,6 +181,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	) {
 		this.mentionMids = message.getMentions()
 			.flatMap((mention) => mention.all ? [] : [mention.mid]);
+		this.replyToMessageId = message.getReplyTarget()?.id;
 		this.destination = {
 			kind: "square" as const,
 			chatMid: message.to.id,
@@ -184,15 +193,16 @@ class SquareReplyTarget implements ReplyableLineMessage {
 		};
 	}
 
-	async reply(text: string): Promise<void> {
-		await this.message.reply(text);
+	async reply(text: string): Promise<string | undefined> {
+		return await this.send(text);
 	}
 
-	async send(text: string): Promise<void> {
-		await this.client.base.square.sendMessage({
+	async send(text: string): Promise<string | undefined> {
+		const sent = await this.client.base.square.sendMessage({
 			squareChatMid: this.destination.chatMid,
 			text,
 		});
+		return messageIdFromSquareSendResult(sent);
 	}
 
 	async sendImage(image: OutgoingImage): Promise<void> {
@@ -215,6 +225,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 class RawTalkReplyTarget implements ReplyableLineMessage {
 	readonly destination;
 	readonly mentionMids: string[];
+	readonly replyToMessageId?: string;
 
 	constructor(
 		readonly client: Client,
@@ -223,6 +234,10 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 		mentionMids: string[],
 	) {
 		this.mentionMids = mentionMids;
+		this.replyToMessageId = raw.relatedMessageId &&
+				(raw.messageRelationType === 3 || raw.messageRelationType === "REPLY")
+			? raw.relatedMessageId
+			: undefined;
 		this.destination = {
 			kind: "talk" as const,
 			chatMid: this.sendTo(),
@@ -234,12 +249,12 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 		};
 	}
 
-	async reply(text: string): Promise<void> {
-		await this.sendTalk(text, this.raw.id);
+	async reply(text: string): Promise<string | undefined> {
+		return await this.sendTalk(text);
 	}
 
-	async send(text: string): Promise<void> {
-		await this.sendTalk(text);
+	async send(text: string): Promise<string | undefined> {
+		return await this.sendTalk(text);
 	}
 
 	async sendImage(image: OutgoingImage): Promise<void> {
@@ -280,13 +295,14 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 		return "USER";
 	}
 
-	private async sendTalk(text: string, relatedMessageId?: string): Promise<void> {
-		await this.client.base.talk.sendMessage({
+	private async sendTalk(text: string, relatedMessageId?: string): Promise<string | undefined> {
+		const sent = await this.client.base.talk.sendMessage({
 			to: this.sendTo(),
 			text,
 			relatedMessageId,
 			e2ee: this.isEncrypted(),
 		});
+		return sent.id;
 	}
 
 	private isEncrypted(): boolean {
@@ -356,7 +372,11 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 
 	const parsed = await readTalkText(client, raw);
 	if (parsed === null) return;
-	if (!parsed.text.startsWith(appConfig.commandPrefix)) return;
+	const target = new RawTalkReplyTarget(client, raw, ownMid, parsed.mentionMids);
+	if (!parsed.text.startsWith(appConfig.commandPrefix)) {
+		await handleSearchPageReply(parsed.text, target);
+		return;
+	}
 	const createdAt = Number(raw.createdTime);
 	if (Number.isFinite(createdAt) && createdAt > 1_500_000_000_000) {
 		const receiveLagMs = Math.max(0, Date.now() - createdAt);
@@ -367,7 +387,7 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 	await dispatchText(
 		"talk",
 		parsed.text,
-		new RawTalkReplyTarget(client, raw, ownMid, parsed.mentionMids),
+		target,
 	);
 	void resolveSenderName(client, "talk", raw.from)
 		.then((name) => {
@@ -449,6 +469,7 @@ async function listenRawSquareEvents(
 		onError: (error) => handlePollingError("square", error, onFatal),
 	}) as AsyncIterable<RawSquareEvent>) {
 		if (signal.aborted) break;
+		if (await handleSquareJoinEvent(client, event)) continue;
 		const rawMessage = event.type === "NOTIFICATION_MESSAGE"
 			? event.payload?.notificationMessage?.squareMessage
 			: event.type === "RECEIVE_MESSAGE"
@@ -460,6 +481,38 @@ async function listenRawSquareEvents(
 			raw: rawMessage as never,
 		})).catch((error) => handlePollingError("square", error, onFatal));
 	}
+}
+
+function isSquareJoinEvent(event: RawSquareEvent): boolean {
+	const type = event.type.toUpperCase();
+	return type.includes("JOIN_SQUARE_CHAT") ||
+		type.includes("CREATE_SQUARE_CHAT_MEMBER") ||
+		type.includes("NEW_CHAT_MEMBER");
+}
+
+function findStringValue(value: unknown, keyNames: Set<string>): string | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+		if (keyNames.has(key) && typeof child === "string") return child;
+		const found = findStringValue(child, keyNames);
+		if (found) return found;
+	}
+	return undefined;
+}
+
+async function handleSquareJoinEvent(client: Client, event: RawSquareEvent): Promise<boolean> {
+	if (!isSquareJoinEvent(event)) return false;
+	const squareChatMid = findStringValue(event, new Set(["squareChatMid"]));
+	if (!squareChatMid) {
+		console.warn(`[square:join] squareChatMid not found in ${event.type}`);
+		return false;
+	}
+	try {
+		await client.base.square.sendMessage({ squareChatMid, text: "よろしく！" });
+	} catch (error) {
+		console.error("[square:join] welcome message failed", error);
+	}
+	return true;
 }
 
 function waitForAbort(signal: AbortSignal): Promise<void> {
@@ -478,6 +531,7 @@ async function runSession(
 ): Promise<void> {
 	const profile = await client.getMyProfile();
 	console.log(`[line] logged in as ${profile.displayName} (${profile.mid})`);
+	await runtimeStore.startSession();
 	try {
 		await client.base.e2ee.getE2EESelfKeyData(profile.mid);
 		console.log("[line] E2EE self key is available");
@@ -531,14 +585,23 @@ async function runSession(
 				watchdogRunning = false;
 			});
 	}, appConfig.authWatchdogMs);
+	const runtimeCheckpoint = setInterval(() => {
+		void runtimeStore.checkpoint().catch((error) => {
+			console.warn("[runtime] checkpoint failed", error);
+		});
+	}, 5 * 60_000);
 
 	try {
 		await Promise.race([waitForAbort(shutdownSignal), sessionFailure]);
 	} finally {
 		clearInterval(watchdog);
+		clearInterval(runtimeCheckpoint);
 		clearInterval(eventLoopMonitor);
 		controller.abort();
 		shutdownSignal.removeEventListener("abort", relayShutdown);
+		await runtimeStore.endSession().catch((error) => {
+			console.warn("[runtime] session uptime save failed", error);
+		});
 	}
 }
 
@@ -558,6 +621,7 @@ async function main(): Promise<void> {
 		pushSubscriptionStore.initialize(),
 		eventPushStore.initialize(),
 		rankingStore.initialize(),
+		runtimeStore.initialize(),
 	]);
 	startEventPushScheduler(() => activeClient, shutdownController.signal);
 	const storage = await initializeLineStorage();
@@ -579,6 +643,7 @@ async function main(): Promise<void> {
 
 	await storage.flushBackup().catch(() => {});
 	await rankingStore.flush().catch(() => {});
+	await runtimeStore.flush().catch(() => {});
 	await new Promise<void>((resolve) => eventUpdateServer.close(() => resolve()));
 }
 

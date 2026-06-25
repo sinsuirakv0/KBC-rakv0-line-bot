@@ -1,6 +1,7 @@
 import type { EntitySearchEntry } from "../search/entitySearch.js";
 import type { LineCommand } from "./shared.js";
-import { sendError, sendLong } from "./shared.js";
+import { sendError } from "./shared.js";
+import { sendSearchResults } from "./searchPages.js";
 
 interface EntityCommandOptions {
 	name: string;
@@ -26,21 +27,13 @@ function helpText(options: EntityCommandOptions): string {
 		"  検索ページのURLを表示します。",
 		`!${options.name} <名前またはID>`,
 		`  ${options.label}を検索します。候補が少ない時は詳細ページURL、多い時は一覧を返します。`,
+		`!${options.name} <検索語> -f`,
+		"  正規化せずに元の名前へ直接検索します。通常検索で拾えない表記を探す時に使います。",
 		options.originImageUrl
 			? `!${options.name} <名前またはID> origin\n  検索結果の先頭に一致した${options.label}の画像を送信します。`
 			: "",
 		formLine,
 	].filter(Boolean).join("\n");
-}
-
-function formatList(label: string, query: string, entries: EntitySearchEntry[]): string {
-	const shown = entries.slice(0, 20);
-	const lines = [
-		`${label}「${query}」検索結果 (${entries.length}件)`,
-		...shown.map((entry) => `${entry.id} ${entry.names[0]}`),
-	];
-	if (entries.length > shown.length) lines.push(`...ほか ${entries.length - shown.length}件`);
-	return lines.join("\n");
 }
 
 function imageFilename(url: string): string {
@@ -110,7 +103,11 @@ export function createEntitySearchCommand(options: EntityCommandOptions): LineCo
 				return;
 			}
 
-			await sendLong(message, formatList(options.label, query, result));
+			await sendSearchResults(
+				message,
+				`${options.label}「${query}」検索結果`,
+				result.map((entry) => `${entry.id} ${entry.names[0]}`),
+			);
 		},
 	};
 }

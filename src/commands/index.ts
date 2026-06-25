@@ -1,5 +1,6 @@
 import { appConfig } from "../config.js";
 import type { LineCommand, ReplyableLineMessage } from "./shared.js";
+import { botCommand } from "./bot.js";
 import { enemyCommand } from "./enemy.js";
 import { gatyaCommand } from "./gatya.js";
 import { helpCommand } from "./help.js";
@@ -27,6 +28,7 @@ for (const command of [
 	rankingCommand,
 	testCommand,
 	helpCommand,
+	botCommand,
 ]) {
 	commands.set(command.name, command);
 	for (const alias of command.aliases ?? []) commands.set(alias, command);
