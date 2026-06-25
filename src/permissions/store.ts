@@ -71,17 +71,17 @@ function nowIso(): string {
 }
 
 export function roleLabel(role: PermissionLevel): string {
-	if (role === "admin") return "管理者";
-	if (role === "mod") return "モデレーター";
-	return "なし";
+	if (role === "admin") return "\u7ba1\u7406\u8005";
+	if (role === "mod") return "\u30e2\u30c7\u30ec\u30fc\u30bf\u30fc";
+	return "\u4e00\u822c";
 }
 
 export function requiredPermissionLabel(role: Exclude<PermissionLevel, "none">): string {
-	return role === "admin" ? "管理者" : "モデレーター";
+	return role === "admin" ? "\u7ba1\u7406\u8005" : "\u30e2\u30c7\u30ec\u30fc\u30bf\u30fc";
 }
 
 export function permissionDeniedText(required: Exclude<PermissionLevel, "none">): string {
-	return `実行権限がありません。権限：${requiredPermissionLabel(required)}以上のBOT管理権限が必要です。`;
+	return `\u5b9f\u884c\u6a29\u9650\u304c\u3042\u308a\u307e\u305b\u3093\u3002\u6a29\u9650\uff1a${requiredPermissionLabel(required)}\u4ee5\u4e0a\u306eBOT\u7ba1\u7406\u6a29\u9650\u304c\u5fc5\u8981\u3067\u3059\u3002`;
 }
 
 export function targetFromDestination(destination: LineDestination): PermissionTarget | null {
@@ -213,6 +213,16 @@ class PermissionStore {
 		return roleRank(this.getRole(target, userMid)) >= roleRank(required);
 	}
 
+	executionStatus(target: PermissionTarget | null, userMid: string): { role: PermissionLevel; banned: boolean } {
+		if (!target) return { role: "none", banned: false };
+		const role = this.getRole(target, userMid);
+		if (role === "admin") return { role, banned: false };
+		return {
+			role,
+			banned: this.isUserBanned(target, userMid) || this.isTalkBanned(target),
+		};
+	}
+
 	canExecute(destination: LineDestination): boolean {
 		const target = targetFromDestination(destination);
 		if (!target) return true;
@@ -241,6 +251,17 @@ class PermissionStore {
 		return "created";
 	}
 
+	removeRole(target: PermissionTarget, userMid: string, role?: PermissionRole): "removed" | "not_found" {
+		const before = this.data.roles.length;
+		this.data.roles = this.data.roles.filter((item) => {
+			if (targetKey(item) !== targetKey(target) || item.userMid !== userMid) return true;
+			return role ? item.role !== role : false;
+		});
+		if (this.data.roles.length === before) return "not_found";
+		this.scheduleSave();
+		return "removed";
+	}
+
 	banUser(target: PermissionTarget, userMid: string, createdBy: string): "banned" | "already" | "admin" {
 		if (this.getRole(target, userMid) === "admin") return "admin";
 		if (this.isUserBanned(target, userMid)) return "already";
@@ -249,11 +270,27 @@ class PermissionStore {
 		return "banned";
 	}
 
+	unbanUser(target: PermissionTarget, userMid: string): "removed" | "not_found" {
+		const before = this.data.userBans.length;
+		this.removeUserBan(target, userMid);
+		if (this.data.userBans.length === before) return "not_found";
+		this.scheduleSave();
+		return "removed";
+	}
+
 	banTalk(target: PermissionTarget, createdBy: string): "banned" | "already" {
 		if (this.isTalkBanned(target)) return "already";
 		this.data.talkBans.push({ ...target, createdAt: nowIso(), createdBy });
 		this.scheduleSave();
 		return "banned";
+	}
+
+	unbanTalk(target: PermissionTarget): "removed" | "not_found" {
+		const before = this.data.talkBans.length;
+		this.data.talkBans = this.data.talkBans.filter((item) => targetKey(item) !== targetKey(target));
+		if (this.data.talkBans.length === before) return "not_found";
+		this.scheduleSave();
+		return "removed";
 	}
 
 	snapshot(target: PermissionTarget): { roles: RoleGrant[]; userBans: UserBan[]; talkBanned: boolean } {

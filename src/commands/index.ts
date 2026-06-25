@@ -2,7 +2,6 @@ import { appConfig } from "../config.js";
 import type { LineCommand, ReplyableLineMessage } from "./shared.js";
 import { banCommand } from "./ban.js";
 import { botCommand } from "./bot.js";
-import { botsettingCommand } from "./botsetting.js";
 import { enemyCommand } from "./enemy.js";
 import { gatyaCommand } from "./gatya.js";
 import { helpCommand } from "./help.js";
@@ -32,7 +31,6 @@ for (const command of [
 	testCommand,
 	helpCommand,
 	botCommand,
-	botsettingCommand,
 ]) {
 	commands.set(command.name, command);
 	for (const alias of command.aliases ?? []) commands.set(alias, command);

@@ -79,7 +79,11 @@ async function dispatchText(
 	const startedAt = Date.now();
 	activeHandlers += 1;
 	try {
-		if (messageText.startsWith(appConfig.commandPrefix) && !permissionStore.canExecute(message.destination)) {
+		if (
+			messageText.startsWith(appConfig.commandPrefix) &&
+			!isBotPermissionStatusCommand(messageText) &&
+			!permissionStore.canExecute(message.destination)
+		) {
 			await message.send("実行権限がありません。");
 			return;
 		}
@@ -98,6 +102,11 @@ async function dispatchText(
 		}
 		activeHandlers -= 1;
 	}
+}
+
+function isBotPermissionStatusCommand(messageText: string): boolean {
+	const body = messageText.slice(appConfig.commandPrefix.length).trim().toLowerCase();
+	return /^bot\s+setting\s+status(?:\s|$)/.test(body);
 }
 
 async function handleSquareMessage(client: Client, message: SquareMessage): Promise<void> {

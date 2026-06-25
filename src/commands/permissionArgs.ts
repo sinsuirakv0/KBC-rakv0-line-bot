@@ -16,10 +16,16 @@ export function parseChatType(args: string[], fallback?: PermissionChatType): Pe
 	return fallback;
 }
 
+function inferChatTypeFromMid(mid: string): PermissionChatType | undefined {
+	if (mid.startsWith("m")) return "SQUARE";
+	if (mid.startsWith("c")) return "GROUP";
+	return undefined;
+}
+
 export function parseTarget(args: string[], destination: LineDestination): PermissionTarget | null {
 	const explicitTalkId = argValue(args, "talkID") || argValue(args, "talkId") || argValue(args, "talkid");
 	if (explicitTalkId) {
-		const chatType = parseChatType(args);
+		const chatType = parseChatType(args) || inferChatTypeFromMid(explicitTalkId);
 		if (!chatType) return null;
 		return { chatMid: explicitTalkId, chatType };
 	}
