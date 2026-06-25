@@ -1,6 +1,15 @@
 import type { Client } from "@evex/linejs";
 import type { LineCommand, LineDestination } from "./shared.js";
 
+interface MemberInfo {
+	mid: string;
+	name: string;
+}
+
+function normalizeText(value: string): string {
+	return value.normalize("NFKC").toLowerCase();
+}
+
 function userNameFromRaw(raw: unknown): string | undefined {
 	const value = raw as {
 		targetProfileDetail?: { profileName?: string };
@@ -52,12 +61,77 @@ async function resolveTalkName(client: Client, destination: LineDestination): Pr
 	}
 }
 
+async function resolveTalkMember(client: Client, mid: string): Promise<MemberInfo> {
+	try {
+		const user = await client.getUser(mid);
+		return { mid, name: userNameFromRaw(user.raw) || "(名前なし)" };
+	} catch (error) {
+		console.warn(`[id] failed to resolve talk member ${mid}`, error);
+		return { mid, name: "(取得失敗)" };
+	}
+}
+
+async function listMembers(client: Client, destination: LineDestination): Promise<MemberInfo[]> {
+	if (destination.kind === "square") {
+		const squareChat = await client.getSquareChat(destination.chatMid);
+		const members = await squareChat.getMembers();
+		return members.map((member) => ({
+			mid: member.squareMemberMid,
+			name: member.displayName || "(名前なし)",
+		}));
+	}
+
+	if (destination.chatType === "USER") {
+		return [{
+			mid: destination.senderMid,
+			name: destination.senderName || await resolvePersonName(client, destination, destination.senderMid),
+		}];
+	}
+
+	const chat = await client.getChat(destination.chatMid);
+	const raw = chat.raw as {
+		extra?: {
+			groupExtra?: {
+				memberMids?: Record<string, unknown>;
+			};
+		};
+	};
+	const mids = Object.keys(raw.extra?.groupExtra?.memberMids ?? {});
+	return await Promise.all(mids.map((mid) => resolveTalkMember(client, mid)));
+}
+
 function personText(mid: string, name: string): string {
 	return [
 		"ユーザーID",
 		`名前: ${name}`,
 		`MID: ${mid}`,
 	].join("\n");
+}
+
+async function searchMembers(
+	client: Client,
+	destination: LineDestination,
+	query: string,
+): Promise<MemberInfo[]> {
+	const normalizedQuery = normalizeText(query);
+	const members = await listMembers(client, destination);
+	return members
+		.filter((member) => normalizeText(member.name).includes(normalizedQuery))
+		.sort((left, right) => left.name.localeCompare(right.name, "ja") || left.mid.localeCompare(right.mid));
+}
+
+function formatMemberList(query: string, members: MemberInfo[]): string {
+	const visible = members.slice(0, 20);
+	const lines = [
+		`検索: ${query}`,
+		`結果: ${members.length}件`,
+		"",
+		...visible.map((member, index) => `${index + 1}. ${member.name}\nMID: ${member.mid}`),
+	];
+	if (members.length > visible.length) {
+		lines.push("", `ほか${members.length - visible.length}件あります。検索語を増やして絞り込んでください。`);
+	}
+	return lines.join("\n");
 }
 
 export const idCommand: LineCommand = {
@@ -74,6 +148,8 @@ export const idCommand: LineCommand = {
 				"  メンションした相手の名前とMIDを表示します。",
 				"!id talk",
 				"  このトークの名前とMIDを表示します。",
+				"!id <メンバー名>",
+				"  このトーク内のメンバー名を検索します。1人だけ見つかった場合は、その人のMIDを表示します。",
 			].join("\n"));
 			return;
 		}
@@ -97,12 +173,32 @@ export const idCommand: LineCommand = {
 		}
 
 		const mentionedMid = message.mentionMids[0];
-		if (!mentionedMid) {
-			await message.send("IDを取得する相手をメンションしてください。\n使い方: !id @メンション\nトークIDは !id talk");
+		if (mentionedMid) {
+			const name = await resolvePersonName(message.client, message.destination, mentionedMid);
+			await message.send(personText(mentionedMid, name));
 			return;
 		}
 
-		const name = await resolvePersonName(message.client, message.destination, mentionedMid);
-		await message.send(personText(mentionedMid, name));
+		const query = args.join(" ").trim();
+		if (!query) {
+			await message.send("検索するメンバー名を指定してください。\n使い方: !id <メンバー名>");
+			return;
+		}
+
+		try {
+			const matches = await searchMembers(message.client, message.destination, query);
+			if (matches.length === 0) {
+				await message.send(`「${query}」に一致するメンバーは見つかりませんでした。`);
+				return;
+			}
+			if (matches.length === 1) {
+				await message.send(personText(matches[0].mid, matches[0].name));
+				return;
+			}
+			await message.send(formatMemberList(query, matches));
+		} catch (error) {
+			console.error("[id] member search failed", error);
+			await message.send(`メンバー検索に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+		}
 	},
 };

@@ -10,8 +10,10 @@ const COMMAND_LINES = [
 	"!st/ステージ検索",
 	"!ranking/ランキング",
 	"!id/ID確認",
+	"!ban/BOT管理BAN",
 	"!push/プッシュ通知",
 	"!bot/bot状態確認",
+	"!botsetting/BOT管理設定",
 	"!コマンド helpでそのコマンドの使い方を表示します",
 ];
 

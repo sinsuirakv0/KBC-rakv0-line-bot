@@ -12,6 +12,7 @@ import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineSto
 import { pushSubscriptionStore } from "./subscriptions/store.js";
 import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
+import { permissionStore } from "./permissions/store.js";
 
 interface RawTalkMessage {
 	id: string;
@@ -78,6 +79,10 @@ async function dispatchText(
 	const startedAt = Date.now();
 	activeHandlers += 1;
 	try {
+		if (messageText.startsWith(appConfig.commandPrefix) && !permissionStore.canExecute(message.destination)) {
+			await message.send("実行権限がありません。");
+			return;
+		}
 		if (messageText === `${appConfig.commandPrefix}ping` || messageText === `${appConfig.commandPrefix}ping help`) {
 			rankingStore.record(message.destination);
 			if (await handlePing(messageText, message)) return;
@@ -593,6 +598,7 @@ async function main(): Promise<void> {
 		eventPushStore.initialize(),
 		rankingStore.initialize(),
 		runtimeStore.initialize(),
+		permissionStore.initialize(),
 	]);
 	startEventPushScheduler(() => activeClient, shutdownController.signal);
 	const storage = await initializeLineStorage();
@@ -615,6 +621,7 @@ async function main(): Promise<void> {
 	await storage.flushBackup().catch(() => {});
 	await rankingStore.flush().catch(() => {});
 	await runtimeStore.flush().catch(() => {});
+	await permissionStore.flush().catch(() => {});
 	await new Promise<void>((resolve) => eventUpdateServer.close(() => resolve()));
 }
 
