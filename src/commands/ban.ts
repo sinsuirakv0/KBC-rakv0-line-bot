@@ -1,4 +1,4 @@
-import { permissionDeniedText, permissionStore, targetFromDestination } from "../permissions/store.js";
+import { permissionDeniedText, permissionStore, targetFromDestination, type PermissionTarget } from "../permissions/store.js";
 import { argValue, parseTarget, targetLabel } from "./permissionArgs.js";
 import type { LineCommand } from "./shared.js";
 
@@ -7,7 +7,7 @@ function helpText(): string {
 		"!ban",
 		"",
 		"!ban @ユーザー",
-		"  このトークでユーザーBAN",
+		"  ユーザーBAN。Talk側は全グループ共通",
 		"!ban del @ユーザー",
 		"  このトークでユーザーBAN解除",
 		"!ban userID:<MID> [talkID:<MID>] [del]",
@@ -17,6 +17,10 @@ function helpText(): string {
 		"",
 		"talkIDの種類は通常自動判定します。",
 	].join("\n");
+}
+
+function userBanScopeLabel(target: PermissionTarget): string {
+	return target.chatType === "SQUARE" ? targetLabel(target) : "TALK全体";
 }
 
 function mentionedOrArgUserMid(context: Parameters<LineCommand["execute"]>[0]): string | undefined {
@@ -81,8 +85,8 @@ export const banCommand: LineCommand = {
 			const result = permissionStore.unbanUser(target, userMid);
 			await permissionStore.flush();
 			await message.send(result === "removed"
-				? `ユーザーBANを解除しました。\n対象: ${targetLabel(target)}`
-				: `このユーザーはBANされていません。\n対象: ${targetLabel(target)}`);
+				? `ユーザーBANを解除しました。\n対象: ${userBanScopeLabel(target)}`
+				: `このユーザーはBANされていません。\n対象: ${userBanScopeLabel(target)}`);
 			return;
 		}
 
@@ -93,7 +97,7 @@ export const banCommand: LineCommand = {
 			return;
 		}
 		await message.send(result === "banned"
-			? `ユーザーをBANしました。\n対象: ${targetLabel(target)}`
-			: `すでにBANされています。\n対象: ${targetLabel(target)}`);
+			? `ユーザーをBANしました。\n対象: ${userBanScopeLabel(target)}`
+			: `すでにBANされています。\n対象: ${userBanScopeLabel(target)}`);
 	},
 };

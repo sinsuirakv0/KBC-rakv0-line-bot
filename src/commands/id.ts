@@ -156,12 +156,16 @@ export const idCommand: LineCommand = {
 
 		if (action === "talk") {
 			const name = await resolveTalkName(message.client, message.destination);
-			await message.send([
+			const lines = [
 				"トークID",
 				`トーク名: ${name}`,
 				`MID: ${message.destination.chatMid}`,
 				`種別: ${message.destination.chatType}`,
-			].join("\n"));
+			];
+			if (message.destination.kind === "square" && message.destination.scopeMid !== message.destination.chatMid) {
+				lines.push(`本OC MID: ${message.destination.scopeMid}`);
+			}
+			await message.send(lines.join("\n"));
 			return;
 		}
 

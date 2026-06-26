@@ -6,7 +6,7 @@ import { githubContentsClient } from "../storage/githubContents.js";
 
 export type PermissionRole = "admin" | "mod";
 export type PermissionLevel = "admin" | "mod" | "none";
-export type PermissionChatType = "GROUP" | "SQUARE";
+export type PermissionChatType = "USER" | "GROUP" | "ROOM" | "TALK" | "SQUARE";
 
 export interface PermissionTarget {
 	chatMid: string;
@@ -85,17 +85,30 @@ export function permissionDeniedText(required: Exclude<PermissionLevel, "none">)
 }
 
 export function targetFromDestination(destination: LineDestination): PermissionTarget | null {
-	if (destination.chatType === "GROUP" || destination.chatType === "SQUARE") {
+	if (destination.kind === "square") {
 		return {
-			chatMid: destination.chatMid,
-			chatType: destination.chatType,
+			chatMid: destination.scopeMid,
+			chatType: "SQUARE",
 		};
 	}
-	return null;
+	return {
+		chatMid: destination.chatMid,
+		chatType: destination.chatType,
+	};
 }
 
 export function targetKey(target: PermissionTarget): string {
 	return `${target.chatType}:${target.chatMid}`;
+}
+
+function roleKey(target: PermissionTarget): string {
+	if (target.chatType === "SQUARE") return targetKey(target);
+	return "TALK:*";
+}
+
+function userBanKey(target: PermissionTarget): string {
+	if (target.chatType === "SQUARE") return targetKey(target);
+	return "TALK:*";
 }
 
 function roleRank(role: PermissionLevel): number {
@@ -163,7 +176,11 @@ function parseTalkBans(value: unknown): TalkBan[] {
 
 function isTarget<T extends Partial<PermissionTarget>>(value: T): value is T & PermissionTarget {
 	return typeof value.chatMid === "string" &&
-		(value.chatType === "GROUP" || value.chatType === "SQUARE");
+		(value.chatType === "USER" ||
+			value.chatType === "GROUP" ||
+			value.chatType === "ROOM" ||
+			value.chatType === "TALK" ||
+			value.chatType === "SQUARE");
 }
 
 class PermissionStore {
@@ -204,7 +221,7 @@ class PermissionStore {
 	getRole(target: PermissionTarget | null, userMid: string): PermissionLevel {
 		if (!target) return "none";
 		const grant = this.data.roles.find((item) =>
-			targetKey(item) === targetKey(target) && item.userMid === userMid
+			roleKey(item) === roleKey(target) && item.userMid === userMid
 		);
 		return grant?.role ?? "none";
 	}
@@ -235,7 +252,7 @@ class PermissionStore {
 
 	setRole(target: PermissionTarget, userMid: string, role: PermissionRole, createdBy: string): "created" | "updated" | "unchanged" {
 		const existing = this.data.roles.find((item) =>
-			targetKey(item) === targetKey(target) && item.userMid === userMid
+			roleKey(item) === roleKey(target) && item.userMid === userMid
 		);
 		if (existing) {
 			if (existing.role === role) return "unchanged";
@@ -254,7 +271,7 @@ class PermissionStore {
 	removeRole(target: PermissionTarget, userMid: string, role?: PermissionRole): "removed" | "not_found" {
 		const before = this.data.roles.length;
 		this.data.roles = this.data.roles.filter((item) => {
-			if (targetKey(item) !== targetKey(target) || item.userMid !== userMid) return true;
+			if (roleKey(item) !== roleKey(target) || item.userMid !== userMid) return true;
 			return role ? item.role !== role : false;
 		});
 		if (this.data.roles.length === before) return "not_found";
@@ -295,8 +312,8 @@ class PermissionStore {
 
 	snapshot(target: PermissionTarget): { roles: RoleGrant[]; userBans: UserBan[]; talkBanned: boolean } {
 		return {
-			roles: this.data.roles.filter((item) => targetKey(item) === targetKey(target)).map((item) => ({ ...item })),
-			userBans: this.data.userBans.filter((item) => targetKey(item) === targetKey(target)).map((item) => ({ ...item })),
+			roles: this.data.roles.filter((item) => roleKey(item) === roleKey(target)).map((item) => ({ ...item })),
+			userBans: this.data.userBans.filter((item) => userBanKey(item) === userBanKey(target)).map((item) => ({ ...item })),
 			talkBanned: this.isTalkBanned(target),
 		};
 	}
@@ -333,7 +350,7 @@ class PermissionStore {
 
 	private isUserBanned(target: PermissionTarget, userMid: string): boolean {
 		return this.data.userBans.some((item) =>
-			targetKey(item) === targetKey(target) && item.userMid === userMid
+			userBanKey(item) === userBanKey(target) && item.userMid === userMid
 		);
 	}
 
@@ -343,7 +360,7 @@ class PermissionStore {
 
 	private removeUserBan(target: PermissionTarget, userMid: string): void {
 		this.data.userBans = this.data.userBans.filter((item) =>
-			!(targetKey(item) === targetKey(target) && item.userMid === userMid)
+			!(userBanKey(item) === userBanKey(target) && item.userMid === userMid)
 		);
 	}
 
@@ -351,7 +368,7 @@ class PermissionStore {
 		let changed = false;
 		for (const admin of INITIAL_ADMINS) {
 			const existing = this.data.roles.find((item) =>
-				targetKey(item) === targetKey(admin) && item.userMid === admin.userMid
+				roleKey(item) === roleKey(admin) && item.userMid === admin.userMid
 			);
 			if (!existing) {
 				this.data.roles.push({ ...admin });

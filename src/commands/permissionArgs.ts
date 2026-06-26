@@ -11,14 +11,19 @@ export function parseChatType(args: string[], fallback?: PermissionChatType): Pe
 	for (const arg of args) {
 		const normalized = arg.toLowerCase();
 		if (normalized === "square" || normalized === "oc" || normalized === "openchat") return "SQUARE";
+		if (normalized === "talk") return "TALK";
+		if (normalized === "user" || normalized === "個人") return "USER";
 		if (normalized === "group" || normalized === "グループ") return "GROUP";
+		if (normalized === "room") return "ROOM";
 	}
 	return fallback;
 }
 
 function inferChatTypeFromMid(mid: string): PermissionChatType | undefined {
 	if (mid.startsWith("m")) return "SQUARE";
+	if (mid.startsWith("u")) return "USER";
 	if (mid.startsWith("c")) return "GROUP";
+	if (mid.startsWith("r")) return "ROOM";
 	return undefined;
 }
 
