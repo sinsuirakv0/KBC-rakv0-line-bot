@@ -11,6 +11,7 @@ const COMMAND_LINES = [
 	"!ranking/ランキング",
 	"!id/ID確認",
 	"!ban/BOT管理BAN",
+	"!oc/OpenChat調査",
 	"!push/プッシュ通知",
 	"!bot/bot状態確認",
 	"!コマンド helpでそのコマンドの使い方を表示します",

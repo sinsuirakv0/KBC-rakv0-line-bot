@@ -7,6 +7,7 @@ import { gatyaCommand } from "./gatya.js";
 import { helpCommand } from "./help.js";
 import { idCommand } from "./id.js";
 import { itemCommand } from "./item.js";
+import { ocCommand } from "./oc.js";
 import { pushCommand } from "./push.js";
 import { rankingCommand } from "./ranking.js";
 import { saleCommand } from "./sale.js";
@@ -25,6 +26,7 @@ for (const command of [
 	unitCommand,
 	enemyCommand,
 	stageCommand,
+	ocCommand,
 	pushCommand,
 	rankingCommand,
 	banCommand,
