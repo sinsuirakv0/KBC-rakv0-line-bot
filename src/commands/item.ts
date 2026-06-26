@@ -1,4 +1,4 @@
-import type { LineCommand, TimeBlock } from "./shared.js";
+﻿import type { LineCommand, TimeBlock } from "./shared.js";
 import {
 	fetchItemNameMap,
 	fetchJson,

@@ -1,4 +1,4 @@
-import { rankingStore } from "../ranking/store.js";
+﻿import { rankingStore } from "../ranking/store.js";
 import type { LineCommand } from "./shared.js";
 
 const DEFAULT_START = 1;

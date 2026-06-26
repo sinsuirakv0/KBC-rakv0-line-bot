@@ -1,4 +1,4 @@
-import type { LineCommand } from "./shared.js";
+﻿import type { LineCommand } from "./shared.js";
 
 const COMMAND_LINES = [
 	"!ping/応答確認",

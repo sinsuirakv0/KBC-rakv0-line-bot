@@ -1,4 +1,4 @@
-import type { ReplyableLineMessage } from "./shared.js";
+﻿import type { ReplyableLineMessage } from "./shared.js";
 
 const PAGE_SIZE = 10;
 const EXPIRES_MS = 10 * 60_000;

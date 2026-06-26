@@ -1,4 +1,4 @@
-import { buildEntitySearch, type EntitySearchEntry } from "../search/entitySearch.js";
+﻿import { buildEntitySearch, type EntitySearchEntry } from "../search/entitySearch.js";
 import { searchDataPath } from "../search/dataPaths.js";
 import { createEntitySearchCommand } from "./entitySearchCommand.js";
 

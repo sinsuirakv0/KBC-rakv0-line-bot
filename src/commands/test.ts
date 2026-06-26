@@ -1,4 +1,4 @@
-import type { LineCommand } from "./shared.js";
+﻿import type { LineCommand } from "./shared.js";
 import { notifyScheduleUpdate } from "../notifications/eventUpdates.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
 

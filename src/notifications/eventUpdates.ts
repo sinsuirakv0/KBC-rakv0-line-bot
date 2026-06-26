@@ -1,4 +1,4 @@
-import type { Client } from "@evex/linejs";
+﻿import type { Client } from "@evex/linejs";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
 
 const EVENT_TYPES = new Set(["gatya", "sale", "item"]);

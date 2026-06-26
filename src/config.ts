@@ -79,6 +79,12 @@ export const appConfig = {
 		process.env.EVENT_PUSH_STATE_GITHUB_PATH || "state/event-start-notifications.json",
 	eventPushIntervalMs: Number(process.env.EVENT_PUSH_INTERVAL_MS || 15_000),
 	eventPushLookbackMs: Number(process.env.EVENT_PUSH_LOOKBACK_MS || 10 * 60_000),
+	pushRemindersFile: path.resolve(
+		process.env.PUSH_REMINDERS_FILE || "./storage/push-reminders.json",
+	),
+	pushRemindersGithubPath:
+		process.env.PUSH_REMINDERS_GITHUB_PATH || "state/push-reminders.json",
+	pushReminderIntervalMs: Number(process.env.PUSH_REMINDER_INTERVAL_MS || 10_000),
 	rankingFile: path.resolve(process.env.RANKING_FILE || "./storage/ranking.json"),
 	rankingGithubPath: process.env.RANKING_GITHUB_PATH || "stats/ranking.json",
 	botStatusFile: path.resolve(process.env.BOT_STATUS_FILE || "./storage/bot-status.json"),

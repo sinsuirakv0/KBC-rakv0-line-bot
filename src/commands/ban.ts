@@ -1,4 +1,4 @@
-import { permissionDeniedText, permissionStore, targetFromDestination, type PermissionTarget } from "../permissions/store.js";
+﻿import { permissionDeniedText, permissionStore, targetFromDestination, type PermissionTarget } from "../permissions/store.js";
 import { argValue, parseTarget, targetLabel } from "./permissionArgs.js";
 import type { LineCommand } from "./shared.js";
 

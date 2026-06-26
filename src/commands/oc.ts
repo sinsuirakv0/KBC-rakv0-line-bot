@@ -1,4 +1,4 @@
-import {
+﻿import {
 	permissionDeniedText,
 	permissionStore,
 	targetFromDestination,

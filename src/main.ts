@@ -1,4 +1,4 @@
-import { SquareMessage, type Client } from "@evex/linejs";
+﻿import { SquareMessage, type Client } from "@evex/linejs";
 import { appConfig } from "./config.js";
 import { handleLineCommand } from "./commands/index.js";
 import type { OutgoingImage, ReplyableLineMessage } from "./commands/shared.js";
@@ -7,6 +7,8 @@ import { handlePing } from "./handlers/ping.js";
 import { createLineClient, isAuthenticationError } from "./lineClient.js";
 import { startEventPushScheduler } from "./eventPush/scheduler.js";
 import { eventPushStore } from "./eventPush/store.js";
+import { startPushReminderScheduler } from "./reminders/scheduler.js";
+import { pushReminderStore } from "./reminders/store.js";
 import { startEventUpdateServer } from "./server/eventUpdateServer.js";
 import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineStorage.js";
 import { pushSubscriptionStore } from "./subscriptions/store.js";
@@ -605,11 +607,13 @@ async function main(): Promise<void> {
 	await Promise.all([
 		pushSubscriptionStore.initialize(),
 		eventPushStore.initialize(),
+		pushReminderStore.initialize(),
 		rankingStore.initialize(),
 		runtimeStore.initialize(),
 		permissionStore.initialize(),
 	]);
 	startEventPushScheduler(() => activeClient, shutdownController.signal);
+	startPushReminderScheduler(() => activeClient, shutdownController.signal);
 	const storage = await initializeLineStorage();
 	while (!shutdownController.signal.aborted) {
 		try {

@@ -1,4 +1,4 @@
-import type { LineCommand, LineDestination } from "./shared.js";
+﻿import type { LineCommand, LineDestination } from "./shared.js";
 import { fetchCsvMap, fetchJson, isExactInteger } from "./shared.js";
 import {
 	findNextEventOccurrence,
@@ -7,6 +7,12 @@ import {
 } from "../eventPush/format.js";
 import { isIgnoredEventEntry, type SaleEntry, type SaleJson } from "../eventPush/schedule.js";
 import { eventPushStore } from "../eventPush/store.js";
+import { pushReminderStore } from "../reminders/store.js";
+import {
+	formatReminderDate,
+	parseReminderArgs,
+	type ReminderParseFailureReason,
+} from "../reminders/time.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
 
 interface EventDetails {
@@ -36,6 +42,12 @@ function pushHelpText(): string {
 	return [
 		"!push",
 		"",
+		"!push 178 <内容>",
+		"  178分後に登録者へメンションして内容を送信します。",
+		"!push 6/26 <内容>",
+		"  指定日の00:00(JST)に登録者へメンションして内容を送信します。",
+		"!push 6/26-2:00 <内容>",
+		"  指定日の02:00(JST)に登録者へメンションして内容を送信します。",
 		"!push status",
 		"  このトークの通知設定を表示します。スケジュール更新通知とイベント開始通知の両方を確認できます。",
 		"!push skd",
@@ -51,6 +63,15 @@ function pushHelpText(): string {
 		"!push event del",
 		"  このトークのイベント開始通知設定を削除します。",
 	].join("\n");
+}
+
+function reminderErrorText(reason: ReminderParseFailureReason): string {
+	const usage = "使い方: !push 178 内容 / !push 6/26 内容 / !push 6/26-2:00 内容";
+	if (reason === "missing-content") return `通知する内容を指定してください。\n${usage}`;
+	if (reason === "invalid-time") return `時刻の指定を確認してください。\n${usage}`;
+	if (reason === "past") return `過去の時刻には登録できません。\n${usage}`;
+	if (reason === "too-far") return `10年より先のリマインダーは登録できません。\n${usage}`;
+	return usage;
 }
 
 async function statusText(destination: LineDestination): Promise<string> {
@@ -93,6 +114,24 @@ export const pushCommand: LineCommand = {
 			return;
 		}
 
+		const reminder = parseReminderArgs(args);
+		if (reminder.ok) {
+			const saved = await pushReminderStore.add({
+				destination: message.destination,
+				remindAt: reminder.remindAt,
+				message: reminder.content,
+			});
+			await message.send([
+				"リマインダーを登録しました。",
+				`通知時刻: ${formatReminderDate(new Date(saved.remindAt))}`,
+			].join("\n"));
+			return;
+		}
+		if (reminder.reason !== "not-reminder") {
+			await message.send(reminderErrorText(reminder.reason));
+			return;
+		}
+
 		if (action === "skd") {
 			const skdAction = args[1]?.toLowerCase() || "on";
 			if (skdAction === "help") {
@@ -132,7 +171,7 @@ export const pushCommand: LineCommand = {
 
 
 		if (action !== "event") {
-			await message.send("使い方: !push [status|skd|event]\n詳しくは !push help");
+			await message.send("使い方: !push 178 内容 / !push 6/26 内容 / !push 6/26-2:00 内容 / !push [status|skd|event]\n詳しくは !push help");
 			return;
 		}
 

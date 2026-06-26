@@ -1,4 +1,4 @@
-import type { LineDestination } from "./shared.js";
+﻿import type { LineDestination } from "./shared.js";
 import { type PermissionChatType, type PermissionTarget, targetFromDestination } from "../permissions/store.js";
 
 export function argValue(args: string[], key: string): string | undefined {

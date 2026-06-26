@@ -1,4 +1,4 @@
-import type { Client } from "@evex/linejs";
+﻿import type { Client } from "@evex/linejs";
 import type { LineCommand, LineDestination } from "./shared.js";
 
 interface MemberInfo {

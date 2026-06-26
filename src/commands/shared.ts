@@ -1,4 +1,4 @@
-export const RAW_BASE_URL =
+﻿export const RAW_BASE_URL =
 	process.env.KBC_EVENT_RAW_BASE_URL ||
 	"https://raw.githubusercontent.com/sinsuirakv0/KBC-rakv0-event/main";
 

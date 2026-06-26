@@ -1,4 +1,4 @@
-import { appConfig } from "../config.js";
+﻿import { appConfig } from "../config.js";
 import type { ReplyableLineMessage } from "../commands/shared.js";
 
 export async function handlePing(messageText: string, message: ReplyableLineMessage): Promise<boolean> {

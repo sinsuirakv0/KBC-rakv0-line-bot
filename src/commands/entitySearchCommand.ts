@@ -1,4 +1,4 @@
-import type { EntitySearchEntry } from "../search/entitySearch.js";
+﻿import type { EntitySearchEntry } from "../search/entitySearch.js";
 import type { LineCommand } from "./shared.js";
 import { sendError } from "./shared.js";
 import { sendSearchResults } from "./searchPages.js";
