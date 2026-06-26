@@ -43,7 +43,7 @@ const SAVE_DELAY_MS = 5_000;
 const INITIAL_ADMINS: RoleGrant[] = [
 	{
 		chatType: "SQUARE",
-		chatMid: "m2f7b1899dc79a842b4b494cdf85e4f69",
+		chatMid: "s8a7850dd223df93bee3907d757876630",
 		userMid: "p947d06c23b7162b3060c26fec481fa10",
 		role: "admin",
 		createdAt: "2026-06-26T00:00:00.000+09:00",

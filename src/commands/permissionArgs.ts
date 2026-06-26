@@ -20,7 +20,7 @@ export function parseChatType(args: string[], fallback?: PermissionChatType): Pe
 }
 
 function inferChatTypeFromMid(mid: string): PermissionChatType | undefined {
-	if (mid.startsWith("m")) return "SQUARE";
+	if (mid.startsWith("m") || mid.startsWith("s")) return "SQUARE";
 	if (mid.startsWith("u")) return "USER";
 	if (mid.startsWith("c")) return "GROUP";
 	if (mid.startsWith("r")) return "ROOM";
