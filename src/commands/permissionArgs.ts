@@ -38,5 +38,6 @@ export function parseTarget(args: string[], destination: LineDestination): Permi
 }
 
 export function targetLabel(target: PermissionTarget): string {
+	if (target.chatType !== "SQUARE") return "TALK全体";
 	return `${target.chatType} ${target.chatMid}`;
 }

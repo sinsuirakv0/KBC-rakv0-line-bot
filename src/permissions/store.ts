@@ -101,14 +101,25 @@ export function targetKey(target: PermissionTarget): string {
 	return `${target.chatType}:${target.chatMid}`;
 }
 
+function canonicalTarget(target: PermissionTarget): PermissionTarget {
+	if (target.chatType === "SQUARE") return { chatType: "SQUARE", chatMid: target.chatMid };
+	return { chatType: "TALK", chatMid: "*" };
+}
+
+function scopeKey(target: PermissionTarget): string {
+	return targetKey(canonicalTarget(target));
+}
+
 function roleKey(target: PermissionTarget): string {
-	if (target.chatType === "SQUARE") return targetKey(target);
-	return "TALK:*";
+	return scopeKey(target);
 }
 
 function userBanKey(target: PermissionTarget): string {
-	if (target.chatType === "SQUARE") return targetKey(target);
-	return "TALK:*";
+	return scopeKey(target);
+}
+
+function talkBanKey(target: PermissionTarget): string {
+	return scopeKey(target);
 }
 
 function roleRank(role: PermissionLevel): number {
@@ -198,7 +209,9 @@ class PermissionStore {
 				if (remote) {
 					this.data = parsePermissions(JSON.parse(remote.content));
 					this.githubSha = remote.sha;
-					if (this.ensureInitialAdmins()) await this.flush();
+					const normalized = this.normalizeData();
+					const changed = this.ensureInitialAdmins() || normalized;
+					if (changed) await this.flush();
 					else await this.writeLocal();
 					console.log(`[permissions] loaded ${this.data.roles.length} role(s) from GitHub`);
 					return;
@@ -213,17 +226,20 @@ class PermissionStore {
 		} catch {
 			this.data = structuredClone(EMPTY_PERMISSIONS);
 		}
-		if (this.ensureInitialAdmins()) await this.flush();
+		const normalized = this.normalizeData();
+		const changed = this.ensureInitialAdmins() || normalized;
+		if (changed) await this.flush();
 		else await this.writeLocal();
 		console.log(`[permissions] loaded ${this.data.roles.length} role(s)`);
 	}
 
 	getRole(target: PermissionTarget | null, userMid: string): PermissionLevel {
 		if (!target) return "none";
-		const grant = this.data.roles.find((item) =>
-			roleKey(item) === roleKey(target) && item.userMid === userMid
-		);
-		return grant?.role ?? "none";
+		return this.data.roles
+			.filter((item) => roleKey(item) === roleKey(target) && item.userMid === userMid)
+			.reduce<PermissionLevel>((best, item) => {
+				return roleRank(item.role) > roleRank(best) ? item.role : best;
+			}, "none");
 	}
 
 	hasAtLeast(target: PermissionTarget | null, userMid: string, required: Exclude<PermissionLevel, "none">): boolean {
@@ -251,18 +267,19 @@ class PermissionStore {
 	}
 
 	setRole(target: PermissionTarget, userMid: string, role: PermissionRole, createdBy: string): "created" | "updated" | "unchanged" {
-		const existing = this.data.roles.find((item) =>
-			roleKey(item) === roleKey(target) && item.userMid === userMid
-		);
-		if (existing) {
-			if (existing.role === role) return "unchanged";
-			existing.role = role;
-			existing.createdAt = nowIso();
-			existing.createdBy = createdBy;
+		const key = roleKey(target);
+		const matching = this.data.roles.filter((item) => roleKey(item) === key && item.userMid === userMid);
+		if (matching.length > 0) {
+			const current = this.getRole(target, userMid);
+			if (current === role && matching.length === 1 && targetKey(matching[0]) === targetKey(canonicalTarget(target))) {
+				return "unchanged";
+			}
+			this.data.roles = this.data.roles.filter((item) => !(roleKey(item) === key && item.userMid === userMid));
+			this.data.roles.push({ ...canonicalTarget(target), userMid, role, createdAt: nowIso(), createdBy });
 			this.scheduleSave();
 			return "updated";
 		}
-		this.data.roles.push({ ...target, userMid, role, createdAt: nowIso(), createdBy });
+		this.data.roles.push({ ...canonicalTarget(target), userMid, role, createdAt: nowIso(), createdBy });
 		this.removeUserBan(target, userMid);
 		this.scheduleSave();
 		return "created";
@@ -282,7 +299,7 @@ class PermissionStore {
 	banUser(target: PermissionTarget, userMid: string, createdBy: string): "banned" | "already" | "admin" {
 		if (this.getRole(target, userMid) === "admin") return "admin";
 		if (this.isUserBanned(target, userMid)) return "already";
-		this.data.userBans.push({ ...target, userMid, createdAt: nowIso(), createdBy });
+		this.data.userBans.push({ ...canonicalTarget(target), userMid, createdAt: nowIso(), createdBy });
 		this.scheduleSave();
 		return "banned";
 	}
@@ -297,14 +314,14 @@ class PermissionStore {
 
 	banTalk(target: PermissionTarget, createdBy: string): "banned" | "already" {
 		if (this.isTalkBanned(target)) return "already";
-		this.data.talkBans.push({ ...target, createdAt: nowIso(), createdBy });
+		this.data.talkBans.push({ ...canonicalTarget(target), createdAt: nowIso(), createdBy });
 		this.scheduleSave();
 		return "banned";
 	}
 
 	unbanTalk(target: PermissionTarget): "removed" | "not_found" {
 		const before = this.data.talkBans.length;
-		this.data.talkBans = this.data.talkBans.filter((item) => targetKey(item) !== targetKey(target));
+		this.data.talkBans = this.data.talkBans.filter((item) => talkBanKey(item) !== talkBanKey(target));
 		if (this.data.talkBans.length === before) return "not_found";
 		this.scheduleSave();
 		return "removed";
@@ -355,7 +372,7 @@ class PermissionStore {
 	}
 
 	private isTalkBanned(target: PermissionTarget): boolean {
-		return this.data.talkBans.some((item) => targetKey(item) === targetKey(target));
+		return this.data.talkBans.some((item) => talkBanKey(item) === talkBanKey(target));
 	}
 
 	private removeUserBan(target: PermissionTarget, userMid: string): void {
@@ -378,6 +395,45 @@ class PermissionStore {
 				changed = true;
 			}
 		}
+		if (changed) this.dirty = true;
+		return changed;
+	}
+
+	private normalizeData(): boolean {
+		let changed = false;
+		const roles = new Map<string, RoleGrant>();
+		for (const role of this.data.roles) {
+			const target = canonicalTarget(role);
+			const key = `${targetKey(target)}:${role.userMid}`;
+			const current = roles.get(key);
+			if (!current || roleRank(role.role) > roleRank(current.role)) {
+				roles.set(key, { ...role, ...target });
+			}
+			if (targetKey(target) !== targetKey(role)) changed = true;
+		}
+		if (roles.size !== this.data.roles.length) changed = true;
+		this.data.roles = [...roles.values()];
+
+		const userBans = new Map<string, UserBan>();
+		for (const ban of this.data.userBans) {
+			const target = canonicalTarget(ban);
+			const key = `${targetKey(target)}:${ban.userMid}`;
+			if (!userBans.has(key)) userBans.set(key, { ...ban, ...target });
+			if (targetKey(target) !== targetKey(ban)) changed = true;
+		}
+		if (userBans.size !== this.data.userBans.length) changed = true;
+		this.data.userBans = [...userBans.values()];
+
+		const talkBans = new Map<string, TalkBan>();
+		for (const ban of this.data.talkBans) {
+			const target = canonicalTarget(ban);
+			const key = targetKey(target);
+			if (!talkBans.has(key)) talkBans.set(key, { ...ban, ...target });
+			if (targetKey(target) !== targetKey(ban)) changed = true;
+		}
+		if (talkBans.size !== this.data.talkBans.length) changed = true;
+		this.data.talkBans = [...talkBans.values()];
+
 		if (changed) this.dirty = true;
 		return changed;
 	}
