@@ -13,6 +13,12 @@ export interface PermissionTarget {
 	chatType: PermissionChatType;
 }
 
+export interface BotStopTarget {
+	kind: "talk" | "square";
+	chatMid: string;
+	chatType: "USER" | "GROUP" | "ROOM" | "SQUARE";
+}
+
 interface RoleGrant extends PermissionTarget {
 	userMid: string;
 	role: PermissionRole;
@@ -31,11 +37,23 @@ interface TalkBan extends PermissionTarget {
 	createdBy?: string;
 }
 
+interface BotStop extends BotStopTarget {
+	createdAt: string;
+	createdBy?: string;
+}
+
+interface GlobalBotStop {
+	createdAt: string;
+	createdBy?: string;
+}
+
 interface PermissionsFile {
 	version: 1;
 	roles: RoleGrant[];
 	userBans: UserBan[];
 	talkBans: TalkBan[];
+	botStops: BotStop[];
+	globalBotStop?: GlobalBotStop;
 }
 
 const SAVE_DELAY_MS = 5_000;
@@ -64,6 +82,7 @@ const EMPTY_PERMISSIONS: PermissionsFile = {
 	roles: [],
 	userBans: [],
 	talkBans: [],
+	botStops: [],
 };
 
 function nowIso(): string {
@@ -101,6 +120,26 @@ export function targetKey(target: PermissionTarget): string {
 	return `${target.chatType}:${target.chatMid}`;
 }
 
+export function botStopTargetFromDestination(destination: LineDestination): BotStopTarget {
+	return {
+		kind: destination.kind,
+		chatMid: destination.chatMid,
+		chatType: destination.chatType,
+	};
+}
+
+export function botStopTargetKey(target: Pick<BotStopTarget, "kind" | "chatMid">): string {
+	return `${target.kind}:${target.chatMid}`;
+}
+
+export function botStopTargetLabel(target: BotStopTarget): string {
+	if (target.kind === "square") return `OCトーク ${target.chatMid}`;
+	if (target.chatType === "USER") return `個人チャット ${target.chatMid}`;
+	if (target.chatType === "GROUP") return `グループ ${target.chatMid}`;
+	if (target.chatType === "ROOM") return `ルーム ${target.chatMid}`;
+	return `トーク ${target.chatMid}`;
+}
+
 function canonicalTarget(target: PermissionTarget): PermissionTarget {
 	if (target.chatType === "SQUARE") return { chatType: "SQUARE", chatMid: target.chatMid };
 	return { chatType: "TALK", chatMid: "*" };
@@ -136,6 +175,8 @@ function parsePermissions(value: unknown): PermissionsFile {
 		roles: parseRoles(raw.roles),
 		userBans: parseUserBans(raw.userBans),
 		talkBans: parseTalkBans(raw.talkBans),
+		botStops: parseBotStops(raw.botStops),
+		globalBotStop: parseGlobalBotStop(raw.globalBotStop),
 	};
 }
 
@@ -185,12 +226,45 @@ function parseTalkBans(value: unknown): TalkBan[] {
 	});
 }
 
+function parseBotStops(value: unknown): BotStop[] {
+	if (!Array.isArray(value)) return [];
+	return value.flatMap((item) => {
+		const raw = item as Partial<BotStop>;
+		if (!isBotStopTarget(raw)) return [];
+		return [{
+			kind: raw.kind,
+			chatMid: raw.chatMid,
+			chatType: raw.chatType,
+			createdAt: typeof raw.createdAt === "string" ? raw.createdAt : nowIso(),
+			createdBy: typeof raw.createdBy === "string" ? raw.createdBy : undefined,
+		}];
+	});
+}
+
+function parseGlobalBotStop(value: unknown): GlobalBotStop | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const raw = value as Partial<GlobalBotStop>;
+	return {
+		createdAt: typeof raw.createdAt === "string" ? raw.createdAt : nowIso(),
+		createdBy: typeof raw.createdBy === "string" ? raw.createdBy : undefined,
+	};
+}
+
 function isTarget<T extends Partial<PermissionTarget>>(value: T): value is T & PermissionTarget {
 	return typeof value.chatMid === "string" &&
 		(value.chatType === "USER" ||
 			value.chatType === "GROUP" ||
 			value.chatType === "ROOM" ||
 			value.chatType === "TALK" ||
+			value.chatType === "SQUARE");
+}
+
+function isBotStopTarget<T extends Partial<BotStopTarget>>(value: T): value is T & BotStopTarget {
+	return typeof value.chatMid === "string" &&
+		(value.kind === "talk" || value.kind === "square") &&
+		(value.chatType === "USER" ||
+			value.chatType === "GROUP" ||
+			value.chatType === "ROOM" ||
 			value.chatType === "SQUARE");
 }
 
@@ -264,6 +338,49 @@ class PermissionStore {
 		if (this.isUserBanned(target, destination.senderMid)) return false;
 		if (this.isTalkBanned(target)) return false;
 		return true;
+	}
+
+	botStopStatus(target: BotStopTarget): { allStopped: boolean; targetStopped: boolean; stopped: boolean } {
+		const allStopped = Boolean(this.data.globalBotStop);
+		const targetStopped = this.isBotTargetStopped(target);
+		return {
+			allStopped,
+			targetStopped,
+			stopped: allStopped || targetStopped,
+		};
+	}
+
+	isBotStopped(target: BotStopTarget): boolean {
+		return this.botStopStatus(target).stopped;
+	}
+
+	stopBot(target: BotStopTarget, createdBy: string): "stopped" | "already" {
+		if (this.isBotTargetStopped(target)) return "already";
+		this.data.botStops.push({ ...target, createdAt: nowIso(), createdBy });
+		this.scheduleSave();
+		return "stopped";
+	}
+
+	startBot(target: BotStopTarget): "started" | "not_stopped" {
+		const before = this.data.botStops.length;
+		this.data.botStops = this.data.botStops.filter((item) => botStopTargetKey(item) !== botStopTargetKey(target));
+		if (this.data.botStops.length === before) return "not_stopped";
+		this.scheduleSave();
+		return "started";
+	}
+
+	stopBotAll(createdBy: string): "stopped" | "already" {
+		if (this.data.globalBotStop) return "already";
+		this.data.globalBotStop = { createdAt: nowIso(), createdBy };
+		this.scheduleSave();
+		return "stopped";
+	}
+
+	startBotAll(): "started" | "not_stopped" {
+		if (!this.data.globalBotStop) return "not_stopped";
+		delete this.data.globalBotStop;
+		this.scheduleSave();
+		return "started";
 	}
 
 	setRole(target: PermissionTarget, userMid: string, role: PermissionRole, createdBy: string): "created" | "updated" | "unchanged" {
@@ -375,6 +492,10 @@ class PermissionStore {
 		return this.data.talkBans.some((item) => talkBanKey(item) === talkBanKey(target));
 	}
 
+	private isBotTargetStopped(target: Pick<BotStopTarget, "kind" | "chatMid">): boolean {
+		return this.data.botStops.some((item) => botStopTargetKey(item) === botStopTargetKey(target));
+	}
+
 	private removeUserBan(target: PermissionTarget, userMid: string): void {
 		this.data.userBans = this.data.userBans.filter((item) =>
 			!(userBanKey(item) === userBanKey(target) && item.userMid === userMid)
@@ -433,6 +554,14 @@ class PermissionStore {
 		}
 		if (talkBans.size !== this.data.talkBans.length) changed = true;
 		this.data.talkBans = [...talkBans.values()];
+
+		const botStops = new Map<string, BotStop>();
+		for (const stop of this.data.botStops) {
+			const key = botStopTargetKey(stop);
+			if (!botStops.has(key)) botStops.set(key, { ...stop });
+		}
+		if (botStops.size !== this.data.botStops.length) changed = true;
+		this.data.botStops = [...botStops.values()];
 
 		if (changed) this.dirty = true;
 		return changed;

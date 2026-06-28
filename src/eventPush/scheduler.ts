@@ -1,6 +1,7 @@
 ﻿import type { Client } from "@evex/linejs";
 import { fetchCsvMap, fetchJson } from "../commands/shared.js";
 import { appConfig } from "../config.js";
+import { permissionStore } from "../permissions/store.js";
 import {
 	collectEventNotifications,
 	formatEventDuration,
@@ -13,16 +14,18 @@ async function sendToTarget(
 	client: Client,
 	target: EventPushSubscription,
 	text: string,
-): Promise<void> {
+): Promise<"sent" | "stopped"> {
+	if (permissionStore.isBotStopped(target)) return "stopped";
 	if (target.kind === "square") {
 		await client.base.square.sendMessage({ squareChatMid: target.chatMid, text });
-		return;
+		return "sent";
 	}
 	await client.base.talk.sendMessage({
 		to: target.chatMid,
 		text,
 		e2ee: target.encrypted,
 	});
+	return "sent";
 }
 
 function notificationKey(

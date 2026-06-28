@@ -1,5 +1,6 @@
 import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
+import { permissionStore } from "../permissions/store.js";
 import { pushReminderStore, type PushReminder } from "./store.js";
 
 function mentionLabel(reminder: PushReminder): string {
@@ -23,7 +24,8 @@ function reminderMessage(reminder: PushReminder): { text: string; contentMetadat
 	};
 }
 
-async function sendReminder(client: Client, reminder: PushReminder): Promise<void> {
+async function sendReminder(client: Client, reminder: PushReminder): Promise<"sent" | "stopped"> {
+	if (permissionStore.isBotStopped(reminder)) return "stopped";
 	const { text, contentMetadata } = reminderMessage(reminder);
 	if (reminder.kind === "square") {
 		await client.base.square.sendMessage({
@@ -31,7 +33,7 @@ async function sendReminder(client: Client, reminder: PushReminder): Promise<voi
 			text,
 			contentMetadata,
 		});
-		return;
+		return "sent";
 	}
 	await client.base.talk.sendMessage({
 		to: reminder.chatMid,
@@ -39,6 +41,7 @@ async function sendReminder(client: Client, reminder: PushReminder): Promise<voi
 		contentMetadata,
 		e2ee: reminder.encrypted,
 	});
+	return "sent";
 }
 
 export async function checkPushReminders(client: Client, now: Date): Promise<void> {

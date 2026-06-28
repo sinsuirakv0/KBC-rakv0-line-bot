@@ -1,4 +1,5 @@
 ﻿import type { Client } from "@evex/linejs";
+import { permissionStore } from "../permissions/store.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
 
 const EVENT_TYPES = new Set(["gatya", "sale", "item"]);
@@ -77,9 +78,14 @@ export async function notifyScheduleUpdate(
 	].join("\n");
 
 	let sent = 0;
+	let stopped = 0;
 	const failures: string[] = [];
 	for (const target of pushSubscriptionStore.list()) {
 		try {
+			if (permissionStore.isBotStopped(target)) {
+				stopped++;
+				continue;
+			}
 			if (target.kind === "square") {
 				await client.base.square.sendMessage({ squareChatMid: target.chatMid, text });
 			} else {
@@ -95,8 +101,8 @@ export async function notifyScheduleUpdate(
 		}
 	}
 
-	if (sent > 0 && !isTest) await pushSubscriptionStore.markNotified(key);
+	if ((sent > 0 || stopped > 0) && !isTest) await pushSubscriptionStore.markNotified(key);
 	for (const failure of failures) console.error(`[event-update] delivery failed: ${failure}`);
-	if (failures.length > 0 && sent === 0) throw new Error("all LINE notification deliveries failed");
+	if (failures.length > 0 && sent === 0 && stopped === 0) throw new Error("all LINE notification deliveries failed");
 	return { sent, skipped: false };
 }

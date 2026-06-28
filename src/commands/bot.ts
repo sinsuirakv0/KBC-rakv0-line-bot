@@ -1,5 +1,7 @@
 ﻿import type { Client } from "@evex/linejs";
 import {
+	botStopTargetFromDestination,
+	botStopTargetLabel,
 	permissionDeniedText,
 	permissionStore,
 	requiredPermissionLabel,
@@ -13,6 +15,7 @@ import { argValue, parseTarget, targetLabel } from "./permissionArgs.js";
 import type { LineCommand, LineDestination } from "./shared.js";
 
 type RoleSnapshot = ReturnType<typeof permissionStore.snapshot>["roles"][number];
+type SquareRole = string | number | undefined;
 
 function formatDuration(ms: number): string {
 	const totalSeconds = Math.floor(ms / 1000);
@@ -39,6 +42,14 @@ function helpText(): string {
 		"",
 		"!bot status",
 		"  稼働状態を表示",
+		"!bot stop",
+		"  このトークでbotを停止",
+		"!bot start",
+		"  このトークでbotを再開",
+		"!bot stop all",
+		"  全てのトークでbotを停止",
+		"!bot start all",
+		"  全体停止を解除。個別停止は維持",
 		"!bot admin [talkID:<MID>]",
 		"  管理者/モデレーター一覧",
 		"!bot setting status",
@@ -69,6 +80,90 @@ function settingHelpText(): string {
 		"",
 		"talkIDの種類は通常自動判定します。",
 	].join("\n");
+}
+
+function isOpenChatManagerRole(role: SquareRole): boolean {
+	return role === 1 || role === 2 || role === "ADMIN" || role === "CO_ADMIN" ||
+		role === "1" || role === "2";
+}
+
+async function isOpenChatManager(message: Parameters<LineCommand["execute"]>[0]["message"]): Promise<boolean> {
+	if (message.destination.kind !== "square") return false;
+	try {
+		const response = await message.client.base.square.getSquareMember({
+			squareMemberMid: message.destination.senderMid,
+		});
+		return isOpenChatManagerRole(response.squareMember.role);
+	} catch (error) {
+		console.warn(`[bot] failed to resolve OpenChat role for ${message.destination.senderMid}`, error);
+		return false;
+	}
+}
+
+async function canControlBotState(command: Parameters<LineCommand["execute"]>[0], all: boolean): Promise<boolean> {
+	const { message } = command;
+	const currentTarget = targetFromDestination(message.destination);
+	if (permissionStore.hasAtLeast(currentTarget, message.destination.senderMid, "admin")) return true;
+	if (all) return false;
+	return await isOpenChatManager(message);
+}
+
+function botControlDeniedText(all: boolean): string {
+	if (all) return permissionDeniedText("admin");
+	return "実行権限がありません。BOT管理者、またはOpenChatの管理人/副官のみ操作できます。";
+}
+
+async function executeBotControl(
+	command: Parameters<LineCommand["execute"]>[0],
+	action: "start" | "stop",
+): Promise<void> {
+	const { message, args } = command;
+	const all = args[1]?.toLowerCase() === "all";
+	if (!await canControlBotState(command, all)) {
+		await message.send(botControlDeniedText(all));
+		return;
+	}
+
+	if (all) {
+		if (action === "stop") {
+			const result = permissionStore.stopBotAll(message.destination.senderMid);
+			await permissionStore.flush();
+			await message.send(result === "stopped"
+				? "全体停止しました。全てのトークルーム/個人チャットでbotは動作しません。"
+				: "すでに全体停止中です。");
+			return;
+		}
+
+		const result = permissionStore.startBotAll();
+		await permissionStore.flush();
+		await message.send(result === "started"
+			? "全体停止を解除しました。個別に停止していたトークは停止したままです。"
+			: "全体停止は有効ではありません。個別停止は変更していません。");
+		return;
+	}
+
+	const target = botStopTargetFromDestination(message.destination);
+	if (action === "stop") {
+		const result = permissionStore.stopBot(target, message.destination.senderMid);
+		await permissionStore.flush();
+		await message.send(result === "stopped"
+			? `このトークでbotを停止しました。\n対象: ${botStopTargetLabel(target)}`
+			: `このトークはすでに停止中です。\n対象: ${botStopTargetLabel(target)}`);
+		return;
+	}
+
+	const result = permissionStore.startBot(target);
+	await permissionStore.flush();
+	const status = permissionStore.botStopStatus(target);
+	const lines = [
+		result === "started"
+			? `このトークでbotを再開しました。\n対象: ${botStopTargetLabel(target)}`
+			: `このトークは個別停止されていません。\n対象: ${botStopTargetLabel(target)}`,
+	];
+	if (status.allStopped) {
+		lines.push("ただし全体停止中のため、!bot start all まで実際の動作は再開しません。");
+	}
+	await message.send(lines.join("\n"));
 }
 
 function rawUserName(raw: unknown): string | undefined {
@@ -237,14 +332,24 @@ export const botCommand: LineCommand = {
 			return;
 		}
 
+		if (action === "stop" || action === "start") {
+			await executeBotControl(command, action);
+			return;
+		}
+
 		if (action !== "status") {
-			await message.send("使い方: !bot [status|admin|setting]\n詳しくは !bot help");
+			await message.send("使い方: !bot [status|start|stop|admin|setting]\n詳しくは !bot help");
 			return;
 		}
 
 		const status = runtimeStore.snapshot();
+		const stopTarget = botStopTargetFromDestination(message.destination);
+		const stopStatus = permissionStore.botStopStatus(stopTarget);
 		await message.send([
 			"bot status",
+			`動作状態: ${stopStatus.stopped ? "停止中" : "稼働中"}`,
+			`全体停止: ${stopStatus.allStopped ? "有効" : "無効"}`,
+			`このトークの個別停止: ${stopStatus.targetStopped ? "有効" : "無効"}`,
 			`現在の稼働時間: ${formatDuration(status.sessionUptimeMs)}`,
 			`累計稼働時間: ${formatDuration(status.totalUptimeMs)}`,
 			`メモリ使用率: ${(status.systemUsedRatio * 100).toFixed(1)}%`,

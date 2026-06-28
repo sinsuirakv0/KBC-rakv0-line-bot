@@ -14,7 +14,7 @@ import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineSto
 import { pushSubscriptionStore } from "./subscriptions/store.js";
 import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
-import { permissionStore } from "./permissions/store.js";
+import { botStopTargetFromDestination, permissionStore } from "./permissions/store.js";
 
 interface RawTalkMessage {
 	id: string;
@@ -83,7 +83,7 @@ async function dispatchText(
 	try {
 		if (
 			messageText.startsWith(appConfig.commandPrefix) &&
-			!isBotPermissionStatusCommand(messageText) &&
+			!isBotPermissionBypassCommand(messageText) &&
 			!permissionStore.canExecute(message.destination)
 		) {
 			await message.send("実行権限がありません。");
@@ -106,9 +106,20 @@ async function dispatchText(
 	}
 }
 
-function isBotPermissionStatusCommand(messageText: string): boolean {
+function isBotPermissionBypassCommand(messageText: string): boolean {
 	const body = messageText.slice(appConfig.commandPrefix.length).trim().toLowerCase();
-	return /^bot\s+setting\s+status(?:\s|$)/.test(body);
+	return /^bot\s+setting\s+status(?:\s|$)/.test(body) ||
+		/^bot\s+(?:start|stop)(?:\s|$)/.test(body);
+}
+
+function isBotStartCommand(messageText: string): boolean {
+	const body = messageText.slice(appConfig.commandPrefix.length).trim().toLowerCase();
+	return /^bot\s+start(?:\s|$)/.test(body);
+}
+
+function shouldIgnoreStoppedText(messageText: string, message: ReplyableLineMessage): boolean {
+	const target = botStopTargetFromDestination(message.destination);
+	return permissionStore.isBotStopped(target) && !isBotStartCommand(messageText);
 }
 
 async function handleSquareMessage(client: Client, message: SquareMessage): Promise<void> {
@@ -121,6 +132,7 @@ async function handleSquareMessage(client: Client, message: SquareMessage): Prom
 		scopeMid,
 		senderNames.get(`square:${message.from.id}`),
 	);
+	if (shouldIgnoreStoppedText(message.text, target)) return;
 	if (!message.text.startsWith(appConfig.commandPrefix)) {
 		await handleSearchPageReply(message.text, target);
 		return;
@@ -393,6 +405,7 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 	const parsed = await readTalkText(client, raw);
 	if (parsed === null) return;
 	const target = new RawTalkReplyTarget(client, raw, ownMid, parsed.mentionMids);
+	if (shouldIgnoreStoppedText(parsed.text, target)) return;
 	if (!parsed.text.startsWith(appConfig.commandPrefix)) {
 		await handleSearchPageReply(parsed.text, target);
 		return;
