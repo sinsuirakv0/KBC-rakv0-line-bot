@@ -3653,7 +3653,8 @@
     "names": [
       "温泉天国テルマエ",
       "地底戦隊グランドン",
-      "超地底戦隊グランドン"
+      "超地底戦隊グランドン",
+      "極地底戦隊グランドン"
     ],
     "url": "https://jarjarblink.github.io/JDB/u000.html?cc=ja&unit=417"
   },
@@ -4416,7 +4417,8 @@
     "id": 507,
     "names": [
       "スーパーにゃん",
-      "ジャイにゃん"
+      "ジャイにゃん",
+      "アイアンにゃん"
     ],
     "url": "https://jarjarblink.github.io/JDB/u000.html?cc=ja&unit=507"
   },
@@ -6292,7 +6294,8 @@
     "id": 725,
     "names": [
       "忍者娘トモエ",
-      "食道楽忍者トモエ"
+      "食道楽忍者トモエ",
+      "美食極楽忍者トモエ"
     ],
     "url": "https://jarjarblink.github.io/JDB/u000.html?cc=ja&unit=725"
   },
@@ -7384,8 +7387,7 @@
     "id": 861,
     "names": [
       "嵐竜機ヴォルネード",
-      "嵐竜機王ヴォルネード",
-      "エアコン"
+      "嵐竜機王ヴォルネード"
     ],
     "url": "https://jarjarblink.github.io/JDB/u000.html?cc=ja&unit=861"
   },
@@ -7420,5 +7422,46 @@
       "真アサシンCC"
     ],
     "url": "https://jarjarblink.github.io/JDB/u000.html?cc=ja&unit=865"
+  },
+  {
+      "id": 866,
+    "names": [
+      "パックマン",
+      "パックマンネコ"
+    ],
+    "url": "https://jarjarblink.github.io/JDB/u000.html?cc=ja&unit=866"
+  },
+  {
+    "id": 867,
+    "names": [
+      "ネコブリンキー",
+      "ネコブリンキーCC"
+    ],
+    "url": "https://jarjarblink.github.io/JDB/u000.html?cc=ja&unit=867"
+  },
+  {
+    "id": 868,
+    "names": [
+      "ネコインキー",
+      "ネコインキーCC"
+    ],
+    "url": "https://jarjarblink.github.io/JDB/u000.html?cc=ja&unit=868"
+  },
+  {
+    "id": 869,
+    "names": [
+      "鉄腕！東雲寺あかね",
+      "それいけ！東雲寺あかね"
+    ],
+    "url": "https://jarjarblink.github.io/JDB/u000.html?cc=ja&unit=869"
+  },
+  {
+    "id": 870,
+    "names": [
+      "古びたタマゴ:N207",
+      "黒いタマゴ:N207",
+      "成金ネコ"
+    ],
+    "url": "https://jarjarblink.github.io/JDB/u000.html?cc=ja&unit=870"
   }
 ]

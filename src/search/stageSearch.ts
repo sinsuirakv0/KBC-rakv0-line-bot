@@ -133,10 +133,21 @@ function isMapIdQuery(value: string): boolean {
 
 export function getStageUrl(fullId: string): string {
 	const [mapPart, stagePart] = fullId.split("-");
-	const type = mapPart.replace(/\d+$/, "");
-	const map = Number(mapPart.match(/\d+$/)?.[0] ?? 0);
+	const match = mapPart.match(/^(.*?)(\d{3})$/);
+	const type = match ? match[1] : mapPart.replace(/\d+$/, "");
+	const map = Number(match ? match[2] : mapPart.match(/\d+$/)?.[0] ?? 0);
 	const stage = stagePart === undefined ? "" : `&stage=${Number(stagePart)}`;
 	return `https://jarjarblink.github.io/JDB/map.html?cc=ja&type=${type}&map=${map}${stage}`;
+}
+
+export function getStageDisplayId(entry: StageEntry | MapEntry): string {
+	if (entry.mapIdRaw >= 3000 && entry.mapIdRaw <= 3008 || entry.mapIdRaw >= 20000 && entry.mapIdRaw <= 22002) {
+		if ("stageId" in entry) {
+			return `${entry.mapIdRaw}-${entry.stageId.split("-")[1]}`;
+		}
+		return String(entry.mapIdRaw);
+	}
+	return "stageId" in entry ? entry.stageId : entry.mapId;
 }
 
 export function searchStages(keyword: string): { stages: StageEntry[]; maps: MapEntry[] } {

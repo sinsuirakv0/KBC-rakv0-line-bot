@@ -1,10 +1,11 @@
-﻿import { getStageUrl, searchStages } from "../search/stageSearch.js";
+import { getStageDisplayId, getStageUrl, searchStages } from "../search/stageSearch.js";
 import type { LineCommand } from "./shared.js";
 import { sendError } from "./shared.js";
 import { sendSearchResults } from "./searchPages.js";
 
 interface StageResult {
 	id: string;
+	displayId: string;
 	name: string;
 	type: "map" | "stage";
 }
@@ -40,8 +41,18 @@ export const stageCommand: LineCommand = {
 
 		const found = searchStages(query);
 		const results: StageResult[] = [
-			...found.maps.map((map) => ({ id: map.mapId, name: map.mapName, type: "map" as const })),
-			...found.stages.map((stage) => ({ id: stage.stageId, name: stage.stageName, type: "stage" as const })),
+			...found.maps.map((map) => ({
+				id: map.mapId,
+				displayId: getStageDisplayId(map),
+				name: map.mapName,
+				type: "map" as const,
+			})),
+			...found.stages.map((stage) => ({
+				id: stage.stageId,
+				displayId: getStageDisplayId(stage),
+				name: stage.stageName,
+				type: "stage" as const,
+			})),
 		];
 		if (results.length === 0) {
 			await sendError(message, "該当するステージが見つかりませんでした");
@@ -51,7 +62,7 @@ export const stageCommand: LineCommand = {
 		if (results.length <= 3) {
 			for (let index = 0; index < results.length; index++) {
 				const result = results[index];
-				const body = `${result.id} ${result.name}\n${getStageUrl(result.id)}`;
+				const body = `${result.displayId} ${result.name}\n${getStageUrl(result.id)}`;
 				if (index === 0) await message.reply(body);
 				else await message.send(body);
 			}
@@ -61,7 +72,7 @@ export const stageCommand: LineCommand = {
 		await sendSearchResults(
 			message,
 			`ステージ「${query}」検索結果`,
-			results.map((result) => `${result.id} ${result.name}`),
+			results.map((result) => `${result.displayId} ${result.name}`),
 		);
 	},
 };
