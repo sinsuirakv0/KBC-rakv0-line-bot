@@ -1,5 +1,8 @@
 import type { Client } from "@evex/linejs";
+import { appConfig } from "../config.js";
+import { messageLogStore, type StoredMemberState, type StoredMessageLog } from "../messageLog/store.js";
 import { memberNameHistoryStore } from "../nameHistory/store.js";
+import { permissionDeniedText, permissionStore, targetFromDestination } from "../permissions/store.js";
 import { sendSearchResults } from "./searchPages.js";
 import type { LineCommand, LineDestination } from "./shared.js";
 
@@ -41,11 +44,16 @@ interface SquareHistoryEvent {
 
 interface SquareHistoryMember {
 	squareMemberMid?: string;
+	squareMid?: string;
 	displayName?: string;
+	membershipState?: string | number;
+	role?: string | number;
+	createdAt?: number | bigint;
 }
 
 interface SquareHistoryMessagePayload {
 	senderDisplayName?: string;
+	squareChatMid?: string;
 	squareMid?: string;
 	squareMessage?: {
 		message?: {
@@ -73,6 +81,11 @@ interface ResolvedTarget {
 
 const MAX_LOG_ROWS = 1000;
 const LOG_PAGE_SIZE = 20;
+const activeBackfills = new Set<string>();
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function normalizeText(value: string): string {
 	return value.normalize("NFKC").toLowerCase();
@@ -170,6 +183,41 @@ function logEntryFromEvent(event: SquareHistoryEvent, targetMid: string, filter:
 	return { id: message.id || `${targetMid}:${createdAt}:${content}`, createdAt, content };
 }
 
+function messageLogFromEvent(destination: LineDestination, event: SquareHistoryEvent): StoredMessageLog | undefined {
+	const payload = event.payload?.receiveMessage ?? event.payload?.sendMessage;
+	if (!payload) return undefined;
+	const message = payload?.squareMessage?.message;
+	if (!message?.from) return undefined;
+	const createdAt = Number(message.createdTime ?? event.createdTime);
+	if (!Number.isFinite(createdAt) || createdAt <= 0) return undefined;
+	const content = formatContent(payload);
+	return {
+		id: message.id || `${message.from}:${createdAt}:${content}`,
+		kind: "square",
+		chatMid: payload.squareChatMid || destination.chatMid,
+		scopeMid: destination.scopeMid,
+		chatType: "SQUARE",
+		senderMid: message.from,
+		senderName: payload.senderDisplayName,
+		createdAt,
+		content,
+		contentType: message.contentType === undefined ? undefined : String(message.contentType),
+	};
+}
+
+function recordMessageLogsFromEvents(destination: LineDestination, events: SquareHistoryEvent[]): { read: number; added: number; oldestAt?: number } {
+	const messages = events.flatMap((event) => {
+		const message = messageLogFromEvent(destination, event);
+		return message ? [message] : [];
+	});
+	const added = messageLogStore.recordMany(messages);
+	const oldestAt = messages.reduce<number | undefined>((oldest, message) => {
+		if (oldest === undefined || message.createdAt < oldest) return message.createdAt;
+		return oldest;
+	}, undefined);
+	return { read: messages.length, added, oldestAt };
+}
+
 function eventMembers(event: SquareHistoryEvent): MemberInfo[] {
 	const members: MemberInfo[] = [];
 	const add = (member: SquareHistoryMember | undefined) => {
@@ -194,12 +242,91 @@ function eventMembers(event: SquareHistoryEvent): MemberInfo[] {
 	return members;
 }
 
+function eventMemberProfiles(event: SquareHistoryEvent): Array<MemberInfo & {
+	state: StoredMemberState;
+	role?: string;
+	seenAt?: number;
+	source: string;
+	extra?: Record<string, unknown>;
+}> {
+	const profiles: Array<MemberInfo & {
+		state: StoredMemberState;
+		role?: string;
+		seenAt?: number;
+		source: string;
+		extra?: Record<string, unknown>;
+	}> = [];
+	const eventCreatedAt = Number(event.createdTime);
+	const seenAt = Number.isFinite(eventCreatedAt) && eventCreatedAt > 0 ? eventCreatedAt : Date.now();
+	const add = (
+		member: SquareHistoryMember | undefined,
+		state: StoredMemberState,
+		source: string,
+		extra?: Record<string, unknown>,
+	) => {
+		if (!member?.squareMemberMid?.startsWith("p")) return;
+		profiles.push({
+			mid: member.squareMemberMid,
+			name: member.displayName || "(名前なし)",
+			state,
+			role: member.role === undefined ? undefined : String(member.role),
+			seenAt: Number(member.createdAt) > 0 ? Number(member.createdAt) : seenAt,
+			source,
+			extra: {
+				...(member.membershipState === undefined ? {} : { membershipState: String(member.membershipState) }),
+				...(member.squareMid ? { squareMid: member.squareMid } : {}),
+				...(extra ?? {}),
+			},
+		});
+	};
+
+	add(event.payload?.notifiedCreateSquareMember?.squareMember, "JOINED", "createSquareMember");
+	add(event.payload?.notifiedCreateSquareChatMember?.peerSquareMember, "JOINED", "createSquareChatMember");
+	add(event.payload?.notifiedJoinSquareChat?.joinedMember, "JOINED", "joinSquareChat");
+	add(event.payload?.notifiedLeaveSquareChat?.squareMember, "LEFT", "leaveSquareChat");
+	add(event.payload?.notifiedUpdateSquareMemberProfile?.squareMember, "UNKNOWN", "updateProfile");
+	add(event.payload?.notifiedUpdateSquareMember?.squareMember, "UNKNOWN", "updateMember");
+	for (const member of event.payload?.notifiedKickoutFromSquare?.kickees ?? []) {
+		add(member, "KICK_OUT", "kickoutFromSquare");
+	}
+
+	const messagePayload = event.payload?.receiveMessage ?? event.payload?.sendMessage;
+	const message = messagePayload?.squareMessage?.message;
+	if (message?.from?.startsWith("p")) {
+		profiles.push({
+			mid: message.from,
+			name: messagePayload?.senderDisplayName || "(名前なし)",
+			state: "JOINED",
+			seenAt: Number(message.createdTime) > 0 ? Number(message.createdTime) : seenAt,
+			source: "message",
+			extra: messagePayload?.squareMid ? { squareMid: messagePayload.squareMid } : undefined,
+		});
+	}
+
+	return profiles;
+}
+
 function recordEventNames(destination: LineDestination, events: SquareHistoryEvent[]): void {
 	for (const event of events) {
 		const createdAt = Number(event.createdTime);
 		const seenAt = Number.isFinite(createdAt) && createdAt > 0 ? createdAt : Date.now();
 		for (const member of eventMembers(event)) {
 			memberNameHistoryStore.record("square", destination.scopeMid, member.mid, member.name, seenAt);
+		}
+		for (const member of eventMemberProfiles(event)) {
+			messageLogStore.recordMember({
+				kind: "square",
+				chatMid: destination.chatMid,
+				scopeMid: destination.scopeMid,
+				chatType: "SQUARE",
+				mid: member.mid,
+				name: member.name,
+				state: member.state,
+				role: member.role,
+				seenAt: member.seenAt,
+				source: member.source,
+				extra: member.extra,
+			});
 		}
 	}
 }
@@ -248,6 +375,22 @@ async function searchSquareMembersByName(
 						name: member.displayName || "(名前なし)",
 					};
 					memberNameHistoryStore.record("square", destination.scopeMid, info.mid, info.name);
+					messageLogStore.recordMember({
+						kind: "square",
+						chatMid: destination.chatMid,
+						scopeMid: destination.scopeMid,
+						chatType: "SQUARE",
+						mid: info.mid,
+						name: info.name,
+						state: state === "KICK_OUT" ? "KICK_OUT" : state,
+						role: member.role === undefined ? undefined : String(member.role),
+						seenAt: Number(member.createdAt) > 0 ? Number(member.createdAt) : Date.now(),
+						source: "searchSquareMembers",
+						extra: {
+							searchState: state,
+							...(member.membershipState === undefined ? {} : { membershipState: String(member.membershipState) }),
+						},
+					});
 					if (looseNameMatches(info.name, query)) found.set(info.mid, info);
 				}
 				continuationToken = response.continuationToken || undefined;
@@ -464,6 +607,15 @@ function formatLogRows(rows: LogEntry[]): string[] {
 	return rows.map((row) => `${formatLogTime(row.createdAt)}:${row.content}`);
 }
 
+function formatStoredRows(rows: StoredMessageLog[], includeSender: boolean): string[] {
+	return rows.map((row) => {
+		const sender = row.senderName || row.senderMid;
+		return includeSender
+			? `${formatLogTime(row.createdAt)}:${sender}:${row.content}`
+			: `${formatLogTime(row.createdAt)}:${row.content}`;
+	});
+}
+
 function formatNameHistoryRows(entries: ReturnType<typeof memberNameHistoryStore.get>): string[] {
 	return entries.map((entry) => {
 		const first = formatLogTime(Date.parse(entry.firstSeenAt));
@@ -472,23 +624,156 @@ function formatNameHistoryRows(entries: ReturnType<typeof memberNameHistoryStore
 	});
 }
 
+async function backfillSquareHistory(
+	client: Client,
+	destination: LineDestination,
+	onProgress?: (read: number, added: number) => Promise<void>,
+): Promise<{ read: number; added: number; oldestAt?: number }> {
+	let continuationToken: string | undefined;
+	let syncToken: string | undefined;
+	let totalRead = 0;
+	let totalAdded = 0;
+	let oldestAt: number | undefined;
+	const applyStats = (stats: { read: number; added: number; oldestAt?: number }) => {
+		totalRead += stats.read;
+		totalAdded += stats.added;
+		if (stats.oldestAt !== undefined && (oldestAt === undefined || stats.oldestAt < oldestAt)) {
+			oldestAt = stats.oldestAt;
+		}
+	};
+
+	for (let page = 0; page < 10; page++) {
+		const response = await fetchSquareChatEvents(client, {
+			squareChatMid: destination.chatMid,
+			syncToken,
+			limit: 100,
+			direction: "FORWARD",
+			fetchType: "DEFAULT",
+		});
+		syncToken = response.syncToken;
+		const events = response.events as SquareHistoryEvent[];
+		recordEventNames(destination, events);
+		applyStats(recordMessageLogsFromEvents(destination, events));
+		if (response.events.length === 0) break;
+		await sleep(appConfig.messageLogBackfillDelayMs);
+	}
+	if (!syncToken) return { read: totalRead, added: totalAdded, oldestAt };
+
+	for (let page = 0; page < 100_000; page++) {
+		const response = await fetchSquareChatEvents(client, {
+			squareChatMid: destination.chatMid,
+			syncToken,
+			direction: "BACKWARD",
+			inclusive: page === 0 ? "ON" : "OFF",
+			fetchType: "DEFAULT",
+			limit: 100,
+			...(continuationToken ? { continuationToken } : {}),
+		});
+		syncToken = response.syncToken;
+		continuationToken = response.continuationToken || undefined;
+		const events = response.events as SquareHistoryEvent[];
+		recordEventNames(destination, events);
+		applyStats(recordMessageLogsFromEvents(destination, events));
+		if (page % 10 === 9) {
+			await messageLogStore.flush();
+			await memberNameHistoryStore.flush();
+			await onProgress?.(totalRead, totalAdded);
+		}
+		if (!continuationToken) break;
+		await sleep(appConfig.messageLogBackfillDelayMs);
+	}
+
+	messageLogStore.markBackfillComplete(destination, oldestAt);
+	await messageLogStore.flush();
+	await memberNameHistoryStore.flush();
+	return { read: totalRead, added: totalAdded, oldestAt };
+}
+
+function backfillKey(destination: LineDestination): string {
+	return `${destination.kind}:${destination.chatMid}`;
+}
+
+async function startBackfill(message: Parameters<LineCommand["execute"]>[0]["message"]): Promise<void> {
+	if (message.destination.kind !== "square") {
+		await message.send("!log getはOpenChatでのみ使用できます。");
+		return;
+	}
+	const key = backfillKey(message.destination);
+	if (activeBackfills.has(key)) {
+		await message.send("このトークの履歴取得はすでに実行中です。");
+		return;
+	}
+	activeBackfills.add(key);
+	const startedAt = Date.now();
+	const requester = message.destination.senderName || message.destination.senderMid;
+	const destination = { ...message.destination };
+	await message.send("履歴取得を開始しました。完了までバックグラウンドでゆっくり読み込みます。");
+	void backfillSquareHistory(message.client, destination)
+		.then(async (result) => {
+			const elapsedMs = Date.now() - startedAt;
+			const label = `@${requester}`;
+			const text = [
+				label,
+				"履歴取得が完了しました。",
+				`読み込んだメッセージ数: ${result.read}`,
+				`新規保存: ${result.added}`,
+				`完了時間: ${formatLogTime(Date.now())}`,
+				`かかった時間: ${formatDuration(elapsedMs)}`,
+			].join("\n");
+			if (message.sendMention) {
+				await message.sendMention(text, [{ start: 0, end: label.length, mid: destination.senderMid }]);
+			} else {
+				await message.send(text);
+			}
+		})
+		.catch(async (error) => {
+			const label = `@${requester}`;
+			const text = `${label}\n履歴取得に失敗しました: ${error instanceof Error ? error.message : String(error)}`;
+			if (message.sendMention) {
+				await message.sendMention(text, [{ start: 0, end: label.length, mid: destination.senderMid }]);
+			} else {
+				await message.send(text);
+			}
+		})
+		.finally(() => {
+			activeBackfills.delete(key);
+		});
+}
+
+function formatDuration(ms: number): string {
+	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+	if (hours > 0) return `${hours}時間${minutes}分${seconds}秒`;
+	if (minutes > 0) return `${minutes}分${seconds}秒`;
+	return `${seconds}秒`;
+}
+
 export const logCommand: LineCommand = {
 	name: "log",
 	async execute({ message, args }) {
 		if (args[0]?.toLowerCase() === "help") {
 			await message.send([
-				"!log <メンバー名>",
-				"  その人の発言履歴を直近1000件まで表示します。",
-				"!log <メンバー名> <検索語>",
+				"!log <検索語>",
+				"  このトーク全体から検索語を含む発言を表示します。",
+				"!log <検索語> <メンバー名>",
 				"  その人の発言から検索語を含むものだけ表示します。",
+				"!log get",
+				"  このOpenChatの過去履歴をゆっくり保存します。",
 				"!log name <メンバー名>",
 				"  保存済みの過去の名前を表示します。",
 			].join("\n"));
 			return;
 		}
 
-		if (message.destination.kind !== "square") {
-			await message.send("!logはOpenChatでのみ使用できます。");
+		if (args[0]?.toLowerCase() === "get") {
+			const target = targetFromDestination(message.destination);
+			if (!permissionStore.hasAtLeast(target, message.destination.senderMid, "admin")) {
+				await message.send(permissionDeniedText("admin"));
+				return;
+			}
+			await startBackfill(message);
 			return;
 		}
 
@@ -496,38 +781,37 @@ export const logCommand: LineCommand = {
 		const targetArgs = mode === "name" ? args.slice(1) : args;
 		const mentionedMid = message.mentionMids[0];
 		let target: MemberInfo | undefined;
-		let filter = "";
 		let ambiguous: MemberInfo[] | undefined;
 
-		if (mode === "name" && targetArgs.length === 0 && !mentionedMid) {
-			target = {
-				mid: message.destination.senderMid,
-				name: message.destination.senderName || message.destination.senderMid,
-			};
-			memberNameHistoryStore.record("square", message.destination.scopeMid, target.mid, target.name);
-		} else {
-			const resolved = await resolveTarget(message.client, message.destination, targetArgs, mentionedMid);
-			target = resolved?.member;
-			filter = resolved?.filter ?? "";
-			ambiguous = resolved?.ambiguous;
-		}
-
-		if (ambiguous && ambiguous.length > 1) {
-			await sendSearchResults(
-				message,
-				"対象候補",
-				ambiguous.map((member) => `${member.name}\nMID: ${member.mid}`),
-				LOG_PAGE_SIZE,
-			);
-			return;
-		}
-
-		if (!target) {
-			await message.send("対象メンバーが見つかりませんでした。");
-			return;
-		}
-
 		if (mode === "name") {
+			if (message.destination.kind !== "square") {
+				await message.send("!log nameはOpenChatでのみ使用できます。");
+				return;
+			}
+			if (targetArgs.length === 0 && !mentionedMid) {
+				target = {
+					mid: message.destination.senderMid,
+					name: message.destination.senderName || message.destination.senderMid,
+				};
+				memberNameHistoryStore.record("square", message.destination.scopeMid, target.mid, target.name);
+			} else {
+				const resolved = await resolveTarget(message.client, message.destination, targetArgs, mentionedMid);
+				target = resolved?.member;
+				ambiguous = resolved?.ambiguous;
+			}
+			if (ambiguous && ambiguous.length > 1) {
+				await sendSearchResults(
+					message,
+					"対象候補",
+					ambiguous.map((member) => `${member.name}\nMID: ${member.mid}`),
+					LOG_PAGE_SIZE,
+				);
+				return;
+			}
+			if (!target) {
+				await message.send("対象メンバーが見つかりませんでした。");
+				return;
+			}
 			await scanNamesFromHistory(message.client, message.destination, target.mid);
 			await memberNameHistoryStore.flush();
 			const entries = memberNameHistoryStore.get("square", message.destination.scopeMid, target.mid);
@@ -544,19 +828,48 @@ export const logCommand: LineCommand = {
 			return;
 		}
 
-		const rows = await collectMemberLogs(message.client, message.destination, target.mid, filter);
-		if (rows.length === 0) {
-			await message.send(filter
-				? `${target.name} の「${filter}」を含む発言は見つかりませんでした。`
-				: `${target.name} の発言履歴がありません。`);
+		const query = args[0]?.trim();
+		if (!query) {
+			await message.send("検索語を指定してください。\n使い方: !log <検索語> [メンバー名]");
 			return;
 		}
 
-		await memberNameHistoryStore.flush();
+		const targetNameArgs = args.slice(1);
+		if (mentionedMid || targetNameArgs.length > 0) {
+			if (message.destination.kind !== "square") {
+				await message.send("名前指定の!log検索はOpenChatでのみ使用できます。");
+				return;
+			}
+			const resolved = await resolveTarget(message.client, message.destination, targetNameArgs, mentionedMid);
+			target = resolved?.member;
+			ambiguous = resolved?.ambiguous;
+			if (ambiguous && ambiguous.length > 1) {
+				await sendSearchResults(
+					message,
+					"対象候補",
+					ambiguous.map((member) => `${member.name}\nMID: ${member.mid}`),
+					LOG_PAGE_SIZE,
+				);
+				return;
+			}
+			if (!target) {
+				await message.send("対象メンバーが見つかりませんでした。");
+				return;
+			}
+		}
+
+		const rows = messageLogStore.search(message.destination, query, target?.mid, MAX_LOG_ROWS);
+		if (rows.length === 0) {
+			await message.send(target
+				? `${target.name} の「${query}」を含む発言は保存済みログに見つかりませんでした。`
+				: `このトークで「${query}」を含む発言は保存済みログに見つかりませんでした。`);
+			return;
+		}
+
 		await sendSearchResults(
 			message,
-			filter ? `${target.name} log "${filter}"` : `${target.name} log`,
-			formatLogRows(rows),
+			target ? `${target.name} log "${query}"` : `talk log "${query}"`,
+			formatStoredRows(rows, !target),
 			LOG_PAGE_SIZE,
 		);
 	},

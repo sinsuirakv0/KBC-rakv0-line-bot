@@ -96,6 +96,9 @@ export const appConfig = {
 	memberNameHistoryFile: path.resolve(process.env.MEMBER_NAME_HISTORY_FILE || "./storage/member-name-history.json"),
 	memberNameHistoryGithubPath: process.env.MEMBER_NAME_HISTORY_GITHUB_PATH || "logs/member-name-history.json",
 	memberNameScanIntervalMs: Number(process.env.MEMBER_NAME_SCAN_INTERVAL_MS || 30 * 60_000),
+	messageLogFile: path.resolve(process.env.MESSAGE_LOG_FILE || "./storage/message-log.json"),
+	messageLogGithubPath: process.env.MESSAGE_LOG_GITHUB_PATH || "logs/message-log.json",
+	messageLogBackfillDelayMs: Number(process.env.MESSAGE_LOG_BACKFILL_DELAY_MS || 750),
 };
 
 export function getPasswordCredentials(): { email: string; password: string } {

@@ -1,7 +1,7 @@
 ﻿import { SquareMessage, type Client } from "@evex/linejs";
 import { appConfig } from "./config.js";
 import { handleLineCommand } from "./commands/index.js";
-import type { OutgoingImage, ReplyableLineMessage } from "./commands/shared.js";
+import type { OutgoingImage, OutgoingMention, ReplyableLineMessage } from "./commands/shared.js";
 import { handleSearchPageReply } from "./commands/searchPages.js";
 import { handlePing } from "./handlers/ping.js";
 import { createLineClient, isAuthenticationError } from "./lineClient.js";
@@ -17,6 +17,7 @@ import { runtimeStore } from "./runtime/store.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
 import { botStopTargetFromDestination, permissionStore } from "./permissions/store.js";
 import { memberNameHistoryStore } from "./nameHistory/store.js";
+import { messageLogStore, type StoredMessageLog } from "./messageLog/store.js";
 
 interface RawTalkMessage {
 	id: string;
@@ -65,6 +66,19 @@ interface RawSquareEvent {
 	} & Record<string, unknown>;
 }
 
+interface RawSquareMessage {
+	message?: {
+		id?: string;
+		from?: string;
+		to?: string;
+		toType?: string;
+		createdTime?: number | bigint;
+		text?: string;
+		contentType?: string | number;
+		hasContent?: boolean;
+	};
+}
+
 let warnedEncryptedTalk = false;
 let activeHandlers = 0;
 const senderNames = new Map<string, string>();
@@ -73,6 +87,55 @@ const squareScopeRequests = new Map<string, Promise<string>>();
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function contentTypeLabel(contentType: string | number | undefined, hasContent: boolean | undefined): string {
+	switch (contentType) {
+		case 1:
+		case "IMAGE":
+			return "画像";
+		case 2:
+		case "VIDEO":
+			return "動画";
+		case 3:
+		case "AUDIO":
+			return "音声";
+		case 7:
+		case "STICKER":
+			return "スタンプ";
+		case 14:
+		case "FILE":
+			return "ファイル";
+		case 15:
+		case "LOCATION":
+			return "位置情報";
+		case 0:
+		case "NONE":
+		case undefined:
+			return hasContent ? "メディア" : "";
+		default:
+			return `メディア(${String(contentType)})`;
+	}
+}
+
+function messageContent(text: string | undefined, contentType: string | number | undefined, hasContent: boolean | undefined): string {
+	const normalizedText = (text ?? "").replace(/\s+/g, " ").trim();
+	const label = contentTypeLabel(contentType, hasContent);
+	if (label && normalizedText) return `${label} ${normalizedText}`;
+	if (label) return label;
+	return normalizedText || "(本文なし)";
+}
+
+function mentionMetadata(mentions: OutgoingMention[]): Record<string, string> {
+	return {
+		MENTION: JSON.stringify({
+			MENTIONEES: mentions.map((mention) => ({
+				S: String(mention.start),
+				E: String(mention.end),
+				M: mention.mid,
+			})),
+		}),
+	};
 }
 
 async function dispatchText(
@@ -126,7 +189,6 @@ function shouldIgnoreStoppedText(messageText: string, message: ReplyableLineMess
 
 async function handleSquareMessage(client: Client, message: SquareMessage): Promise<void> {
 	if (await message.isMyMessage()) return;
-	if (typeof message.text !== "string") return;
 	const scopeMid = await resolveSquareScope(client, message.to.id, message.from.id);
 	const target = new SquareReplyTarget(
 		client,
@@ -134,6 +196,8 @@ async function handleSquareMessage(client: Client, message: SquareMessage): Prom
 		scopeMid,
 		senderNames.get(`square:${message.from.id}`),
 	);
+	recordSquareMessage(message, target.destination);
+	if (typeof message.text !== "string") return;
 	if (shouldIgnoreStoppedText(message.text, target)) return;
 	if (!message.text.startsWith(appConfig.commandPrefix)) {
 		await handleSearchPageReply(message.text, target);
@@ -144,7 +208,41 @@ async function handleSquareMessage(client: Client, message: SquareMessage): Prom
 		.then((name) => {
 			if (name) rankingStore.updateName("square", message.from.id, name);
 			if (name) memberNameHistoryStore.record("square", scopeMid, message.from.id, name);
+			if (name) {
+				messageLogStore.recordMember({
+					kind: "square",
+					chatMid: target.destination.chatMid,
+					scopeMid,
+					chatType: "SQUARE",
+					mid: message.from.id,
+					name,
+					state: "JOINED",
+					source: "liveNameResolve",
+				});
+				recordSquareMessage(message, { ...target.destination, senderName: name });
+			}
 		});
+}
+
+function recordSquareMessage(message: SquareMessage, destination: SquareReplyTarget["destination"]): void {
+	const raw = message.raw as RawSquareMessage;
+	const rawMessage = raw.message;
+	if (!rawMessage?.id || !rawMessage.from) return;
+	const createdAt = Number(rawMessage.createdTime);
+	if (!Number.isFinite(createdAt) || createdAt <= 0) return;
+	const record: StoredMessageLog = {
+		id: rawMessage.id,
+		kind: "square",
+		chatMid: destination.chatMid,
+		scopeMid: destination.scopeMid,
+		chatType: "SQUARE",
+		senderMid: rawMessage.from,
+		senderName: destination.senderName,
+		createdAt,
+		content: messageContent(rawMessage.text, rawMessage.contentType, rawMessage.hasContent),
+		contentType: rawMessage.contentType === undefined ? undefined : String(rawMessage.contentType),
+	};
+	messageLogStore.record(record);
 }
 
 function resolveSquareScope(client: Client, squareChatMid: string, senderMid: string): Promise<string> {
@@ -156,6 +254,20 @@ function resolveSquareScope(client: Client, squareChatMid: string, senderMid: st
 				if (member.displayName) {
 					senderNames.set(`square:${senderMid}`, member.displayName);
 					memberNameHistoryStore.record("square", member.squareMid, senderMid, member.displayName);
+					messageLogStore.recordMember({
+						kind: "square",
+						chatMid: squareChatMid,
+						scopeMid: member.squareMid,
+						chatType: "SQUARE",
+						mid: senderMid,
+						name: member.displayName,
+						state: "JOINED",
+						role: member.role === undefined ? undefined : String(member.role),
+						source: "resolveSquareScope",
+						extra: {
+							...(member.membershipState === undefined ? {} : { membershipState: String(member.membershipState) }),
+						},
+					});
 				}
 				return member.squareMid;
 			})
@@ -239,6 +351,15 @@ class SquareReplyTarget implements ReplyableLineMessage {
 		return messageIdFromSquareSendResult(sent);
 	}
 
+	async sendMention(text: string, mentions: OutgoingMention[]): Promise<string | undefined> {
+		const sent = await this.client.base.square.sendMessage({
+			squareChatMid: this.destination.chatMid,
+			text,
+			contentMetadata: mentionMetadata(mentions),
+		});
+		return messageIdFromSquareSendResult(sent);
+	}
+
 	async sendImage(image: OutgoingImage): Promise<void> {
 		const sent = await this.client.base.square.sendMessage({
 			squareChatMid: this.destination.chatMid,
@@ -291,6 +412,10 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 		return await this.sendTalk(text);
 	}
 
+	async sendMention(text: string, mentions: OutgoingMention[]): Promise<string | undefined> {
+		return await this.sendTalk(text, undefined, mentionMetadata(mentions));
+	}
+
 	async sendImage(image: OutgoingImage): Promise<void> {
 		const to = this.sendTo();
 		if (this.isEncrypted() && (to.startsWith("u") || to.startsWith("c"))) {
@@ -329,11 +454,16 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 		return "USER";
 	}
 
-	private async sendTalk(text: string, relatedMessageId?: string): Promise<string | undefined> {
+	private async sendTalk(
+		text: string,
+		relatedMessageId?: string,
+		contentMetadata?: Record<string, string>,
+	): Promise<string | undefined> {
 		const sent = await this.client.base.talk.sendMessage({
 			to: this.sendTo(),
 			text,
 			relatedMessageId,
+			contentMetadata,
 			e2ee: this.isEncrypted(),
 		});
 		return sent.id;
@@ -411,6 +541,7 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 	const parsed = await readTalkText(client, raw);
 	if (parsed === null) return;
 	const target = new RawTalkReplyTarget(client, raw, ownMid, parsed.mentionMids);
+	recordTalkMessage(raw, target.destination, parsed.text);
 	if (shouldIgnoreStoppedText(parsed.text, target)) return;
 	if (!parsed.text.startsWith(appConfig.commandPrefix)) {
 		await handleSearchPageReply(parsed.text, target);
@@ -432,7 +563,42 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 		.then((name) => {
 			if (name) rankingStore.updateName("talk", raw.from, name);
 			if (name) memberNameHistoryStore.record("talk", target.destination.scopeMid, raw.from, name);
+			if (name) {
+				messageLogStore.recordMember({
+					kind: "talk",
+					chatMid: target.destination.chatMid,
+					scopeMid: target.destination.scopeMid,
+					chatType: target.destination.chatType,
+					mid: raw.from,
+					name,
+					state: "JOINED",
+					source: "liveNameResolve",
+				});
+				recordTalkMessage(raw, { ...target.destination, senderName: name }, parsed.text);
+			}
 		});
+}
+
+function recordTalkMessage(
+	raw: RawTalkMessage,
+	destination: RawTalkReplyTarget["destination"],
+	text?: string,
+): void {
+	if (!raw.id || !raw.from) return;
+	const createdAt = Number(raw.createdTime);
+	if (!Number.isFinite(createdAt) || createdAt <= 0) return;
+	const record: StoredMessageLog = {
+		id: raw.id,
+		kind: "talk",
+		chatMid: destination.chatMid,
+		scopeMid: destination.scopeMid,
+		chatType: destination.chatType,
+		senderMid: raw.from,
+		senderName: destination.senderName,
+		createdAt,
+		content: messageContent(text ?? raw.text, undefined, false),
+	};
+	messageLogStore.record(record);
 }
 
 function handlePollingError(
@@ -646,6 +812,7 @@ async function main(): Promise<void> {
 		permissionStore.initialize(),
 		ocKickHistoryStore.initialize(),
 		memberNameHistoryStore.initialize(),
+		messageLogStore.initialize(),
 	]);
 	startEventPushScheduler(() => activeClient, shutdownController.signal);
 	startPushReminderScheduler(() => activeClient, shutdownController.signal);
@@ -672,6 +839,7 @@ async function main(): Promise<void> {
 	await permissionStore.flush().catch(() => {});
 	await ocKickHistoryStore.flush().catch(() => {});
 	await memberNameHistoryStore.flush().catch(() => {});
+	await messageLogStore.flush().catch(() => {});
 	await new Promise<void>((resolve) => eventUpdateServer.close(() => resolve()));
 }
 
