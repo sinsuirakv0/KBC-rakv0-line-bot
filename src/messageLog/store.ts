@@ -123,7 +123,6 @@ interface MessageLogMembersFile {
 }
 
 const EMPTY_LEGACY_LOG: LegacyMessageLogFile = { version: 1, chats: [] };
-const SAVE_DELAY_MS = 15_000;
 const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
 
 function chatKey(value: Pick<StoredChat, "kind" | "chatMid">): string {
@@ -339,6 +338,8 @@ function membersFile(chat: Pick<StoredChat, "kind" | "chatMid" | "scopeMid" | "c
 
 class MessageLogStore {
 	private data: LegacyMessageLogFile = structuredClone(EMPTY_LEGACY_LOG);
+	private chatsByKey = new Map<string, StoredChat>();
+	private messagesByChat = new Map<string, Map<string, StoredMessageLog>>();
 	private fileShas = new Map<string, string | undefined>();
 	private saveTimer: NodeJS.Timeout | undefined;
 	private saveQueue: Promise<void> = Promise.resolve();
@@ -354,6 +355,7 @@ class MessageLogStore {
 		if (githubContentsClient.enabled) {
 			try {
 				if (await this.restoreSplitFromGitHub()) {
+					this.rebuildIndexes();
 					console.log(`[message-log] loaded ${this.countMessages()} message(s) from split GitHub storage`);
 					return;
 				}
@@ -367,6 +369,7 @@ class MessageLogStore {
 					this.importedLegacy = true;
 					this.markAllDirty();
 					await this.writeSplitLocal();
+					this.rebuildIndexes();
 					console.log(`[message-log] imported ${this.countMessages()} legacy message(s) from GitHub`);
 					return;
 				}
@@ -376,6 +379,7 @@ class MessageLogStore {
 		}
 		try {
 			if (await this.restoreSplitFromLocal()) {
+				this.rebuildIndexes();
 				console.log(`[message-log] loaded ${this.countMessages()} message(s) from split local storage`);
 				return;
 			}
@@ -389,8 +393,10 @@ class MessageLogStore {
 			this.importedLegacy = true;
 			this.markAllDirty();
 			await this.writeSplitLocal();
+			this.rebuildIndexes();
 		} catch {
 			await this.writeManifestLocal(this.buildPersistence().manifest);
+			this.rebuildIndexes();
 		}
 		console.log(`[message-log] loaded ${this.countMessages()} message(s)`);
 	}
@@ -398,7 +404,10 @@ class MessageLogStore {
 	record(message: StoredMessageLog): boolean {
 		if (!message.id || !message.chatMid || !message.senderMid || !message.content) return false;
 		const chat = this.getOrCreateChat(message);
-		const existing = chat.messages.find((item) => item.id === message.id);
+		const key = chatKey(chat);
+		const messagesById = this.messagesByChat.get(key) ?? new Map<string, StoredMessageLog>();
+		this.messagesByChat.set(key, messagesById);
+		const existing = messagesById.get(message.id);
 		if (existing) {
 			let changed = false;
 			if (!existing.senderName && message.senderName) {
@@ -428,11 +437,13 @@ class MessageLogStore {
 			messageCountDelta: 1,
 			source: "message",
 		}, false);
-		chat.messages.push({ ...message });
+		const stored = { ...message };
+		chat.messages.push(stored);
+		messagesById.set(stored.id, stored);
 		if (!chat.oldestMessageAt || message.createdAt < chat.oldestMessageAt) {
 			chat.oldestMessageAt = message.createdAt;
 		}
-		this.markMessageDirty(message);
+		this.markMessageDirty(stored);
 		this.scheduleSave();
 		return true;
 	}
@@ -499,7 +510,7 @@ class MessageLogStore {
 		senderMid?: string,
 		limit = 1000,
 	): StoredMessageLog[] {
-		const chat = this.data.chats.find((item) => chatKey(item) === chatKey(destination));
+		const chat = this.chatsByKey.get(chatKey(destination));
 		if (!chat) return [];
 		const normalizedQuery = normalizeText(query);
 		return chat.messages
@@ -511,7 +522,7 @@ class MessageLogStore {
 	}
 
 	markBackfillComplete(destination: Pick<LineDestination, "kind" | "chatMid">, oldestMessageAt?: number): void {
-		const chat = this.data.chats.find((item) => chatKey(item) === chatKey(destination));
+		const chat = this.chatsByKey.get(chatKey(destination));
 		if (!chat) return;
 		chat.backfillCompletedAt = new Date().toISOString();
 		if (oldestMessageAt) chat.oldestMessageAt = oldestMessageAt;
@@ -581,6 +592,28 @@ class MessageLogStore {
 		const dirtyMembers = new Set(this.dirtyMembers);
 		if (dirtyDates.size === 0 && dirtyMembers.size === 0) return;
 		await this.writeSplitLocal(this.buildPersistence(), dirtyDates, dirtyMembers);
+	}
+
+	async flushLocalOnly(): Promise<number> {
+		if (this.saveTimer) {
+			clearTimeout(this.saveTimer);
+			this.saveTimer = undefined;
+		}
+		if (!this.dirty) return 0;
+		this.dirty = false;
+		const dirtyDates = new Set(this.dirtyDates);
+		const dirtyMembers = new Set(this.dirtyMembers);
+		this.dirtyDates.clear();
+		this.dirtyMembers.clear();
+		if (this.importedLegacy || dirtyDates.size === 0 && dirtyMembers.size === 0) {
+			this.markAllDirty();
+			for (const item of this.dirtyDates) dirtyDates.add(item);
+			for (const item of this.dirtyMembers) dirtyMembers.add(item);
+			this.dirtyDates.clear();
+			this.dirtyMembers.clear();
+			this.importedLegacy = false;
+		}
+		return await this.writeSplitLocal(this.buildPersistence(), dirtyDates, dirtyMembers);
 	}
 
 	suspendRemoteFlush(): () => void {
@@ -860,7 +893,8 @@ class MessageLogStore {
 	}
 
 	private getOrCreateChat(message: StoredMessageLog): StoredChat {
-		const existing = this.data.chats.find((item) => chatKey(item) === chatKey(message));
+		const key = chatKey(message);
+		const existing = this.chatsByKey.get(key);
 		if (existing) return existing;
 		const chat: StoredChat = {
 			kind: message.kind,
@@ -871,8 +905,20 @@ class MessageLogStore {
 			members: [],
 		};
 		this.data.chats.push(chat);
+		this.chatsByKey.set(key, chat);
+		this.messagesByChat.set(key, new Map());
 		this.dirtyMembers.add(chatKey(chat));
 		return chat;
+	}
+
+	private rebuildIndexes(): void {
+		this.chatsByKey.clear();
+		this.messagesByChat.clear();
+		for (const chat of this.data.chats) {
+			const key = chatKey(chat);
+			this.chatsByKey.set(key, chat);
+			this.messagesByChat.set(key, new Map(chat.messages.map((message) => [message.id, message])));
+		}
 	}
 
 	private markMessageDirty(message: StoredMessageLog): void {
@@ -899,10 +945,10 @@ class MessageLogStore {
 		if (this.saveTimer) return;
 		this.saveTimer = setTimeout(() => {
 			this.saveTimer = undefined;
-			void this.flush().catch((error) => {
+			void this.flushLocalOnly().catch((error) => {
 				console.error("[message-log] scheduled save failed", error);
 			});
-		}, SAVE_DELAY_MS);
+		}, appConfig.messageLogAutoFlushMs);
 	}
 }
 

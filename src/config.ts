@@ -103,6 +103,7 @@ export const appConfig = {
 	messageLogBackfillLocalFlushPages: Number(process.env.MESSAGE_LOG_BACKFILL_LOCAL_FLUSH_PAGES || 10),
 	messageLogBackfillRemoteFlushPages: Number(process.env.MESSAGE_LOG_BACKFILL_REMOTE_FLUSH_PAGES || 10),
 	messageLogPartMaxBytes: Number(process.env.MESSAGE_LOG_PART_MAX_BYTES || 5 * 1024 * 1024),
+	messageLogAutoFlushMs: Number(process.env.MESSAGE_LOG_AUTO_FLUSH_MS || 120_000),
 	githubContentsTimeoutMs: Number(process.env.GITHUB_CONTENTS_TIMEOUT_MS || 60_000),
 };
 
