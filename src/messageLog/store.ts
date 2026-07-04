@@ -337,6 +337,7 @@ class MessageLogStore {
 	private saveQueue: Promise<void> = Promise.resolve();
 	private dirty = false;
 	private remoteFlushSuspendCount = 0;
+	private autoFlushSuspendCount = 0;
 	private dirtyDates = new Set<string>();
 	private dirtyMembers = new Set<string>();
 	private importedLegacy = false;
@@ -568,6 +569,20 @@ class MessageLogStore {
 			if (resumed) return;
 			resumed = true;
 			this.remoteFlushSuspendCount = Math.max(0, this.remoteFlushSuspendCount - 1);
+		};
+	}
+
+	suspendAutoFlush(): () => void {
+		this.autoFlushSuspendCount += 1;
+		if (this.saveTimer) {
+			clearTimeout(this.saveTimer);
+			this.saveTimer = undefined;
+		}
+		let resumed = false;
+		return () => {
+			if (resumed) return;
+			resumed = true;
+			this.autoFlushSuspendCount = Math.max(0, this.autoFlushSuspendCount - 1);
 		};
 	}
 
@@ -849,6 +864,7 @@ class MessageLogStore {
 
 	private scheduleSave(): void {
 		this.dirty = true;
+		if (this.autoFlushSuspendCount > 0) return;
 		if (this.saveTimer) return;
 		this.saveTimer = setTimeout(() => {
 			this.saveTimer = undefined;

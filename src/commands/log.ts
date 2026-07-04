@@ -646,8 +646,8 @@ async function backfillSquareHistory(
 	let lastError: string | undefined;
 	let consecutiveSkippedPages = 0;
 	const localFlushPages = Math.max(1, appConfig.messageLogBackfillLocalFlushPages);
-	const remoteFlushPages = Math.max(localFlushPages, appConfig.messageLogBackfillRemoteFlushPages);
 	let resumeRemoteFlush = messageLogStore.suspendRemoteFlush();
+	const resumeAutoFlush = messageLogStore.suspendAutoFlush();
 	const applyStats = (stats: { read: number; added: number; oldestAt?: number }) => {
 		totalRead += stats.read;
 		totalAdded += stats.added;
@@ -674,13 +674,9 @@ async function backfillSquareHistory(
 		}
 		return undefined;
 	};
-	const flushCheckpoint = async (label: string, remote: boolean) => {
+	const flushCheckpoint = async (label: string) => {
 		try {
 			await messageLogStore.checkpointLocal();
-			if (remote) {
-				await messageLogStore.flush();
-				await memberNameHistoryStore.flush();
-			}
 		} catch (error) {
 			noteError(label, error);
 		}
@@ -701,7 +697,7 @@ async function backfillSquareHistory(
 		recordEventNames(destination, events);
 		applyStats(recordMessageLogsFromEvents(destination, events));
 		if ((page + 1) % localFlushPages === 0) {
-			await flushCheckpoint(`local prime checkpoint page ${page + 1}`, false);
+			await flushCheckpoint(`local prime checkpoint page ${page + 1}`);
 		}
 		if (response.events.length === 0) break;
 		await sleep(appConfig.messageLogBackfillDelayMs);
@@ -734,12 +730,7 @@ async function backfillSquareHistory(
 		recordEventNames(destination, events);
 		applyStats(recordMessageLogsFromEvents(destination, events));
 		if ((page + 1) % localFlushPages === 0) {
-			await flushCheckpoint(`local checkpoint page ${page + 1}`, false);
-		}
-		if ((page + 1) % remoteFlushPages === 0) {
-			resumeRemoteFlush();
-			await flushCheckpoint(`remote checkpoint page ${page + 1}`, true);
-			resumeRemoteFlush = messageLogStore.suspendRemoteFlush();
+			await flushCheckpoint(`local checkpoint page ${page + 1}`);
 			await onProgress?.(totalRead, totalAdded);
 		}
 		if (!continuationToken) break;
@@ -747,9 +738,10 @@ async function backfillSquareHistory(
 	}
 
 	messageLogStore.markBackfillComplete(destination, oldestAt);
-	await flushCheckpoint("final local checkpoint", false);
+	await flushCheckpoint("final local checkpoint");
 	} finally {
 		resumeRemoteFlush();
+		resumeAutoFlush();
 	}
 	return { read: totalRead, added: totalAdded, skipped: totalRead - totalAdded, oldestAt, errors, lastError };
 }
