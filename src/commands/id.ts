@@ -1,5 +1,6 @@
 ﻿import type { Client } from "@evex/linejs";
 import type { LineCommand, LineDestination } from "./shared.js";
+import { sendLong } from "./shared.js";
 
 interface MemberInfo {
 	mid: string;
@@ -49,6 +50,57 @@ interface FetchSquareChatEventsOptions {
 	direction?: "FORWARD" | "BACKWARD";
 	inclusive?: "NONE" | "ON" | "OFF";
 	fetchType?: "DEFAULT" | "PREFETCH_BY_SERVER" | "PREFETCH_BY_CLIENT";
+}
+
+class DebugLog {
+	private readonly lines: string[] = [];
+	private detailedLines = 0;
+	private suppressedDetailedLines = 0;
+
+	constructor(private readonly detailedLimit = 350) {}
+
+	add(line = ""): void {
+		this.lines.push(line);
+	}
+
+	detail(line: string): void {
+		if (this.detailedLines < this.detailedLimit) {
+			this.lines.push(line);
+			this.detailedLines++;
+			return;
+		}
+		this.suppressedDetailedLines++;
+	}
+
+	error(label: string, error: unknown): void {
+		this.add(`${label}: ERROR ${error instanceof Error ? error.message : String(error)}`);
+	}
+
+	text(): string {
+		if (this.suppressedDetailedLines > 0) {
+			this.lines.push(`詳細行が多すぎるため ${this.suppressedDetailedLines} 行を省略しました。`);
+		}
+		return this.lines.join("\n");
+	}
+}
+
+function eventTypeName(event: OldSearchEvent): string {
+	if (typeof event.type === "string" || typeof event.type === "number") return String(event.type);
+	const payload = event.payload ?? {};
+	const keys = Object.keys(payload).filter((key) => (payload as Record<string, unknown>)[key] !== undefined);
+	return keys.join("+") || "(typeなし)";
+}
+
+function eventTypeSummary(events: OldSearchEvent[]): string {
+	const counts = new Map<string, number>();
+	for (const event of events) {
+		const type = eventTypeName(event);
+		counts.set(type, (counts.get(type) ?? 0) + 1);
+	}
+	return [...counts.entries()]
+		.sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+		.map(([type, count]) => `${type}:${count}`)
+		.join(", ") || "(イベントなし)";
 }
 
 function normalizeText(value: string): string {
@@ -190,9 +242,19 @@ async function searchMembers(
 	client: Client,
 	destination: LineDestination,
 	query: string,
+	debug?: DebugLog,
 ): Promise<MemberInfo[]> {
 	const normalizedQuery = normalizeText(query);
+	debug?.add("[current members]");
+	debug?.add(`query="${query}" normalized="${normalizedQuery}" compact="${compactSearchText(query)}"`);
+	debug?.add(`destination kind=${destination.kind} chatType=${destination.chatType} chatMid=${destination.chatMid}`);
 	const members = await listMembers(client, destination);
+	debug?.add(`listed members=${members.length}`);
+	for (const member of members) {
+		const includes = normalizeText(member.name).includes(normalizedQuery);
+		const loose = looseNameMatches(member.name, query);
+		debug?.detail(`candidate name="${member.name}" mid=${member.mid} includes=${includes} loose=${loose}`);
+	}
 	return members
 		.filter((member) => normalizeText(member.name).includes(normalizedQuery) || looseNameMatches(member.name, query))
 		.sort((left, right) => left.name.localeCompare(right.name, "ja") || left.mid.localeCompare(right.mid));
@@ -244,6 +306,7 @@ async function searchOldSquareHistory(
 	destination: LineDestination,
 	query: string,
 	mentionedMid?: string,
+	debug?: DebugLog,
 ): Promise<MemberInfo | undefined> {
 	if (destination.kind !== "square") {
 		throw new Error("old検索はOpenChatでのみ使用できます");
@@ -253,18 +316,35 @@ async function searchOldSquareHistory(
 	let syncToken: string | undefined;
 	const seen = new Set<string>();
 	const maxPages = 40;
+	debug?.add("");
+	debug?.add("[square event history]");
+	debug?.add(`query="${query}" normalized="${normalizedQuery}" compact="${compactSearchText(query)}" mentionedMid=${mentionedMid || "(なし)"}`);
+	debug?.add(`squareChatMid=${destination.chatMid} squareMid=${destination.scopeMid}`);
 	const findInEvents = (events: OldSearchEvent[]): MemberInfo | undefined => {
-		for (const event of events) {
+		for (const [index, event] of events.entries()) {
 			const member = eventMember(event);
-			if (!member || seen.has(member.mid)) continue;
+			if (!member) {
+				debug?.detail(`event#${index} type=${eventTypeName(event)} member=(なし)`);
+				continue;
+			}
+			if (seen.has(member.mid)) {
+				debug?.detail(`event#${index} type=${eventTypeName(event)} member="${member.name}" mid=${member.mid} skipped=seen`);
+				continue;
+			}
 			seen.add(member.mid);
-			if (mentionedMid && member.mid === mentionedMid) return member;
-			if (!mentionedMid && normalizedQuery && looseNameMatches(member.name, query)) return member;
+			const midMatch = Boolean(mentionedMid && member.mid === mentionedMid);
+			const nameMatch = Boolean(!mentionedMid && normalizedQuery && looseNameMatches(member.name, query));
+			debug?.detail(
+				`event#${index} type=${eventTypeName(event)} member="${member.name}" mid=${member.mid} midMatch=${midMatch} nameMatch=${nameMatch}`,
+			);
+			if (midMatch) return member;
+			if (nameMatch) return member;
 		}
 		return undefined;
 	};
 
 	for (let page = 0; page < 10; page++) {
+		debug?.add(`prime page=${page + 1} direction=FORWARD syncToken=${syncToken ? "あり" : "なし"}`);
 		const response = await fetchSquareChatEvents(client, {
 			squareChatMid: destination.chatMid,
 			syncToken,
@@ -273,13 +353,20 @@ async function searchOldSquareHistory(
 			fetchType: "DEFAULT",
 		});
 		syncToken = response.syncToken;
+		debug?.add(
+			`prime response events=${response.events.length} syncToken=${syncToken ? "あり" : "なし"} types=${eventTypeSummary(response.events as OldSearchEvent[])}`,
+		);
 		const found = findInEvents(response.events as OldSearchEvent[]);
 		if (found) return found;
 		if (response.events.length === 0) break;
 	}
+	debug?.add(`prime end syncToken=${syncToken ? "あり" : "なし"} seen=${seen.size}`);
 	if (!syncToken) return undefined;
 
 	for (let page = 0; page < maxPages; page++) {
+		debug?.add(
+			`backward page=${page + 1} inclusive=${page === 0 ? "ON" : "OFF"} continuation=${continuationToken ? "あり" : "なし"}`,
+		);
 		const response = await fetchSquareChatEvents(client, {
 			squareChatMid: destination.chatMid,
 			syncToken,
@@ -291,6 +378,11 @@ async function searchOldSquareHistory(
 		});
 		syncToken = response.syncToken;
 		continuationToken = response.continuationToken || undefined;
+		debug?.add(
+			`backward response events=${response.events.length} continuation=${continuationToken ? "あり" : "なし"} syncToken=${
+				syncToken ? "あり" : "なし"
+			} types=${eventTypeSummary(response.events as OldSearchEvent[])}`,
+		);
 
 		const found = findInEvents(response.events as OldSearchEvent[]);
 		if (found) return found;
@@ -305,17 +397,29 @@ async function searchSquareMemberDirectory(
 	destination: LineDestination,
 	query: string,
 	mentionedMid?: string,
+	debug?: DebugLog,
 ): Promise<MemberInfo | undefined> {
 	if (destination.kind !== "square") {
 		throw new Error("old検索はOpenChatでのみ使用できます");
 	}
+	debug?.add("[square member directory]");
+	debug?.add(`query="${query}" normalized="${normalizeText(query)}" compact="${compactSearchText(query)}" mentionedMid=${mentionedMid || "(なし)"}`);
+	debug?.add(`squareChatMid=${destination.chatMid} squareMid=${destination.scopeMid}`);
 	if (mentionedMid?.startsWith("p")) {
-		const response = await client.base.square.getSquareMember({ squareMemberMid: mentionedMid });
-		if (response.squareMember.squareMid === destination.scopeMid) {
-			return {
-				mid: response.squareMember.squareMemberMid,
-				name: response.squareMember.displayName || "(名前なし)",
-			};
+		debug?.add(`getSquareMember mentionedMid=${mentionedMid}`);
+		try {
+			const response = await client.base.square.getSquareMember({ squareMemberMid: mentionedMid });
+			debug?.add(
+				`getSquareMember result squareMid=${response.squareMember.squareMid} name="${response.squareMember.displayName || "(名前なし)"}"`,
+			);
+			if (response.squareMember.squareMid === destination.scopeMid) {
+				return {
+					mid: response.squareMember.squareMemberMid,
+					name: response.squareMember.displayName || "(名前なし)",
+				};
+			}
+		} catch (error) {
+			debug?.error("getSquareMember", error);
 		}
 	}
 
@@ -328,10 +432,17 @@ async function searchSquareMemberDirectory(
 		query.split(/\s+/)[0] ?? "",
 		"",
 	].filter((value) => value !== undefined))];
+	debug?.add(`states=${states.join(",")}`);
+	debug?.add(`displayNameQueries=${displayNameQueries.map((value) => `"${value}"`).join(", ")}`);
 	for (const state of states) {
 		for (const displayName of displayNameQueries) {
 			let continuationToken: string | undefined;
 			for (let page = 0; page < 20; page++) {
+				debug?.add(
+					`searchSquareMembers state=${state} displayName="${displayName}" page=${page + 1} continuation=${
+						continuationToken ? "あり" : "なし"
+					}`,
+				);
 				const response = await client.base.square.searchSquareMembers({
 					request: {
 						squareMid: destination.scopeMid,
@@ -350,12 +461,16 @@ async function searchSquareMemberDirectory(
 						limit: 100,
 					},
 				});
+				debug?.add(`searchSquareMembers response members=${response.members.length} continuation=${response.continuationToken ? "あり" : "なし"}`);
 				for (const member of response.members) {
 					const info = {
 						mid: member.squareMemberMid,
 						name: member.displayName || "(名前なし)",
 					};
-					if (normalizeText(info.name).includes(normalizedQuery) || looseNameMatches(info.name, query)) return info;
+					const includes = normalizeText(info.name).includes(normalizedQuery);
+					const loose = looseNameMatches(info.name, query);
+					debug?.detail(`candidate state=${state} name="${info.name}" mid=${info.mid} includes=${includes} loose=${loose}`);
+					if (includes || loose) return info;
 				}
 				continuationToken = response.continuationToken || undefined;
 				if (!continuationToken || response.members.length === 0) break;
@@ -397,6 +512,8 @@ export const idCommand: LineCommand = {
 				"  このトーク内のメンバー名を検索します。1人だけ見つかった場合は、その人のMIDを表示します。",
 				"!id old <メンバー名>",
 				"  退会済みを含むOpenChatメンバー情報から最初に見つかった人のMIDを表示します。",
+				"!id old <メンバー名> log",
+				"  old検索の詳細ログを表示します。",
 			].join("\n"));
 			return;
 		}
@@ -424,7 +541,11 @@ export const idCommand: LineCommand = {
 		}
 
 		const oldSearch = args.some((arg) => arg.toLowerCase() === "old");
-		const searchArgs = oldSearch ? args.filter((arg) => arg.toLowerCase() !== "old") : args;
+		const debugMode = args.some((arg) => arg.toLowerCase() === "log");
+		const searchArgs = args.filter((arg) => {
+			const lower = arg.toLowerCase();
+			return lower !== "old" && lower !== "log";
+		});
 		const mentionedMid = message.mentionMids[0];
 		if (mentionedMid && !oldSearch) {
 			const name = await resolvePersonName(message.client, message.destination, mentionedMid);
@@ -439,27 +560,47 @@ export const idCommand: LineCommand = {
 		}
 
 		try {
+			const debug = debugMode ? new DebugLog() : undefined;
+			if (debug) {
+				debug.add("!id debug log");
+				debug.add(`mode=${oldSearch ? "old" : "current"}`);
+				debug.add(`rawArgs=${args.join(" ")}`);
+				debug.add(`query="${query}" mentionedMid=${mentionedMid || "(なし)"}`);
+				debug.add(`senderMid=${message.destination.senderMid}`);
+				debug.add(`destination kind=${message.destination.kind} chatType=${message.destination.chatType}`);
+				debug.add(`chatMid=${message.destination.chatMid}`);
+				debug.add(`scopeMid=${message.destination.scopeMid}`);
+				debug.add("");
+			}
 			if (oldSearch) {
-				const member = await searchSquareMemberDirectory(message.client, message.destination, query, mentionedMid) ??
-					await searchOldSquareHistory(message.client, message.destination, query, mentionedMid);
+				const member = await searchSquareMemberDirectory(message.client, message.destination, query, mentionedMid, debug) ??
+					await searchOldSquareHistory(message.client, message.destination, query, mentionedMid, debug);
 				if (!member) {
-					await message.send(`退会済みメンバー情報から「${query || mentionedMid}」に一致するユーザーは見つかりませんでした。`);
+					const text = `退会済みメンバー情報から「${query || mentionedMid}」に一致するユーザーは見つかりませんでした。`;
+					if (debug) await sendLong(message, `${text}\n\n${debug.text()}`);
+					else await message.send(text);
 					return;
 				}
-				await message.send(personText(member.mid, member.name));
+				if (debug) await sendLong(message, `${personText(member.mid, member.name)}\n\n${debug.text()}`);
+				else await message.send(personText(member.mid, member.name));
 				return;
 			}
 
-			const matches = await searchMembers(message.client, message.destination, query);
+			const matches = await searchMembers(message.client, message.destination, query, debug);
 			if (matches.length === 0) {
-				await message.send(`「${query}」に一致するメンバーは見つかりませんでした。`);
+				const text = `「${query}」に一致するメンバーは見つかりませんでした。`;
+				if (debug) await sendLong(message, `${text}\n\n${debug.text()}`);
+				else await message.send(text);
 				return;
 			}
 			if (matches.length === 1) {
-				await message.send(personText(matches[0].mid, matches[0].name));
+				if (debug) await sendLong(message, `${personText(matches[0].mid, matches[0].name)}\n\n${debug.text()}`);
+				else await message.send(personText(matches[0].mid, matches[0].name));
 				return;
 			}
-			await message.send(formatMemberList(query, matches));
+			const text = formatMemberList(query, matches);
+			if (debug) await sendLong(message, `${text}\n\n${debug.text()}`);
+			else await message.send(text);
 		} catch (error) {
 			console.error("[id] member search failed", error);
 			await message.send(`メンバー検索に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
