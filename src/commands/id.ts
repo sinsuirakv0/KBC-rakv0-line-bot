@@ -255,9 +255,84 @@ async function searchMembers(
 		const loose = looseNameMatches(member.name, query);
 		debug?.detail(`candidate name="${member.name}" mid=${member.mid} includes=${includes} loose=${loose}`);
 	}
-	return members
+	const matches = members
 		.filter((member) => normalizeText(member.name).includes(normalizedQuery) || looseNameMatches(member.name, query))
 		.sort((left, right) => left.name.localeCompare(right.name, "ja") || left.mid.localeCompare(right.mid));
+	if (destination.kind !== "square") return matches;
+
+	const byMid = new Map(matches.map((member) => [member.mid, member]));
+	for (const member of await searchJoinedSquareMembers(client, destination, query, debug)) {
+		byMid.set(member.mid, member);
+	}
+	return [...byMid.values()]
+		.sort((left, right) => left.name.localeCompare(right.name, "ja") || left.mid.localeCompare(right.mid));
+}
+
+async function searchJoinedSquareMembers(
+	client: Client,
+	destination: LineDestination,
+	query: string,
+	debug?: DebugLog,
+): Promise<MemberInfo[]> {
+	const normalizedQuery = normalizeText(query);
+	const displayNameQueries = [...new Set([
+		query,
+		normalizeText(query),
+		compactSearchText(query),
+		query.split(/\s+/)[0] ?? "",
+		"",
+	].filter((value) => value !== undefined))];
+	const found = new Map<string, MemberInfo>();
+
+	debug?.add("");
+	debug?.add("[joined square member search]");
+	debug?.add(`squareMid=${destination.scopeMid}`);
+	debug?.add(`displayNameQueries=${displayNameQueries.map((value) => `"${value}"`).join(", ")}`);
+
+	for (const displayName of displayNameQueries) {
+		let continuationToken: string | undefined;
+		for (let page = 0; page < 20; page++) {
+			debug?.add(
+				`searchSquareMembers state=JOINED displayName="${displayName}" page=${page + 1} continuation=${
+					continuationToken ? "あり" : "なし"
+				}`,
+			);
+			const response = await client.base.square.searchSquareMembers({
+				request: {
+					squareMid: destination.scopeMid,
+					searchOption: {
+						membershipState: "JOINED",
+						memberRoles: [],
+						displayName,
+						ableToReceiveMessage: "NONE",
+						ableToReceiveFriendRequest: "NONE",
+						chatMidToExcludeMembers: "",
+						includingMe: true,
+						excludeBlockedMembers: false,
+						includingMeOnlyMatch: false,
+					},
+					continuationToken,
+					limit: 100,
+				},
+			});
+			debug?.add(`searchSquareMembers response members=${response.members.length} continuation=${response.continuationToken ? "あり" : "なし"}`);
+			for (const member of response.members) {
+				const info = {
+					mid: member.squareMemberMid,
+					name: member.displayName || "(名前なし)",
+				};
+				const includes = normalizeText(info.name).includes(normalizedQuery);
+				const loose = looseNameMatches(info.name, query);
+				debug?.detail(`joined candidate name="${info.name}" mid=${info.mid} includes=${includes} loose=${loose}`);
+				if (includes || loose) found.set(info.mid, info);
+			}
+			continuationToken = response.continuationToken || undefined;
+			if (!continuationToken || response.members.length === 0) break;
+		}
+		if (found.size > 0) break;
+	}
+
+	return [...found.values()];
 }
 
 function eventMember(event: OldSearchEvent): MemberInfo | undefined {
