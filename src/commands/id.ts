@@ -17,10 +17,14 @@ interface OldSearchEvent {
 			peerSquareMember?: OldSearchSquareMember;
 		};
 		notifiedJoinSquareChat?: { joinedMember?: OldSearchSquareMember };
+		notifiedLeaveSquareChat?: { squareMember?: OldSearchSquareMember; squareMemberMid?: string };
+		notifiedKickoutFromSquare?: { kickees?: OldSearchSquareMember[] };
 		notifiedUpdateSquareMemberProfile?: { squareMember?: OldSearchSquareMember };
 		notifiedUpdateSquareMember?: { squareMember?: OldSearchSquareMember };
 	};
 }
+
+type OldSearchMembershipState = "LEFT" | "KICK_OUT" | "BANNED" | "JOINED";
 
 interface OldSearchSquareMember {
 	squareMemberMid?: string;
@@ -38,6 +42,32 @@ interface OldSearchMessagePayload {
 
 function normalizeText(value: string): string {
 	return value.normalize("NFKC").toLowerCase();
+}
+
+function compactSearchText(value: string): string {
+	return normalizeText(value).replace(/[\s\u3000\-_.・/\\()[\]{}「」『』【】!！?？~〜～、。，．,]/g, "");
+}
+
+function isSubsequence(needle: string, haystack: string): boolean {
+	let index = 0;
+	for (const char of needle) {
+		index = haystack.indexOf(char, index);
+		if (index === -1) return false;
+		index += char.length;
+	}
+	return true;
+}
+
+function looseNameMatches(name: string, query: string): boolean {
+	const normalizedName = normalizeText(name);
+	const normalizedQuery = normalizeText(query);
+	if (!normalizedQuery) return false;
+	if (normalizedName.includes(normalizedQuery)) return true;
+	const compactName = compactSearchText(name);
+	const compactQuery = compactSearchText(query);
+	if (!compactQuery) return false;
+	if (compactName.includes(compactQuery) || compactQuery.includes(compactName)) return true;
+	return compactQuery.length >= 2 && isSubsequence(compactQuery, compactName);
 }
 
 function userNameFromRaw(raw: unknown): string | undefined {
@@ -146,7 +176,7 @@ async function searchMembers(
 	const normalizedQuery = normalizeText(query);
 	const members = await listMembers(client, destination);
 	return members
-		.filter((member) => normalizeText(member.name).includes(normalizedQuery))
+		.filter((member) => normalizeText(member.name).includes(normalizedQuery) || looseNameMatches(member.name, query))
 		.sort((left, right) => left.name.localeCompare(right.name, "ja") || left.mid.localeCompare(right.mid));
 }
 
@@ -155,6 +185,8 @@ function eventMember(event: OldSearchEvent): MemberInfo | undefined {
 		event.payload?.notifiedCreateSquareMember?.squareMember ??
 		event.payload?.notifiedCreateSquareChatMember?.peerSquareMember ??
 		event.payload?.notifiedJoinSquareChat?.joinedMember ??
+		event.payload?.notifiedLeaveSquareChat?.squareMember ??
+		event.payload?.notifiedKickoutFromSquare?.kickees?.[0] ??
 		event.payload?.notifiedUpdateSquareMemberProfile?.squareMember ??
 		event.payload?.notifiedUpdateSquareMember?.squareMember;
 	if (memberPayload?.squareMemberMid?.startsWith("p")) {
@@ -169,6 +201,14 @@ function eventMember(event: OldSearchEvent): MemberInfo | undefined {
 		return {
 			mid: chatMemberMid,
 			name: memberPayload?.displayName || "(名前なし)",
+		};
+	}
+
+	const leftMemberMid = event.payload?.notifiedLeaveSquareChat?.squareMemberMid;
+	if (leftMemberMid?.startsWith("p")) {
+		return {
+			mid: leftMemberMid,
+			name: "(名前なし)",
 		};
 	}
 
@@ -212,10 +252,75 @@ async function searchOldSquareHistory(
 			if (!member || seen.has(member.mid)) continue;
 			seen.add(member.mid);
 			if (mentionedMid && member.mid === mentionedMid) return member;
-			if (!mentionedMid && normalizedQuery && normalizeText(member.name).includes(normalizedQuery)) return member;
+			if (!mentionedMid && normalizedQuery && looseNameMatches(member.name, query)) return member;
 		}
 
 		if (!continuationToken || response.events.length === 0) break;
+	}
+	return undefined;
+}
+
+async function searchSquareMemberDirectory(
+	client: Client,
+	destination: LineDestination,
+	query: string,
+	mentionedMid?: string,
+): Promise<MemberInfo | undefined> {
+	if (destination.kind !== "square") {
+		throw new Error("old検索はOpenChatでのみ使用できます");
+	}
+	if (mentionedMid?.startsWith("p")) {
+		const response = await client.base.square.getSquareMember({ squareMemberMid: mentionedMid });
+		if (response.squareMember.squareMid === destination.scopeMid) {
+			return {
+				mid: response.squareMember.squareMemberMid,
+				name: response.squareMember.displayName || "(名前なし)",
+			};
+		}
+	}
+
+	const normalizedQuery = normalizeText(query);
+	const states: OldSearchMembershipState[] = ["LEFT", "KICK_OUT", "BANNED", "JOINED"];
+	const displayNameQueries = [...new Set([
+		query,
+		normalizeText(query),
+		compactSearchText(query),
+		query.split(/\s+/)[0] ?? "",
+		"",
+	].filter((value) => value !== undefined))];
+	for (const state of states) {
+		for (const displayName of displayNameQueries) {
+			let continuationToken: string | undefined;
+			for (let page = 0; page < 20; page++) {
+				const response = await client.base.square.searchSquareMembers({
+					request: {
+						squareMid: destination.scopeMid,
+						searchOption: {
+							membershipState: state,
+							memberRoles: [],
+							displayName,
+							ableToReceiveMessage: "NONE",
+							ableToReceiveFriendRequest: "NONE",
+							chatMidToExcludeMembers: "",
+							includingMe: true,
+							excludeBlockedMembers: false,
+							includingMeOnlyMatch: false,
+						},
+						continuationToken,
+						limit: 100,
+					},
+				});
+				for (const member of response.members) {
+					const info = {
+						mid: member.squareMemberMid,
+						name: member.displayName || "(名前なし)",
+					};
+					if (normalizeText(info.name).includes(normalizedQuery) || looseNameMatches(info.name, query)) return info;
+				}
+				continuationToken = response.continuationToken || undefined;
+				if (!continuationToken || response.members.length === 0) break;
+			}
+		}
 	}
 	return undefined;
 }
@@ -251,7 +356,7 @@ export const idCommand: LineCommand = {
 				"!id <メンバー名>",
 				"  このトーク内のメンバー名を検索します。1人だけ見つかった場合は、その人のMIDを表示します。",
 				"!id old <メンバー名>",
-				"  OpenChatの過去トーク履歴から最初に見つかった人のMIDを表示します。",
+				"  退会済みを含むOpenChatメンバー情報から最初に見つかった人のMIDを表示します。",
 			].join("\n"));
 			return;
 		}
@@ -295,9 +400,10 @@ export const idCommand: LineCommand = {
 
 		try {
 			if (oldSearch) {
-				const member = await searchOldSquareHistory(message.client, message.destination, query, mentionedMid);
+				const member = await searchSquareMemberDirectory(message.client, message.destination, query, mentionedMid) ??
+					await searchOldSquareHistory(message.client, message.destination, query, mentionedMid);
 				if (!member) {
-					await message.send(`過去履歴から「${query || mentionedMid}」に一致するユーザーは見つかりませんでした。`);
+					await message.send(`退会済みメンバー情報から「${query || mentionedMid}」に一致するユーザーは見つかりませんでした。`);
 					return;
 				}
 				await message.send(personText(member.mid, member.name));
