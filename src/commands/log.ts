@@ -751,7 +751,6 @@ async function backfillSquareHistory(
 	} finally {
 		resumeRemoteFlush();
 	}
-	await flushCheckpoint("final checkpoint", true);
 	return { read: totalRead, added: totalAdded, skipped: totalRead - totalAdded, oldestAt, errors, lastError };
 }
 
@@ -794,6 +793,12 @@ async function startBackfill(message: Parameters<LineCommand["execute"]>[0]["mes
 			} else {
 				await message.send(text);
 			}
+			void Promise.all([
+				messageLogStore.flush(),
+				memberNameHistoryStore.flush(),
+			]).catch((error) => {
+				console.error("[log:get] background GitHub sync failed", error);
+			});
 		})
 		.catch(async (error) => {
 			const label = `@${requester}`;
