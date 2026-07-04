@@ -10,6 +10,7 @@ const COMMAND_LINES = [
 	"!st/ステージ検索",
 	"!ranking/ランキング",
 	"!id/ID確認",
+	"!log/メンバー発言履歴",
 	"!ban/BOT管理BAN",
 	"!oc/OpenChat調査",
 	"!push/プッシュ通知",

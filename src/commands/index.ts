@@ -7,6 +7,7 @@ import { gatyaCommand } from "./gatya.js";
 import { helpCommand } from "./help.js";
 import { idCommand } from "./id.js";
 import { itemCommand } from "./item.js";
+import { logCommand } from "./log.js";
 import { ocCommand } from "./oc.js";
 import { pushCommand } from "./push.js";
 import { rankingCommand } from "./ranking.js";
@@ -21,6 +22,7 @@ const commands = new Map<string, LineCommand>();
 for (const command of [
 	gatyaCommand,
 	idCommand,
+	logCommand,
 	saleCommand,
 	itemCommand,
 	unitCommand,

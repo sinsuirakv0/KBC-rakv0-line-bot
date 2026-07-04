@@ -16,6 +16,7 @@ import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
 import { botStopTargetFromDestination, permissionStore } from "./permissions/store.js";
+import { memberNameHistoryStore } from "./nameHistory/store.js";
 
 interface RawTalkMessage {
 	id: string;
@@ -142,6 +143,7 @@ async function handleSquareMessage(client: Client, message: SquareMessage): Prom
 	void resolveSenderName(client, "square", message.from.id)
 		.then((name) => {
 			if (name) rankingStore.updateName("square", message.from.id, name);
+			if (name) memberNameHistoryStore.record("square", scopeMid, message.from.id, name);
 		});
 }
 
@@ -151,7 +153,10 @@ function resolveSquareScope(client: Client, squareChatMid: string, senderMid: st
 		request = client.base.square.getSquareMember({ squareMemberMid: senderMid })
 			.then((response) => {
 				const member = response.squareMember;
-				if (member.displayName) senderNames.set(`square:${senderMid}`, member.displayName);
+				if (member.displayName) {
+					senderNames.set(`square:${senderMid}`, member.displayName);
+					memberNameHistoryStore.record("square", member.squareMid, senderMid, member.displayName);
+				}
 				return member.squareMid;
 			})
 			.catch((error) => {
@@ -426,6 +431,7 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 	void resolveSenderName(client, "talk", raw.from)
 		.then((name) => {
 			if (name) rankingStore.updateName("talk", raw.from, name);
+			if (name) memberNameHistoryStore.record("talk", target.destination.scopeMid, raw.from, name);
 		});
 }
 
@@ -591,12 +597,25 @@ async function runSession(
 			console.warn("[runtime] checkpoint failed", error);
 		});
 	}, 5 * 60_000);
+	let nameScanRunning = false;
+	const nameScan = setInterval(() => {
+		if (nameScanRunning || controller.signal.aborted) return;
+		nameScanRunning = true;
+		void memberNameHistoryStore.scanKnownSquareNames(client)
+			.catch((error) => {
+				console.warn("[name-history] periodic scan failed", error);
+			})
+			.finally(() => {
+				nameScanRunning = false;
+			});
+	}, appConfig.memberNameScanIntervalMs);
 
 	try {
 		await Promise.race([waitForAbort(shutdownSignal), sessionFailure]);
 	} finally {
 		clearInterval(watchdog);
 		clearInterval(runtimeCheckpoint);
+		clearInterval(nameScan);
 		clearInterval(eventLoopMonitor);
 		controller.abort();
 		shutdownSignal.removeEventListener("abort", relayShutdown);
@@ -626,6 +645,7 @@ async function main(): Promise<void> {
 		runtimeStore.initialize(),
 		permissionStore.initialize(),
 		ocKickHistoryStore.initialize(),
+		memberNameHistoryStore.initialize(),
 	]);
 	startEventPushScheduler(() => activeClient, shutdownController.signal);
 	startPushReminderScheduler(() => activeClient, shutdownController.signal);
@@ -651,6 +671,7 @@ async function main(): Promise<void> {
 	await runtimeStore.flush().catch(() => {});
 	await permissionStore.flush().catch(() => {});
 	await ocKickHistoryStore.flush().catch(() => {});
+	await memberNameHistoryStore.flush().catch(() => {});
 	await new Promise<void>((resolve) => eventUpdateServer.close(() => resolve()));
 }
 

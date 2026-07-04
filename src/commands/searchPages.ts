@@ -1,11 +1,12 @@
 ﻿import type { ReplyableLineMessage } from "./shared.js";
 
-const PAGE_SIZE = 10;
+const DEFAULT_PAGE_SIZE = 10;
 const EXPIRES_MS = 10 * 60_000;
 
 interface SearchPageSession {
 	title: string;
 	rows: string[];
+	pageSize: number;
 	destinationKey: string;
 	senderMid: string;
 	expiresAt: number;
@@ -33,14 +34,14 @@ function cleanup(): void {
 }
 
 function formatPage(session: SearchPageSession, page: number): string {
-	const start = (page - 1) * PAGE_SIZE;
-	const end = Math.min(start + PAGE_SIZE, session.rows.length);
+	const start = (page - 1) * session.pageSize;
+	const end = Math.min(start + session.pageSize, session.rows.length);
 	const lines = [
 		`${session.title} ${start + 1}~${end}/${session.rows.length}`,
 		...session.rows.slice(start, end),
 	];
 	if (end < session.rows.length) {
-		lines.push(`${end + 1}~${end + PAGE_SIZE}を表示するにはこのメッセージに ${page + 1} とリプライしてください`);
+		lines.push(`${end + 1}~${Math.min(end + session.pageSize, session.rows.length)}を表示するにはこのメッセージに ${page + 1} とリプライしてください`);
 	}
 	return lines.join("\n");
 }
@@ -49,18 +50,20 @@ export async function sendSearchResults(
 	message: ReplyableLineMessage,
 	title: string,
 	rows: string[],
+	pageSize = DEFAULT_PAGE_SIZE,
 ): Promise<void> {
 	cleanup();
 	const temporarySession: SearchPageSession = {
 		title,
 		rows,
+		pageSize,
 		destinationKey: destinationKey(message),
 		senderMid: message.destination.senderMid,
 		expiresAt: Date.now() + EXPIRES_MS,
 	};
 	const messageId = await message.send(formatPage(temporarySession, 1));
-	if (messageId && rows.length > PAGE_SIZE) sessions.set(messageId, temporarySession);
-	if (rows.length > PAGE_SIZE) recentSessions.set(recentKey(message), temporarySession);
+	if (messageId && rows.length > pageSize) sessions.set(messageId, temporarySession);
+	if (rows.length > pageSize) recentSessions.set(recentKey(message), temporarySession);
 }
 
 export async function handleSearchPageReply(
@@ -74,7 +77,7 @@ export async function handleSearchPageReply(
 	const session = targetId ? sessions.get(targetId) : recentSessions.get(recentKey(message));
 	if (!session || session.destinationKey !== destinationKey(message) ||
 		session.senderMid !== message.destination.senderMid) return false;
-	const maxPage = Math.ceil(session.rows.length / PAGE_SIZE);
+	const maxPage = Math.ceil(session.rows.length / session.pageSize);
 	if (page > maxPage) {
 		await message.send(`ページは1~${maxPage}までです。`);
 		return true;
