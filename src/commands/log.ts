@@ -87,6 +87,7 @@ let activeBackfill: {
 	startedAt: number;
 } | undefined;
 let activeMessageLogSync: Promise<string> | undefined;
+let messageLogSyncRequested = false;
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -863,14 +864,27 @@ async function syncMessageLogToGitHub(): Promise<string> {
 }
 
 function queueMessageLogSync(): { started: boolean; promise: Promise<string> } {
+	messageLogSyncRequested = true;
 	if (activeMessageLogSync) {
 		return { started: false, promise: activeMessageLogSync };
 	}
-	activeMessageLogSync = syncMessageLogToGitHub()
+	activeMessageLogSync = runQueuedMessageLogSync()
 		.finally(() => {
 			activeMessageLogSync = undefined;
 		});
 	return { started: true, promise: activeMessageLogSync };
+}
+
+async function runQueuedMessageLogSync(): Promise<string> {
+	let result = "";
+	let runs = 0;
+	while (messageLogSyncRequested) {
+		messageLogSyncRequested = false;
+		result = await syncMessageLogToGitHub();
+		runs += 1;
+		await sleep(500);
+	}
+	return runs > 1 ? `${result}\n追加同期: ${runs}回` : result;
 }
 
 export const logCommand: LineCommand = {

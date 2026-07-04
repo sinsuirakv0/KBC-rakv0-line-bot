@@ -802,23 +802,34 @@ class MessageLogStore {
 	private async flushPendingRemote(): Promise<number> {
 		if (this.pendingRemotePaths.size === 0) return 0;
 		let written = 0;
+		let nonManifestFailed = false;
+		const errors: string[] = [];
 		const paths = [...this.pendingRemotePaths].sort((left, right) => {
 			if (left === "manifest.json") return 1;
 			if (right === "manifest.json") return -1;
 			return left.localeCompare(right);
 		});
 		for (const relativePath of paths) {
-			const content = await fs.readFile(localPathFor(relativePath), "utf8");
-			const filePath = remotePathFor(relativePath);
-			const nextSha = await githubContentsClient.write(
-				filePath,
-				content,
-				"Update LINE message log",
-				this.fileShas.get(filePath),
-			);
-			this.fileShas.set(filePath, nextSha);
-			this.pendingRemotePaths.delete(relativePath);
-			written += 1;
+			if (relativePath === "manifest.json" && nonManifestFailed) continue;
+			try {
+				const content = await fs.readFile(localPathFor(relativePath), "utf8");
+				const filePath = remotePathFor(relativePath);
+				const nextSha = await githubContentsClient.write(
+					filePath,
+					content,
+					"Update LINE message log",
+					this.fileShas.get(filePath),
+				);
+				this.fileShas.set(filePath, nextSha);
+				this.pendingRemotePaths.delete(relativePath);
+				written += 1;
+			} catch (error) {
+				if (relativePath !== "manifest.json") nonManifestFailed = true;
+				errors.push(`${relativePath}: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+		if (errors.length > 0) {
+			throw new Error(`GitHub sync partially failed after ${written} file(s): ${errors.slice(0, 3).join(" / ")}`);
 		}
 		return written;
 	}
