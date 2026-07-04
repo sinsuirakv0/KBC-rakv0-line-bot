@@ -11,7 +11,20 @@ interface OldSearchEvent {
 	payload?: {
 		receiveMessage?: OldSearchMessagePayload;
 		sendMessage?: OldSearchMessagePayload;
+		notifiedCreateSquareMember?: { squareMember?: OldSearchSquareMember };
+		notifiedCreateSquareChatMember?: {
+			chatMember?: { squareMemberMid?: string };
+			peerSquareMember?: OldSearchSquareMember;
+		};
+		notifiedJoinSquareChat?: { joinedMember?: OldSearchSquareMember };
+		notifiedUpdateSquareMemberProfile?: { squareMember?: OldSearchSquareMember };
+		notifiedUpdateSquareMember?: { squareMember?: OldSearchSquareMember };
 	};
+}
+
+interface OldSearchSquareMember {
+	squareMemberMid?: string;
+	displayName?: string;
 }
 
 interface OldSearchMessagePayload {
@@ -138,6 +151,27 @@ async function searchMembers(
 }
 
 function eventMember(event: OldSearchEvent): MemberInfo | undefined {
+	const memberPayload =
+		event.payload?.notifiedCreateSquareMember?.squareMember ??
+		event.payload?.notifiedCreateSquareChatMember?.peerSquareMember ??
+		event.payload?.notifiedJoinSquareChat?.joinedMember ??
+		event.payload?.notifiedUpdateSquareMemberProfile?.squareMember ??
+		event.payload?.notifiedUpdateSquareMember?.squareMember;
+	if (memberPayload?.squareMemberMid?.startsWith("p")) {
+		return {
+			mid: memberPayload.squareMemberMid,
+			name: memberPayload.displayName || "(名前なし)",
+		};
+	}
+
+	const chatMemberMid = event.payload?.notifiedCreateSquareChatMember?.chatMember?.squareMemberMid;
+	if (chatMemberMid?.startsWith("p")) {
+		return {
+			mid: chatMemberMid,
+			name: memberPayload?.displayName || "(名前なし)",
+		};
+	}
+
 	const payload = event.payload?.receiveMessage ?? event.payload?.sendMessage;
 	const mid = payload?.squareMessage?.message?.from;
 	if (!mid?.startsWith("p")) return undefined;
