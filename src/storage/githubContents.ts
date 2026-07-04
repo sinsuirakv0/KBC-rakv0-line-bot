@@ -54,26 +54,25 @@ export class GithubContentsClient {
 		message: string,
 		sha?: string,
 	): Promise<string | undefined> {
-		const response = await this.put(filePath, content, message, sha);
-		if (response.status === 409 || response.status === 422) {
-			const latestSha = await this.readSha(filePath).catch(() => undefined);
-			if (latestSha) {
-				console.warn(`[github] retrying ${filePath} with latest sha after HTTP ${response.status}`);
-				const retry = await this.put(filePath, content, message, latestSha);
-				if (retry.ok) {
-					const result = await retry.json() as { content?: { sha?: string } };
-					return result.content?.sha;
-				}
-				const detail = await retry.text();
-				throw new Error(`GitHub write failed: HTTP ${retry.status} ${detail.slice(0, 1000)}`);
+		let nextSha = sha;
+		let lastStatus = 0;
+		let lastDetail = "";
+		for (let attempt = 1; attempt <= 5; attempt++) {
+			const response = await this.put(filePath, content, message, nextSha);
+			if (response.ok) {
+				const result = await response.json() as { content?: { sha?: string } };
+				return result.content?.sha;
 			}
+			lastStatus = response.status;
+			lastDetail = await response.text();
+			if (response.status !== 409 && response.status !== 422) break;
+			const latestSha = await this.readSha(filePath).catch(() => undefined);
+			if (!latestSha) break;
+			nextSha = latestSha;
+			console.warn(`[github] retrying ${filePath} with latest sha after HTTP ${response.status} (attempt ${attempt})`);
+			await this.sleep(250 * attempt);
 		}
-		if (!response.ok) {
-			const detail = await response.text();
-			throw new Error(`GitHub write failed: HTTP ${response.status} ${detail.slice(0, 1000)}`);
-		}
-		const result = await response.json() as { content?: { sha?: string } };
-		return result.content?.sha;
+		throw new Error(`GitHub write failed: HTTP ${lastStatus} ${lastDetail.slice(0, 1000)}`);
 	}
 
 	private async put(
@@ -124,6 +123,10 @@ export class GithubContentsClient {
 			"X-GitHub-Api-Version": "2022-11-28",
 			"User-Agent": "KBC-rakv0-line-bot",
 		};
+	}
+
+	private sleep(ms: number): Promise<void> {
+		return new Promise((resolve) => setTimeout(resolve, ms));
 	}
 }
 
