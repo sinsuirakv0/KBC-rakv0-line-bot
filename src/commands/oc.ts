@@ -1,4 +1,5 @@
-﻿import {
+import { ocKickHistoryStore } from "../moderation/ocKickHistory.js";
+import {
 	permissionDeniedText,
 	permissionStore,
 	targetFromDestination,
@@ -23,12 +24,14 @@ function helpText(): string {
 		"",
 		"!oc authority",
 		"  このOCでのbot権限を表示",
-		"!oc kicktest @ユーザー",
-		"  強制退会リクエストの事前確認",
-		"!oc kicktest @ユーザー confirm",
-		"  実際に退会リクエストを送信",
-		"",
-		"注意: confirm付きは成功すると本当に退会します。",
+		"!oc kick @ユーザー 理由",
+		"  指定したメンバーを強制退会",
+		"!oc kick @A @B 理由",
+		"  複数人をまとめて強制退会",
+		"!oc kick userID:<p...> <p...> 理由",
+		"  MID指定で強制退会",
+		"!oc kick his",
+		"  強制退会履歴を表示",
 	].join("\n");
 }
 
@@ -49,35 +52,59 @@ function canRoleExecute(myRole: SquareRole, requiredRole: SquareRole): boolean {
 	return required > 0 && mine >= required;
 }
 
-function targetUserMid(args: string[], mentions: string[]): string | undefined {
-	return mentions[0] ||
-		argValue(args, "userID") ||
-		argValue(args, "userId") ||
-		argValue(args, "userid");
+function compactError(error: unknown): string {
+	if (!error || typeof error !== "object") return String(error);
+	const raw = error as { name?: string; message?: string; code?: string | number; status?: string | number; reason?: string };
+	return raw.message || raw.reason || raw.name || String(raw.code ?? raw.status ?? "不明なエラー");
 }
 
-function errorSummary(error: unknown): string {
-	if (!error || typeof error !== "object") return String(error);
-	const raw = error as {
-		name?: string;
-		message?: string;
-		code?: string | number;
-		status?: string | number;
-		reason?: string;
-		data?: unknown;
-	};
-	const lines = [
-		`name: ${raw.name ?? "(なし)"}`,
-		`message: ${raw.message ?? "(なし)"}`,
-	];
-	if (raw.code !== undefined) lines.push(`code: ${raw.code}`);
-	if (raw.status !== undefined) lines.push(`status: ${raw.status}`);
-	if (raw.reason !== undefined) lines.push(`reason: ${raw.reason}`);
-	if (raw.data !== undefined) {
-		const data = JSON.stringify(raw.data);
-		lines.push(`data: ${data.length > 300 ? `${data.slice(0, 300)}...` : data}`);
+function formatJst(iso: string): string {
+	const date = new Date(iso);
+	const jst = new Date(date.getTime() + 9 * 60 * 60 * 1000);
+	const y = jst.getUTCFullYear();
+	const m = String(jst.getUTCMonth() + 1).padStart(2, "0");
+	const d = String(jst.getUTCDate()).padStart(2, "0");
+	const hh = String(jst.getUTCHours()).padStart(2, "0");
+	const mm = String(jst.getUTCMinutes()).padStart(2, "0");
+	return `${y}/${m}/${d} ${hh}:${mm}`;
+}
+
+function isUserIdToken(token: string): boolean {
+	return /^p[0-9a-f]{8,}$/i.test(token);
+}
+
+function collectKickTargets(args: string[], mentions: string[]): { mids: string[]; reason: string } {
+	const mids = new Set<string>();
+	for (const mid of mentions) {
+		if (mid.startsWith("p")) mids.add(mid);
 	}
-	return lines.join("\n");
+
+	const reasonParts: string[] = [];
+	for (let index = 1; index < args.length; index++) {
+		const arg = args[index];
+		const lower = arg.toLowerCase();
+		const keyed = argValue([arg], "userID") || argValue([arg], "userId") || argValue([arg], "userid");
+		if (keyed && keyed.startsWith("p")) {
+			mids.add(keyed);
+			continue;
+		}
+		if ((lower === "userid:" || lower === "userid" || lower === "userID:".toLowerCase()) && args[index + 1]?.startsWith("p")) {
+			mids.add(args[index + 1]);
+			index += 1;
+			continue;
+		}
+		if (isUserIdToken(arg)) {
+			mids.add(arg);
+			continue;
+		}
+		if (arg.startsWith("@")) continue;
+		reasonParts.push(arg);
+	}
+
+	return {
+		mids: [...mids],
+		reason: reasonParts.join(" ").trim(),
+	};
 }
 
 async function authorityText(command: Parameters<LineCommand["execute"]>[0]): Promise<string> {
@@ -118,11 +145,34 @@ async function authorityText(command: Parameters<LineCommand["execute"]>[0]): Pr
 	].join("\n");
 }
 
-async function kickTest(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+async function kickHistory(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message } = command;
+	if (message.destination.kind !== "square") {
+		await message.send("このコマンドはOpenChatで実行してください。");
+		return;
+	}
+	const entries = ocKickHistoryStore.list(message.destination.scopeMid, 10);
+	if (entries.length === 0) {
+		await message.send("強制退会履歴はありません。");
+		return;
+	}
+	await message.send([
+		"強制退会履歴",
+		...entries.map((entry, index) => [
+			`${index + 1}. ${formatJst(entry.at)} ${entry.result === "success" ? "成功" : "失敗"}`,
+			`対象: ${entry.targetName} (${entry.targetMid})`,
+			`実行者: ${entry.actorName}`,
+			`理由: ${entry.reason || "なし"}`,
+			entry.error ? `エラー: ${entry.error}` : "",
+		].filter(Boolean).join("\n")),
+	].join("\n\n"));
+}
+
+async function executeKick(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
 	const { message, args } = command;
 	const currentTarget = targetFromDestination(message.destination);
-	if (!currentTarget || !permissionStore.hasAtLeast(currentTarget, message.destination.senderMid, "admin")) {
-		await message.send(permissionDeniedText("admin"));
+	if (!currentTarget || !permissionStore.hasAtLeast(currentTarget, message.destination.senderMid, "mod")) {
+		await message.send(permissionDeniedText("mod"));
 		return;
 	}
 	if (message.destination.kind !== "square") {
@@ -130,69 +180,62 @@ async function kickTest(command: Parameters<LineCommand["execute"]>[0]): Promise
 		return;
 	}
 
-	const userMid = targetUserMid(args, message.mentionMids);
-	if (!userMid || !userMid.startsWith("p")) {
+	const subAction = args[1]?.toLowerCase();
+	if (subAction === "his" || subAction === "history") {
+		await kickHistory(command);
+		return;
+	}
+
+	const { mids, reason } = collectKickTargets(args, message.mentionMids);
+	if (mids.length === 0) {
 		await message.send("対象ユーザーをメンションするか userID:<p...> を指定してください。");
 		return;
 	}
 
-	const confirmed = args.some((arg) => arg.toLowerCase() === "confirm");
-	const squareMid = message.destination.scopeMid;
-	const [chat, authorityResponse, targetMemberResponse] = await Promise.all([
-		message.client.base.square.getSquareChat({ squareChatMid: message.destination.chatMid }),
-		message.client.base.square.getSquareAuthority({ request: { squareMid } }),
-		message.client.base.square.getSquareMember({ squareMemberMid: userMid }),
-	]);
-	const rawChat = chat as unknown as { squareChatMember?: { squareMemberMid?: string } };
-	let myRole: SquareRole;
-	if (rawChat.squareChatMember?.squareMemberMid) {
-		const selfMember = await message.client.base.square.getSquareMember({
-			squareMemberMid: rawChat.squareChatMember.squareMemberMid,
-		});
-		myRole = selfMember.squareMember.role;
-	}
-	const authority = authorityResponse.authority;
-	const targetMember = targetMemberResponse.squareMember;
-	const precheck = [
-		"強制退会リクエスト確認",
-		`OC MID: ${squareMid}`,
-		`対象: ${targetMember.displayName || "(名前なし)"}`,
-		`対象MID: ${targetMember.squareMemberMid}`,
-		`対象状態: ${targetMember.membershipState}`,
-		`対象ロール: ${roleText(targetMember.role)}`,
-		`botロール: ${roleText(myRole)}`,
-		`必要権限: ${roleText(authority.removeSquareMember)}`,
-		`事前判定: ${canRoleExecute(myRole, authority.removeSquareMember) ? "実行可能そう" : "権限不足の可能性あり"}`,
-	];
+	const actorName = message.destination.senderName || message.destination.senderMid;
+	const lines = ["強制退会結果"];
+	for (const userMid of mids) {
+		let targetName = userMid;
+		try {
+			const target = await message.client.base.square.getSquareMember({ squareMemberMid: userMid });
+			targetName = target.squareMember.displayName || userMid;
+		} catch {
+			targetName = "(取得失敗)";
+		}
 
-	if (!confirmed) {
-		await message.send([
-			...precheck,
-			"",
-			"まだ送信していません。",
-			"実際に試す場合は同じコマンドに confirm を付けてください。",
-			"成功した場合は本当に退会します。",
-		].join("\n"));
-		return;
+		try {
+			const response = await message.client.base.square.deleteOtherFromSquare(userMid);
+			const kickedName = response.squareMember.displayName || targetName;
+			ocKickHistoryStore.record({
+				squareMid: message.destination.scopeMid,
+				chatMid: message.destination.chatMid,
+				targetMid: userMid,
+				targetName: kickedName,
+				actorMid: message.destination.senderMid,
+				actorName,
+				reason: reason || undefined,
+				result: "success",
+			});
+			lines.push(`成功: ${kickedName} (${userMid})`);
+		} catch (error) {
+			const summary = compactError(error);
+			ocKickHistoryStore.record({
+				squareMid: message.destination.scopeMid,
+				chatMid: message.destination.chatMid,
+				targetMid: userMid,
+				targetName,
+				actorMid: message.destination.senderMid,
+				actorName,
+				reason: reason || undefined,
+				result: "failed",
+				error: summary,
+			});
+			lines.push(`失敗: ${targetName} (${userMid}) ${summary}`);
+		}
 	}
-
-	try {
-		const response = await message.client.base.square.deleteOtherFromSquare(userMid);
-		await message.send([
-			...precheck,
-			"",
-			"送信結果: 成功",
-			`更新状態: ${response.squareMember.membershipState}`,
-			`更新対象: ${response.squareMember.squareMemberMid}`,
-		].join("\n"));
-	} catch (error) {
-		await message.send([
-			...precheck,
-			"",
-			"送信結果: 失敗",
-			errorSummary(error),
-		].join("\n"));
-	}
+	await ocKickHistoryStore.flush();
+	if (reason) lines.push(`理由: ${reason}`);
+	await message.send(lines.join("\n"));
 }
 
 export const ocCommand: LineCommand = {
@@ -207,10 +250,14 @@ export const ocCommand: LineCommand = {
 			await command.message.send(await authorityText(command));
 			return;
 		}
-		if (action === "kicktest") {
-			await kickTest(command);
+		if (action === "kick") {
+			await executeKick(command);
 			return;
 		}
-		await command.message.send("使い方: !oc [authority|kicktest]\n詳しくは !oc help");
+		if (action === "kicktest") {
+			await command.message.send("!oc kick を使用してください。confirmは不要です。");
+			return;
+		}
+		await command.message.send("使い方: !oc [authority|kick]\n詳しくは !oc help");
 	},
 };

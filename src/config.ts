@@ -91,6 +91,8 @@ export const appConfig = {
 	botStatusGithubPath: process.env.BOT_STATUS_GITHUB_PATH || "stats/bot-status.json",
 	permissionsFile: path.resolve(process.env.PERMISSIONS_FILE || "./storage/permissions.json"),
 	permissionsGithubPath: process.env.PERMISSIONS_GITHUB_PATH || "settings/permissions.json",
+	ocKickHistoryFile: path.resolve(process.env.OC_KICK_HISTORY_FILE || "./storage/oc-kick-history.json"),
+	ocKickHistoryGithubPath: process.env.OC_KICK_HISTORY_GITHUB_PATH || "moderation/oc-kick-history.json",
 };
 
 export function getPasswordCredentials(): { email: string; password: string } {

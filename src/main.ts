@@ -14,6 +14,7 @@ import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineSto
 import { pushSubscriptionStore } from "./subscriptions/store.js";
 import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
+import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
 import { botStopTargetFromDestination, permissionStore } from "./permissions/store.js";
 
 interface RawTalkMessage {
@@ -624,6 +625,7 @@ async function main(): Promise<void> {
 		rankingStore.initialize(),
 		runtimeStore.initialize(),
 		permissionStore.initialize(),
+		ocKickHistoryStore.initialize(),
 	]);
 	startEventPushScheduler(() => activeClient, shutdownController.signal);
 	startPushReminderScheduler(() => activeClient, shutdownController.signal);
@@ -648,6 +650,7 @@ async function main(): Promise<void> {
 	await rankingStore.flush().catch(() => {});
 	await runtimeStore.flush().catch(() => {});
 	await permissionStore.flush().catch(() => {});
+	await ocKickHistoryStore.flush().catch(() => {});
 	await new Promise<void>((resolve) => eventUpdateServer.close(() => resolve()));
 }
 
