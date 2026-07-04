@@ -101,7 +101,7 @@ export const appConfig = {
 	messageLogGithubPath: process.env.MESSAGE_LOG_GITHUB_PATH || "logs/message-log.json",
 	messageLogBackfillDelayMs: Number(process.env.MESSAGE_LOG_BACKFILL_DELAY_MS || 1_500),
 	messageLogBackfillLocalFlushPages: Number(process.env.MESSAGE_LOG_BACKFILL_LOCAL_FLUSH_PAGES || 10),
-	messageLogBackfillRemoteFlushPages: Number(process.env.MESSAGE_LOG_BACKFILL_REMOTE_FLUSH_PAGES || 100),
+	messageLogBackfillRemoteFlushPages: Number(process.env.MESSAGE_LOG_BACKFILL_REMOTE_FLUSH_PAGES || 10),
 	messageLogPartMaxBytes: Number(process.env.MESSAGE_LOG_PART_MAX_BYTES || 5 * 1024 * 1024),
 	githubContentsTimeoutMs: Number(process.env.GITHUB_CONTENTS_TIMEOUT_MS || 60_000),
 };

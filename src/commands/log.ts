@@ -82,6 +82,7 @@ interface ResolvedTarget {
 const MAX_LOG_ROWS = 1000;
 const LOG_PAGE_SIZE = 20;
 const activeBackfills = new Set<string>();
+let activeMessageLogSync: Promise<string> | undefined;
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -646,7 +647,7 @@ async function backfillSquareHistory(
 	let lastError: string | undefined;
 	let consecutiveSkippedPages = 0;
 	const localFlushPages = Math.max(1, appConfig.messageLogBackfillLocalFlushPages);
-	let resumeRemoteFlush = messageLogStore.suspendRemoteFlush();
+	const remoteFlushPages = Math.max(localFlushPages, appConfig.messageLogBackfillRemoteFlushPages);
 	const resumeAutoFlush = messageLogStore.suspendAutoFlush();
 	const applyStats = (stats: { read: number; added: number; oldestAt?: number }) => {
 		totalRead += stats.read;
@@ -733,6 +734,14 @@ async function backfillSquareHistory(
 			await flushCheckpoint(`local checkpoint page ${page + 1}`);
 			await onProgress?.(totalRead, totalAdded);
 		}
+		if ((page + 1) % remoteFlushPages === 0) {
+			const sync = queueMessageLogSync();
+			if (sync.started) {
+				void sync.promise.catch((error) => {
+					console.error("[log:get] periodic GitHub sync failed", error);
+				});
+			}
+		}
 		if (!continuationToken) break;
 		await sleep(appConfig.messageLogBackfillDelayMs);
 	}
@@ -740,7 +749,6 @@ async function backfillSquareHistory(
 	messageLogStore.markBackfillComplete(destination, oldestAt);
 	await flushCheckpoint("final local checkpoint");
 	} finally {
-		resumeRemoteFlush();
 		resumeAutoFlush();
 	}
 	return { read: totalRead, added: totalAdded, skipped: totalRead - totalAdded, oldestAt, errors, lastError };
@@ -785,7 +793,8 @@ async function startBackfill(message: Parameters<LineCommand["execute"]>[0]["mes
 			} else {
 				await message.send(text);
 			}
-			void syncMessageLogToGitHub()
+			const sync = queueMessageLogSync();
+			void sync.promise
 				.then((syncText) => message.send(syncText))
 				.catch((error) => {
 				console.error("[log:get] background GitHub sync failed", error);
@@ -843,6 +852,17 @@ async function syncMessageLogToGitHub(): Promise<string> {
 	return formatMessageLogSyncResult(logResult);
 }
 
+function queueMessageLogSync(): { started: boolean; promise: Promise<string> } {
+	if (activeMessageLogSync) {
+		return { started: false, promise: activeMessageLogSync };
+	}
+	activeMessageLogSync = syncMessageLogToGitHub()
+		.finally(() => {
+			activeMessageLogSync = undefined;
+		});
+	return { started: true, promise: activeMessageLogSync };
+}
+
 export const logCommand: LineCommand = {
 	name: "log",
 	async execute({ message, args }) {
@@ -879,11 +899,11 @@ export const logCommand: LineCommand = {
 				return;
 			}
 			await message.send("ログのGitHub同期を開始しました。");
-			try {
-				await message.send(await syncMessageLogToGitHub());
-			} catch (error) {
-				await message.send(`ログのGitHub同期に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
-			}
+			const sync = queueMessageLogSync();
+			if (!sync.started) await message.send("すでにログのGitHub同期が実行中です。完了時に通知します。");
+			void sync.promise
+				.then((text) => message.send(text))
+				.catch((error) => message.send(`ログのGitHub同期に失敗しました: ${error instanceof Error ? error.message : String(error)}`));
 			return;
 		}
 
