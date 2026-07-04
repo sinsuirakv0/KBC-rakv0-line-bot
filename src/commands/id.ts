@@ -40,6 +40,17 @@ interface OldSearchMessagePayload {
 	};
 }
 
+interface FetchSquareChatEventsOptions {
+	squareChatMid: string;
+	threadMid?: string;
+	syncToken?: string;
+	continuationToken?: string;
+	limit?: number;
+	direction?: "FORWARD" | "BACKWARD";
+	inclusive?: "NONE" | "ON" | "OFF";
+	fetchType?: "DEFAULT" | "PREFETCH_BY_SERVER" | "PREFETCH_BY_CLIENT";
+}
+
 function normalizeText(value: string): string {
 	return value.normalize("NFKC").toLowerCase();
 }
@@ -68,6 +79,13 @@ function looseNameMatches(name: string, query: string): boolean {
 	if (!compactQuery) return false;
 	if (compactName.includes(compactQuery) || compactQuery.includes(compactName)) return true;
 	return compactQuery.length >= 2 && isSubsequence(compactQuery, compactName);
+}
+
+async function fetchSquareChatEvents(
+	client: Client,
+	options: FetchSquareChatEventsOptions,
+) {
+	return await client.base.square.fetchSquareChatEvents(options as never);
 }
 
 function userNameFromRaw(raw: unknown): string | undefined {
@@ -234,28 +252,50 @@ async function searchOldSquareHistory(
 	let continuationToken: string | undefined;
 	let syncToken: string | undefined;
 	const seen = new Set<string>();
-	const maxPages = 30;
-
-	for (let page = 0; page < maxPages; page++) {
-		const response = await client.base.square.fetchSquareChatEvents({
-			squareChatMid: destination.chatMid,
-			syncToken,
-			direction: "BACKWARD",
-			limit: 100,
-			...(continuationToken ? { continuationToken } : {}),
-		} as never);
-		syncToken = response.syncToken;
-		continuationToken = response.continuationToken || undefined;
-
-		for (const event of response.events as OldSearchEvent[]) {
+	const maxPages = 40;
+	const findInEvents = (events: OldSearchEvent[]): MemberInfo | undefined => {
+		for (const event of events) {
 			const member = eventMember(event);
 			if (!member || seen.has(member.mid)) continue;
 			seen.add(member.mid);
 			if (mentionedMid && member.mid === mentionedMid) return member;
 			if (!mentionedMid && normalizedQuery && looseNameMatches(member.name, query)) return member;
 		}
+		return undefined;
+	};
 
-		if (!continuationToken || response.events.length === 0) break;
+	for (let page = 0; page < 10; page++) {
+		const response = await fetchSquareChatEvents(client, {
+			squareChatMid: destination.chatMid,
+			syncToken,
+			limit: 100,
+			direction: "FORWARD",
+			fetchType: "DEFAULT",
+		});
+		syncToken = response.syncToken;
+		const found = findInEvents(response.events as OldSearchEvent[]);
+		if (found) return found;
+		if (response.events.length === 0) break;
+	}
+	if (!syncToken) return undefined;
+
+	for (let page = 0; page < maxPages; page++) {
+		const response = await fetchSquareChatEvents(client, {
+			squareChatMid: destination.chatMid,
+			syncToken,
+			direction: "BACKWARD",
+			inclusive: page === 0 ? "ON" : "OFF",
+			fetchType: "DEFAULT",
+			limit: 100,
+			...(continuationToken ? { continuationToken } : {}),
+		});
+		syncToken = response.syncToken;
+		continuationToken = response.continuationToken || undefined;
+
+		const found = findInEvents(response.events as OldSearchEvent[]);
+		if (found) return found;
+
+		if (!continuationToken) break;
 	}
 	return undefined;
 }
