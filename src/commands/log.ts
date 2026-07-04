@@ -138,28 +138,28 @@ function contentTypeLabel(contentType: string | number | undefined, hasContent: 
 	switch (contentType) {
 		case 1:
 		case "IMAGE":
-			return "画像";
+			return "画像が送信されました。";
 		case 2:
 		case "VIDEO":
-			return "動画";
+			return "動画が送信されました。";
 		case 3:
 		case "AUDIO":
-			return "音声";
+			return "音声が送信されました。";
 		case 7:
 		case "STICKER":
-			return "スタンプ";
+			return "スタンプが送信されました。";
 		case 14:
 		case "FILE":
-			return "ファイル";
+			return "ファイルが送信されました。";
 		case 15:
 		case "LOCATION":
-			return "位置情報";
+			return "位置情報が送信されました。";
 		case 0:
 		case "NONE":
 		case undefined:
-			return hasContent ? "メディア" : "";
+			return hasContent ? "メディアが送信されました。" : "";
 		default:
-			return `メディア(${String(contentType)})`;
+			return `メディア(${String(contentType)})が送信されました。`;
 	}
 }
 
@@ -628,12 +628,15 @@ async function backfillSquareHistory(
 	client: Client,
 	destination: LineDestination,
 	onProgress?: (read: number, added: number) => Promise<void>,
-): Promise<{ read: number; added: number; oldestAt?: number }> {
+): Promise<{ read: number; added: number; oldestAt?: number; errors: number; lastError?: string }> {
 	let continuationToken: string | undefined;
 	let syncToken: string | undefined;
 	let totalRead = 0;
 	let totalAdded = 0;
 	let oldestAt: number | undefined;
+	let errors = 0;
+	let lastError: string | undefined;
+	let consecutiveSkippedPages = 0;
 	const applyStats = (stats: { read: number; added: number; oldestAt?: number }) => {
 		totalRead += stats.read;
 		totalAdded += stats.added;
@@ -641,15 +644,43 @@ async function backfillSquareHistory(
 			oldestAt = stats.oldestAt;
 		}
 	};
+	const noteError = (label: string, error: unknown) => {
+		errors += 1;
+		lastError = `${label}: ${error instanceof Error ? error.message : String(error)}`;
+		console.warn(`[log:get] ${lastError}`);
+	};
+	const fetchWithRetry = async (
+		label: string,
+		options: FetchSquareChatEventsOptions,
+	): Promise<Awaited<ReturnType<typeof fetchSquareChatEvents>> | undefined> => {
+		for (let attempt = 1; attempt <= 3; attempt++) {
+			try {
+				return await fetchSquareChatEvents(client, options);
+			} catch (error) {
+				noteError(`${label} attempt ${attempt}`, error);
+				await sleep(appConfig.messageLogBackfillDelayMs * attempt);
+			}
+		}
+		return undefined;
+	};
+	const flushCheckpoint = async (label: string) => {
+		try {
+			await messageLogStore.flush();
+			await memberNameHistoryStore.flush();
+		} catch (error) {
+			noteError(label, error);
+		}
+	};
 
 	for (let page = 0; page < 10; page++) {
-		const response = await fetchSquareChatEvents(client, {
+		const response = await fetchWithRetry(`prime page ${page + 1}`, {
 			squareChatMid: destination.chatMid,
 			syncToken,
 			limit: 100,
 			direction: "FORWARD",
 			fetchType: "DEFAULT",
 		});
+		if (!response) break;
 		syncToken = response.syncToken;
 		const events = response.events as SquareHistoryEvent[];
 		recordEventNames(destination, events);
@@ -657,10 +688,10 @@ async function backfillSquareHistory(
 		if (response.events.length === 0) break;
 		await sleep(appConfig.messageLogBackfillDelayMs);
 	}
-	if (!syncToken) return { read: totalRead, added: totalAdded, oldestAt };
+	if (!syncToken) return { read: totalRead, added: totalAdded, oldestAt, errors, lastError };
 
 	for (let page = 0; page < 100_000; page++) {
-		const response = await fetchSquareChatEvents(client, {
+		const response = await fetchWithRetry(`backward page ${page + 1}`, {
 			squareChatMid: destination.chatMid,
 			syncToken,
 			direction: "BACKWARD",
@@ -669,14 +700,23 @@ async function backfillSquareHistory(
 			limit: 100,
 			...(continuationToken ? { continuationToken } : {}),
 		});
+		if (!response) {
+			consecutiveSkippedPages += 1;
+			if (consecutiveSkippedPages >= 5) {
+				noteError("backfill aborted", "連続して履歴取得に失敗したため、この時点までの保存内容で終了します");
+				break;
+			}
+			await sleep(appConfig.messageLogBackfillDelayMs);
+			continue;
+		}
+		consecutiveSkippedPages = 0;
 		syncToken = response.syncToken;
 		continuationToken = response.continuationToken || undefined;
 		const events = response.events as SquareHistoryEvent[];
 		recordEventNames(destination, events);
 		applyStats(recordMessageLogsFromEvents(destination, events));
 		if (page % 10 === 9) {
-			await messageLogStore.flush();
-			await memberNameHistoryStore.flush();
+			await flushCheckpoint(`checkpoint page ${page + 1}`);
 			await onProgress?.(totalRead, totalAdded);
 		}
 		if (!continuationToken) break;
@@ -684,9 +724,8 @@ async function backfillSquareHistory(
 	}
 
 	messageLogStore.markBackfillComplete(destination, oldestAt);
-	await messageLogStore.flush();
-	await memberNameHistoryStore.flush();
-	return { read: totalRead, added: totalAdded, oldestAt };
+	await flushCheckpoint("final checkpoint");
+	return { read: totalRead, added: totalAdded, oldestAt, errors, lastError };
 }
 
 function backfillKey(destination: LineDestination): string {
@@ -717,6 +756,8 @@ async function startBackfill(message: Parameters<LineCommand["execute"]>[0]["mes
 				"履歴取得が完了しました。",
 				`読み込んだメッセージ数: ${result.read}`,
 				`新規保存: ${result.added}`,
+				`途中エラー: ${result.errors}`,
+				...(result.lastError ? [`最後のエラー: ${result.lastError}`] : []),
 				`完了時間: ${formatLogTime(Date.now())}`,
 				`かかった時間: ${formatDuration(elapsedMs)}`,
 			].join("\n");

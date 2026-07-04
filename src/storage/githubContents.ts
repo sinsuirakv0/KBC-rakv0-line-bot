@@ -40,7 +40,35 @@ export class GithubContentsClient {
 		message: string,
 		sha?: string,
 	): Promise<string | undefined> {
-		const response = await fetch(this.url(filePath), {
+		const response = await this.put(filePath, content, message, sha);
+		if (response.status === 409) {
+			const latest = await this.read(filePath);
+			if (latest?.sha) {
+				console.warn(`[github] sha conflict while writing ${filePath}; retrying with latest sha`);
+				const retry = await this.put(filePath, content, message, latest.sha);
+				if (retry.ok) {
+					const result = await retry.json() as { content?: { sha?: string } };
+					return result.content?.sha;
+				}
+				const detail = await retry.text();
+				throw new Error(`GitHub write failed: HTTP ${retry.status} ${detail.slice(0, 300)}`);
+			}
+		}
+		if (!response.ok) {
+			const detail = await response.text();
+			throw new Error(`GitHub write failed: HTTP ${response.status} ${detail.slice(0, 300)}`);
+		}
+		const result = await response.json() as { content?: { sha?: string } };
+		return result.content?.sha;
+	}
+
+	private async put(
+		filePath: string,
+		content: string,
+		message: string,
+		sha?: string,
+	): Promise<Response> {
+		return await fetch(this.url(filePath), {
 			method: "PUT",
 			headers: { ...this.headers(), "Content-Type": "application/json" },
 			body: JSON.stringify({
@@ -50,12 +78,6 @@ export class GithubContentsClient {
 				...(sha ? { sha } : {}),
 			}),
 		});
-		if (!response.ok) {
-			const detail = await response.text();
-			throw new Error(`GitHub write failed: HTTP ${response.status} ${detail.slice(0, 300)}`);
-		}
-		const result = await response.json() as { content?: { sha?: string } };
-		return result.content?.sha;
 	}
 
 	async delete(filePath: string, message: string, sha: string): Promise<void> {

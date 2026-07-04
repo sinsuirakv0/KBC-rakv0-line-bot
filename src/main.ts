@@ -93,28 +93,28 @@ function contentTypeLabel(contentType: string | number | undefined, hasContent: 
 	switch (contentType) {
 		case 1:
 		case "IMAGE":
-			return "画像";
+			return "画像が送信されました。";
 		case 2:
 		case "VIDEO":
-			return "動画";
+			return "動画が送信されました。";
 		case 3:
 		case "AUDIO":
-			return "音声";
+			return "音声が送信されました。";
 		case 7:
 		case "STICKER":
-			return "スタンプ";
+			return "スタンプが送信されました。";
 		case 14:
 		case "FILE":
-			return "ファイル";
+			return "ファイルが送信されました。";
 		case 15:
 		case "LOCATION":
-			return "位置情報";
+			return "位置情報が送信されました。";
 		case 0:
 		case "NONE":
 		case undefined:
-			return hasContent ? "メディア" : "";
+			return hasContent ? "メディアが送信されました。" : "";
 		default:
-			return `メディア(${String(contentType)})`;
+			return `メディア(${String(contentType)})が送信されました。`;
 	}
 }
 
