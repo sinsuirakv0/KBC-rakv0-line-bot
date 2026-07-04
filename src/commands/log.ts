@@ -81,7 +81,11 @@ interface ResolvedTarget {
 
 const MAX_LOG_ROWS = 1000;
 const LOG_PAGE_SIZE = 20;
-const activeBackfills = new Set<string>();
+let activeBackfill: {
+	key: string;
+	requester: string;
+	startedAt: number;
+} | undefined;
 let activeMessageLogSync: Promise<string> | undefined;
 
 function sleep(ms: number): Promise<void> {
@@ -764,13 +768,19 @@ async function startBackfill(message: Parameters<LineCommand["execute"]>[0]["mes
 		return;
 	}
 	const key = backfillKey(message.destination);
-	if (activeBackfills.has(key)) {
-		await message.send("このトークの履歴取得はすでに実行中です。");
+	if (activeBackfill) {
+		await message.send([
+			"現在、別の履歴取得が実行中です。",
+			`実行者: ${activeBackfill.requester}`,
+			`開始: ${formatLogTime(activeBackfill.startedAt)}`,
+			`経過: ${formatDuration(Date.now() - activeBackfill.startedAt)}`,
+			"完了後にもう一度実行してください。",
+		].join("\n"));
 		return;
 	}
-	activeBackfills.add(key);
 	const startedAt = Date.now();
 	const requester = message.destination.senderName || message.destination.senderMid;
+	activeBackfill = { key, requester, startedAt };
 	const destination = { ...message.destination };
 	await message.send("履歴取得を開始しました。完了までバックグラウンドでゆっくり読み込みます。");
 	void backfillSquareHistory(message.client, destination)
@@ -811,7 +821,7 @@ async function startBackfill(message: Parameters<LineCommand["execute"]>[0]["mes
 			}
 		})
 		.finally(() => {
-			activeBackfills.delete(key);
+			if (activeBackfill?.key === key) activeBackfill = undefined;
 		});
 }
 
