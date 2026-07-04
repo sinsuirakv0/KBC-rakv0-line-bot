@@ -51,6 +51,13 @@ export interface MemberProfileInput {
 	extra?: Record<string, unknown>;
 }
 
+export interface MessageLogFlushResult {
+	localFiles: number;
+	remoteFiles: number;
+	remoteEnabled: boolean;
+	remoteSkipped: boolean;
+}
+
 interface StoredChat {
 	kind: "talk" | "square";
 	chatMid: string;
@@ -512,14 +519,19 @@ class MessageLogStore {
 		this.scheduleSave();
 	}
 
-	async flush(): Promise<void> {
+	async flush(): Promise<MessageLogFlushResult> {
 		if (this.saveTimer) {
 			clearTimeout(this.saveTimer);
 			this.saveTimer = undefined;
 		}
 		if (!this.dirty) {
 			await this.saveQueue;
-			return;
+			return {
+				localFiles: 0,
+				remoteFiles: 0,
+				remoteEnabled: githubContentsClient.enabled,
+				remoteSkipped: false,
+			};
 		}
 		this.dirty = false;
 		const dirtyDates = new Set(this.dirtyDates);
@@ -535,24 +547,33 @@ class MessageLogStore {
 			this.importedLegacy = false;
 		}
 		const persistence = this.buildPersistence();
-		const operation = this.saveQueue.then(async () => {
-			await this.writeSplitLocal(persistence, dirtyDates, dirtyMembers);
+		const operation = this.saveQueue.then(async (): Promise<MessageLogFlushResult> => {
+			const localFiles = await this.writeSplitLocal(persistence, dirtyDates, dirtyMembers);
+			let remoteFiles = 0;
+			let remoteSkipped = false;
 			if (githubContentsClient.enabled && this.remoteFlushSuspendCount === 0) {
-				await this.writeSplitRemote(persistence, dirtyDates, dirtyMembers);
+				remoteFiles = await this.writeSplitRemote(persistence, dirtyDates, dirtyMembers);
 			} else if (githubContentsClient.enabled) {
+				remoteSkipped = true;
 				this.dirty = true;
 				for (const item of dirtyDates) this.dirtyDates.add(item);
 				for (const item of dirtyMembers) this.dirtyMembers.add(item);
 			}
+			return {
+				localFiles,
+				remoteFiles,
+				remoteEnabled: githubContentsClient.enabled,
+				remoteSkipped,
+			};
 		});
-		this.saveQueue = operation.catch((error) => {
+		this.saveQueue = operation.then(() => undefined).catch((error) => {
 			console.error("[message-log] save failed", error);
 			this.dirty = true;
 			for (const item of dirtyDates) this.dirtyDates.add(item);
 			for (const item of dirtyMembers) this.dirtyMembers.add(item);
 			this.scheduleSave();
 		});
-		await operation;
+		return await operation;
 	}
 
 	async checkpointLocal(): Promise<void> {
@@ -772,36 +793,46 @@ class MessageLogStore {
 		persistence = this.buildPersistence(),
 		dirtyDates?: Set<string>,
 		dirtyMembers?: Set<string>,
-	): Promise<void> {
+	): Promise<number> {
+		let written = 0;
 		await this.writeManifestLocal(persistence.manifest);
+		written += 1;
 		for (const [relativePath, file] of persistence.parts) {
 			const dirtyKey = persistence.partDates.get(relativePath);
 			if (dirtyDates && dirtyKey && !dirtyDates.has(dirtyKey)) continue;
 			await this.writeLocalJson(relativePath, file);
+			written += 1;
 		}
 		for (const [relativePath, file] of persistence.members) {
 			const dirtyKey = persistence.memberChats.get(relativePath);
 			if (dirtyMembers && dirtyKey && !dirtyMembers.has(dirtyKey)) continue;
 			await this.writeLocalJson(relativePath, file);
+			written += 1;
 		}
+		return written;
 	}
 
 	private async writeSplitRemote(
 		persistence: ReturnType<MessageLogStore["buildPersistence"]>,
 		dirtyDates: Set<string>,
 		dirtyMembers: Set<string>,
-	): Promise<void> {
+	): Promise<number> {
+		let written = 0;
 		for (const [relativePath, file] of persistence.parts) {
 			const dirtyKey = persistence.partDates.get(relativePath);
 			if (dirtyKey && !dirtyDates.has(dirtyKey)) continue;
 			await this.writeRemoteJson(relativePath, file);
+			written += 1;
 		}
 		for (const [relativePath, file] of persistence.members) {
 			const dirtyKey = persistence.memberChats.get(relativePath);
 			if (dirtyKey && !dirtyMembers.has(dirtyKey)) continue;
 			await this.writeRemoteJson(relativePath, file);
+			written += 1;
 		}
 		await this.writeRemoteJson("manifest.json", persistence.manifest);
+		written += 1;
+		return written;
 	}
 
 	private async writeManifestLocal(manifest: MessageLogManifest): Promise<void> {

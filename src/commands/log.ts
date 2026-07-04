@@ -1,6 +1,6 @@
 import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
-import { messageLogStore, type StoredMemberState, type StoredMessageLog } from "../messageLog/store.js";
+import { messageLogStore, type MessageLogFlushResult, type StoredMemberState, type StoredMessageLog } from "../messageLog/store.js";
 import { memberNameHistoryStore } from "../nameHistory/store.js";
 import { permissionDeniedText, permissionStore, targetFromDestination } from "../permissions/store.js";
 import { sendSearchResults } from "./searchPages.js";
@@ -785,11 +785,11 @@ async function startBackfill(message: Parameters<LineCommand["execute"]>[0]["mes
 			} else {
 				await message.send(text);
 			}
-			void Promise.all([
-				messageLogStore.flush(),
-				memberNameHistoryStore.flush(),
-			]).catch((error) => {
+			void syncMessageLogToGitHub()
+				.then((syncText) => message.send(syncText))
+				.catch((error) => {
 				console.error("[log:get] background GitHub sync failed", error);
+				return message.send(`ログのGitHub同期に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
 			});
 		})
 		.catch(async (error) => {
@@ -816,6 +816,33 @@ function formatDuration(ms: number): string {
 	return `${seconds}秒`;
 }
 
+function formatMessageLogSyncResult(result: MessageLogFlushResult): string {
+	if (!result.remoteEnabled) {
+		return [
+			"ログのGitHub同期は無効です。",
+			"PUSH_SUBSCRIPTIONS_GITHUB_REPO と PUSH_SUBSCRIPTIONS_GITHUB_TOKEN を確認してください。",
+			`ローカル保存: ${result.localFiles}ファイル`,
+		].join("\n");
+	}
+	if (result.remoteSkipped) {
+		return [
+			"ログのGitHub同期は保留されました。",
+			`ローカル保存: ${result.localFiles}ファイル`,
+		].join("\n");
+	}
+	return [
+		"ログのGitHub同期が完了しました。",
+		`GitHub保存: ${result.remoteFiles}ファイル`,
+		`ローカル保存: ${result.localFiles}ファイル`,
+	].join("\n");
+}
+
+async function syncMessageLogToGitHub(): Promise<string> {
+	const logResult = await messageLogStore.flush();
+	await memberNameHistoryStore.flush();
+	return formatMessageLogSyncResult(logResult);
+}
+
 export const logCommand: LineCommand = {
 	name: "log",
 	async execute({ message, args }) {
@@ -827,6 +854,8 @@ export const logCommand: LineCommand = {
 				"  その人の発言から検索語を含むものだけ表示します。",
 				"!log get",
 				"  このOpenChatの過去履歴をゆっくり保存します。",
+				"!log sync",
+				"  保存済みログをGitHubへ手動同期します。",
 				"!log name <メンバー名>",
 				"  保存済みの過去の名前を表示します。",
 			].join("\n"));
@@ -840,6 +869,21 @@ export const logCommand: LineCommand = {
 				return;
 			}
 			await startBackfill(message);
+			return;
+		}
+
+		if (args[0]?.toLowerCase() === "sync") {
+			const target = targetFromDestination(message.destination);
+			if (!permissionStore.hasAtLeast(target, message.destination.senderMid, "admin")) {
+				await message.send(permissionDeniedText("admin"));
+				return;
+			}
+			await message.send("ログのGitHub同期を開始しました。");
+			try {
+				await message.send(await syncMessageLogToGitHub());
+			} catch (error) {
+				await message.send(`ログのGitHub同期に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+			}
 			return;
 		}
 
