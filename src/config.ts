@@ -97,6 +97,7 @@ export const appConfig = {
 	memberNameHistoryGithubPath: process.env.MEMBER_NAME_HISTORY_GITHUB_PATH || "logs/member-name-history.json",
 	memberNameScanIntervalMs: Number(process.env.MEMBER_NAME_SCAN_INTERVAL_MS || 30 * 60_000),
 	messageLogFile: path.resolve(process.env.MESSAGE_LOG_FILE || "./storage/message-log.json"),
+	messageLogDir: path.resolve(process.env.MESSAGE_LOG_DIR || "./storage/message-log"),
 	messageLogGithubPath: process.env.MESSAGE_LOG_GITHUB_PATH || "logs/message-log.json",
 	messageLogBackfillDelayMs: Number(process.env.MESSAGE_LOG_BACKFILL_DELAY_MS || 750),
 	messageLogBackfillLocalFlushPages: Number(process.env.MESSAGE_LOG_BACKFILL_LOCAL_FLUSH_PAGES || 1),

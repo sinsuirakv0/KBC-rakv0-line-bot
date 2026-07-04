@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { gzipSync, gunzipSync } from "node:zlib";
+import { gunzipSync } from "node:zlib";
 import type { LineDestination } from "../commands/shared.js";
 import { appConfig } from "../config.js";
 import { githubContentsClient } from "../storage/githubContents.js";
@@ -16,6 +16,7 @@ export interface StoredMessageLog {
 	createdAt: number;
 	content: string;
 	contentType?: string;
+	metadata?: Record<string, unknown>;
 }
 
 export type StoredMemberState = "JOINED" | "LEFT" | "KICK_OUT" | "BANNED" | "UNKNOWN";
@@ -133,9 +134,7 @@ function normalizedRoot(value: string): string {
 }
 
 function localRoot(): string {
-	const configured = process.env.MESSAGE_LOG_DIR;
-	if (configured) return path.resolve(configured);
-	return path.join(path.dirname(appConfig.messageLogFile), "message-log");
+	return appConfig.messageLogDir;
 }
 
 function remoteRoot(): string {
@@ -236,6 +235,7 @@ function parseMessage(message: unknown, chat: Pick<StoredChat, "kind" | "chatMid
 		createdAt,
 		content: raw.content,
 		contentType: typeof raw.contentType === "string" ? raw.contentType : undefined,
+		metadata: raw.metadata && typeof raw.metadata === "object" ? raw.metadata : undefined,
 	};
 }
 
@@ -282,13 +282,7 @@ function decodeWrappedJson(content: string): unknown {
 }
 
 function encodeWrappedJson(value: unknown): string {
-	const data = gzipSync(Buffer.from(JSON.stringify(value), "utf8")).toString("base64");
-	return `${JSON.stringify({
-		format: "kbc-line-message-log",
-		version: 2,
-		encoding: "gzip+base64",
-		data,
-	})}\n`;
+	return `${JSON.stringify(value, null, 2)}\n`;
 }
 
 function bytesOfJson(value: unknown): number {

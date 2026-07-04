@@ -202,6 +202,14 @@ function messageLogFromEvent(destination: LineDestination, event: SquareHistoryE
 		createdAt,
 		content,
 		contentType: message.contentType === undefined ? undefined : String(message.contentType),
+		metadata: {
+			source: "history-square",
+			squareChatMid: payload.squareChatMid,
+			squareMid: payload.squareMid,
+			hasContent: message.hasContent,
+			eventType: event.type,
+			eventCreatedTime: event.createdTime === undefined ? undefined : String(event.createdTime),
+		},
 	};
 }
 
@@ -628,7 +636,7 @@ async function backfillSquareHistory(
 	client: Client,
 	destination: LineDestination,
 	onProgress?: (read: number, added: number) => Promise<void>,
-): Promise<{ read: number; added: number; oldestAt?: number; errors: number; lastError?: string }> {
+): Promise<{ read: number; added: number; skipped: number; oldestAt?: number; errors: number; lastError?: string }> {
 	let continuationToken: string | undefined;
 	let syncToken: string | undefined;
 	let totalRead = 0;
@@ -698,7 +706,7 @@ async function backfillSquareHistory(
 		if (response.events.length === 0) break;
 		await sleep(appConfig.messageLogBackfillDelayMs);
 	}
-	if (!syncToken) return { read: totalRead, added: totalAdded, oldestAt, errors, lastError };
+	if (!syncToken) return { read: totalRead, added: totalAdded, skipped: totalRead - totalAdded, oldestAt, errors, lastError };
 
 	for (let page = 0; page < 100_000; page++) {
 		const response = await fetchWithRetry(`backward page ${page + 1}`, {
@@ -744,7 +752,7 @@ async function backfillSquareHistory(
 		resumeRemoteFlush();
 	}
 	await flushCheckpoint("final checkpoint", true);
-	return { read: totalRead, added: totalAdded, oldestAt, errors, lastError };
+	return { read: totalRead, added: totalAdded, skipped: totalRead - totalAdded, oldestAt, errors, lastError };
 }
 
 function backfillKey(destination: LineDestination): string {
@@ -775,6 +783,7 @@ async function startBackfill(message: Parameters<LineCommand["execute"]>[0]["mes
 				"履歴取得が完了しました。",
 				`読み込んだメッセージ数: ${result.read}`,
 				`新規保存: ${result.added}`,
+				`既存/重複: ${result.skipped}`,
 				`途中エラー: ${result.errors}`,
 				...(result.lastError ? [`最後のエラー: ${result.lastError}`] : []),
 				`完了時間: ${formatLogTime(Date.now())}`,

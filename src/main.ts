@@ -241,6 +241,12 @@ function recordSquareMessage(message: SquareMessage, destination: SquareReplyTar
 		createdAt,
 		content: messageContent(rawMessage.text, rawMessage.contentType, rawMessage.hasContent),
 		contentType: rawMessage.contentType === undefined ? undefined : String(rawMessage.contentType),
+		metadata: {
+			source: "live-square",
+			to: rawMessage.to,
+			toType: rawMessage.toType,
+			hasContent: rawMessage.hasContent,
+		},
 	};
 	messageLogStore.record(record);
 }
@@ -541,7 +547,7 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 	const parsed = await readTalkText(client, raw);
 	if (parsed === null) return;
 	const target = new RawTalkReplyTarget(client, raw, ownMid, parsed.mentionMids);
-	recordTalkMessage(raw, target.destination, parsed.text);
+	recordTalkMessage(raw, target.destination, parsed);
 	if (shouldIgnoreStoppedText(parsed.text, target)) return;
 	if (!parsed.text.startsWith(appConfig.commandPrefix)) {
 		await handleSearchPageReply(parsed.text, target);
@@ -574,7 +580,7 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 					state: "JOINED",
 					source: "liveNameResolve",
 				});
-				recordTalkMessage(raw, { ...target.destination, senderName: name }, parsed.text);
+				recordTalkMessage(raw, { ...target.destination, senderName: name }, parsed);
 			}
 		});
 }
@@ -582,7 +588,7 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 function recordTalkMessage(
 	raw: RawTalkMessage,
 	destination: RawTalkReplyTarget["destination"],
-	text?: string,
+	parsed?: ParsedTalkText,
 ): void {
 	if (!raw.id || !raw.from) return;
 	const createdAt = Number(raw.createdTime);
@@ -596,7 +602,17 @@ function recordTalkMessage(
 		senderMid: raw.from,
 		senderName: destination.senderName,
 		createdAt,
-		content: messageContent(text ?? raw.text, undefined, false),
+		content: messageContent(parsed?.text ?? raw.text, undefined, false),
+		metadata: {
+			source: "live-talk",
+			to: raw.to,
+			toType: raw.toType,
+			chunks: raw.chunks,
+			contentMetadata: raw.contentMetadata,
+			relatedMessageId: raw.relatedMessageId,
+			messageRelationType: raw.messageRelationType,
+			mentionMids: parsed?.mentionMids,
+		},
 	};
 	messageLogStore.record(record);
 }
