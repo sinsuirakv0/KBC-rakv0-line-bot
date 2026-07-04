@@ -216,7 +216,8 @@ async function searchSquareMembersByName(
 		normalizeText(query),
 		compactSearchText(query),
 		query.split(/\s+/)[0] ?? "",
-	].filter((value) => value.trim()))];
+		"",
+	].filter((value) => value !== undefined))];
 	const found = new Map<string, MemberInfo>();
 
 	for (const state of states) {
@@ -271,6 +272,65 @@ async function resolveMentionedMember(
 	return { mid, name };
 }
 
+async function searchHistoryMembersByName(
+	client: Client,
+	destination: LineDestination,
+	query: string,
+): Promise<MemberInfo[]> {
+	if (destination.kind !== "square") throw new Error("!logはOpenChatでのみ使用できます");
+	const found = new Map<string, MemberInfo>();
+	let continuationToken: string | undefined;
+	let syncToken: string | undefined;
+	const collect = (events: SquareHistoryEvent[]) => {
+		recordEventNames(destination, events);
+		for (const event of events) {
+			for (const member of eventMembers(event)) {
+				if (looseNameMatches(member.name, query)) found.set(member.mid, member);
+			}
+		}
+	};
+
+	for (let page = 0; page < 10; page++) {
+		const response = await fetchSquareChatEvents(client, {
+			squareChatMid: destination.chatMid,
+			syncToken,
+			limit: 100,
+			direction: "FORWARD",
+			fetchType: "DEFAULT",
+		});
+		syncToken = response.syncToken;
+		collect(response.events as SquareHistoryEvent[]);
+		if (response.events.length === 0) break;
+	}
+	if (!syncToken) return [];
+
+	for (let page = 0; page < 120; page++) {
+		const response = await fetchSquareChatEvents(client, {
+			squareChatMid: destination.chatMid,
+			syncToken,
+			direction: "BACKWARD",
+			inclusive: page === 0 ? "ON" : "OFF",
+			fetchType: "DEFAULT",
+			limit: 100,
+			...(continuationToken ? { continuationToken } : {}),
+		});
+		syncToken = response.syncToken;
+		continuationToken = response.continuationToken || undefined;
+		collect(response.events as SquareHistoryEvent[]);
+		if (!continuationToken) break;
+	}
+
+	return [...found.values()]
+		.sort((left, right) => left.name.localeCompare(right.name, "ja") || left.mid.localeCompare(right.mid));
+}
+
+function uniqueMembers(members: MemberInfo[]): MemberInfo[] {
+	const byMid = new Map<string, MemberInfo>();
+	for (const member of members) byMid.set(member.mid, member);
+	return [...byMid.values()]
+		.sort((left, right) => left.name.localeCompare(right.name, "ja") || left.mid.localeCompare(right.mid));
+}
+
 async function resolveTarget(
 	client: Client,
 	destination: LineDestination,
@@ -288,7 +348,10 @@ async function resolveTarget(
 	for (let split = args.length; split >= 1; split--) {
 		const memberQuery = args.slice(0, split).join(" ").trim();
 		const filter = args.slice(split).join(" ").trim();
-		const members = await searchSquareMembersByName(client, destination, memberQuery);
+		const members = uniqueMembers([
+			...await searchSquareMembersByName(client, destination, memberQuery),
+			...await searchHistoryMembersByName(client, destination, memberQuery),
+		]);
 		if (members.length === 1) return { member: members[0], filter };
 		if (members.length > 1 && !ambiguous) ambiguous = members;
 	}
@@ -485,7 +548,7 @@ export const logCommand: LineCommand = {
 		if (rows.length === 0) {
 			await message.send(filter
 				? `${target.name} の「${filter}」を含む発言は見つかりませんでした。`
-				: `${target.name} の発言履歴は見つかりませんでした。`);
+				: `${target.name} の発言履歴がありません。`);
 			return;
 		}
 
