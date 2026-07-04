@@ -6,6 +6,23 @@ interface MemberInfo {
 	name: string;
 }
 
+interface OldSearchEvent {
+	type?: string | number;
+	payload?: {
+		receiveMessage?: OldSearchMessagePayload;
+		sendMessage?: OldSearchMessagePayload;
+	};
+}
+
+interface OldSearchMessagePayload {
+	senderDisplayName?: string;
+	squareMessage?: {
+		message?: {
+			from?: string;
+		};
+	};
+}
+
 function normalizeText(value: string): string {
 	return value.normalize("NFKC").toLowerCase();
 }
@@ -120,6 +137,55 @@ async function searchMembers(
 		.sort((left, right) => left.name.localeCompare(right.name, "ja") || left.mid.localeCompare(right.mid));
 }
 
+function eventMember(event: OldSearchEvent): MemberInfo | undefined {
+	const payload = event.payload?.receiveMessage ?? event.payload?.sendMessage;
+	const mid = payload?.squareMessage?.message?.from;
+	if (!mid?.startsWith("p")) return undefined;
+	return {
+		mid,
+		name: payload?.senderDisplayName || "(名前なし)",
+	};
+}
+
+async function searchOldSquareHistory(
+	client: Client,
+	destination: LineDestination,
+	query: string,
+	mentionedMid?: string,
+): Promise<MemberInfo | undefined> {
+	if (destination.kind !== "square") {
+		throw new Error("old検索はOpenChatでのみ使用できます");
+	}
+	const normalizedQuery = normalizeText(query);
+	let continuationToken: string | undefined;
+	let syncToken: string | undefined;
+	const seen = new Set<string>();
+	const maxPages = 30;
+
+	for (let page = 0; page < maxPages; page++) {
+		const response = await client.base.square.fetchSquareChatEvents({
+			squareChatMid: destination.chatMid,
+			syncToken,
+			direction: "BACKWARD",
+			limit: 100,
+			...(continuationToken ? { continuationToken } : {}),
+		} as never);
+		syncToken = response.syncToken;
+		continuationToken = response.continuationToken || undefined;
+
+		for (const event of response.events as OldSearchEvent[]) {
+			const member = eventMember(event);
+			if (!member || seen.has(member.mid)) continue;
+			seen.add(member.mid);
+			if (mentionedMid && member.mid === mentionedMid) return member;
+			if (!mentionedMid && normalizedQuery && normalizeText(member.name).includes(normalizedQuery)) return member;
+		}
+
+		if (!continuationToken || response.events.length === 0) break;
+	}
+	return undefined;
+}
+
 function formatMemberList(query: string, members: MemberInfo[]): string {
 	const visible = members.slice(0, 20);
 	const lines = [
@@ -150,6 +216,8 @@ export const idCommand: LineCommand = {
 				"  このトークの名前とMIDを表示します。",
 				"!id <メンバー名>",
 				"  このトーク内のメンバー名を検索します。1人だけ見つかった場合は、その人のMIDを表示します。",
+				"!id old <メンバー名>",
+				"  OpenChatの過去トーク履歴から最初に見つかった人のMIDを表示します。",
 			].join("\n"));
 			return;
 		}
@@ -176,20 +244,32 @@ export const idCommand: LineCommand = {
 			return;
 		}
 
+		const oldSearch = args.some((arg) => arg.toLowerCase() === "old");
+		const searchArgs = oldSearch ? args.filter((arg) => arg.toLowerCase() !== "old") : args;
 		const mentionedMid = message.mentionMids[0];
-		if (mentionedMid) {
+		if (mentionedMid && !oldSearch) {
 			const name = await resolvePersonName(message.client, message.destination, mentionedMid);
 			await message.send(personText(mentionedMid, name));
 			return;
 		}
 
-		const query = args.join(" ").trim();
-		if (!query) {
+		const query = searchArgs.join(" ").trim();
+		if (!query && !mentionedMid) {
 			await message.send("検索するメンバー名を指定してください。\n使い方: !id <メンバー名>");
 			return;
 		}
 
 		try {
+			if (oldSearch) {
+				const member = await searchOldSquareHistory(message.client, message.destination, query, mentionedMid);
+				if (!member) {
+					await message.send(`過去履歴から「${query || mentionedMid}」に一致するユーザーは見つかりませんでした。`);
+					return;
+				}
+				await message.send(personText(member.mid, member.name));
+				return;
+			}
+
 			const matches = await searchMembers(message.client, message.destination, query);
 			if (matches.length === 0) {
 				await message.send(`「${query}」に一致するメンバーは見つかりませんでした。`);
