@@ -19,6 +19,23 @@ export class GithubContentsClient {
 	}
 
 	async read(filePath: string): Promise<GithubTextFile | null> {
+		const file = await this.getFile(filePath);
+		if (!file) return null;
+		if (file.encoding !== "base64" || !file.content) {
+			throw new Error("GitHub file content is not available as base64");
+		}
+		return {
+			content: Buffer.from(file.content.replace(/\s/g, ""), "base64").toString("utf8"),
+			sha: file.sha,
+		};
+	}
+
+	async readSha(filePath: string): Promise<string | undefined> {
+		const file = await this.getFile(filePath);
+		return file?.sha;
+	}
+
+	private async getFile(filePath: string): Promise<GithubFileResponse | null> {
 		const url = new URL(this.url(filePath));
 		url.searchParams.set("ref", appConfig.pushSubscriptionsGithubBranch);
 		const response = await fetch(url, {
@@ -28,13 +45,7 @@ export class GithubContentsClient {
 		if (response.status === 404) return null;
 		if (!response.ok) throw new Error(`GitHub read failed: HTTP ${response.status}`);
 		const file = await response.json() as GithubFileResponse;
-		if (file.encoding !== "base64" || !file.content) {
-			throw new Error("GitHub file is not base64 content");
-		}
-		return {
-			content: Buffer.from(file.content.replace(/\s/g, ""), "base64").toString("utf8"),
-			sha: file.sha,
-		};
+		return file;
 	}
 
 	async write(
@@ -44,22 +55,22 @@ export class GithubContentsClient {
 		sha?: string,
 	): Promise<string | undefined> {
 		const response = await this.put(filePath, content, message, sha);
-		if (response.status === 409) {
-			const latest = await this.read(filePath);
-			if (latest?.sha) {
-				console.warn(`[github] sha conflict while writing ${filePath}; retrying with latest sha`);
-				const retry = await this.put(filePath, content, message, latest.sha);
+		if (response.status === 409 || response.status === 422) {
+			const latestSha = await this.readSha(filePath).catch(() => undefined);
+			if (latestSha) {
+				console.warn(`[github] retrying ${filePath} with latest sha after HTTP ${response.status}`);
+				const retry = await this.put(filePath, content, message, latestSha);
 				if (retry.ok) {
 					const result = await retry.json() as { content?: { sha?: string } };
 					return result.content?.sha;
 				}
 				const detail = await retry.text();
-				throw new Error(`GitHub write failed: HTTP ${retry.status} ${detail.slice(0, 300)}`);
+				throw new Error(`GitHub write failed: HTTP ${retry.status} ${detail.slice(0, 1000)}`);
 			}
 		}
 		if (!response.ok) {
 			const detail = await response.text();
-			throw new Error(`GitHub write failed: HTTP ${response.status} ${detail.slice(0, 300)}`);
+			throw new Error(`GitHub write failed: HTTP ${response.status} ${detail.slice(0, 1000)}`);
 		}
 		const result = await response.json() as { content?: { sha?: string } };
 		return result.content?.sha;
