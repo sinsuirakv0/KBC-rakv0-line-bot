@@ -637,6 +637,9 @@ async function backfillSquareHistory(
 	let errors = 0;
 	let lastError: string | undefined;
 	let consecutiveSkippedPages = 0;
+	const localFlushPages = Math.max(1, appConfig.messageLogBackfillLocalFlushPages);
+	const remoteFlushPages = Math.max(localFlushPages, appConfig.messageLogBackfillRemoteFlushPages);
+	let resumeRemoteFlush = messageLogStore.suspendRemoteFlush();
 	const applyStats = (stats: { read: number; added: number; oldestAt?: number }) => {
 		totalRead += stats.read;
 		totalAdded += stats.added;
@@ -663,15 +666,19 @@ async function backfillSquareHistory(
 		}
 		return undefined;
 	};
-	const flushCheckpoint = async (label: string) => {
+	const flushCheckpoint = async (label: string, remote: boolean) => {
 		try {
-			await messageLogStore.flush();
-			await memberNameHistoryStore.flush();
+			await messageLogStore.checkpointLocal();
+			if (remote) {
+				await messageLogStore.flush();
+				await memberNameHistoryStore.flush();
+			}
 		} catch (error) {
 			noteError(label, error);
 		}
 	};
 
+	try {
 	for (let page = 0; page < 10; page++) {
 		const response = await fetchWithRetry(`prime page ${page + 1}`, {
 			squareChatMid: destination.chatMid,
@@ -685,6 +692,9 @@ async function backfillSquareHistory(
 		const events = response.events as SquareHistoryEvent[];
 		recordEventNames(destination, events);
 		applyStats(recordMessageLogsFromEvents(destination, events));
+		if ((page + 1) % localFlushPages === 0) {
+			await flushCheckpoint(`local prime checkpoint page ${page + 1}`, false);
+		}
 		if (response.events.length === 0) break;
 		await sleep(appConfig.messageLogBackfillDelayMs);
 	}
@@ -715,8 +725,13 @@ async function backfillSquareHistory(
 		const events = response.events as SquareHistoryEvent[];
 		recordEventNames(destination, events);
 		applyStats(recordMessageLogsFromEvents(destination, events));
-		if (page % 10 === 9) {
-			await flushCheckpoint(`checkpoint page ${page + 1}`);
+		if ((page + 1) % localFlushPages === 0) {
+			await flushCheckpoint(`local checkpoint page ${page + 1}`, false);
+		}
+		if ((page + 1) % remoteFlushPages === 0) {
+			resumeRemoteFlush();
+			await flushCheckpoint(`remote checkpoint page ${page + 1}`, true);
+			resumeRemoteFlush = messageLogStore.suspendRemoteFlush();
 			await onProgress?.(totalRead, totalAdded);
 		}
 		if (!continuationToken) break;
@@ -724,7 +739,11 @@ async function backfillSquareHistory(
 	}
 
 	messageLogStore.markBackfillComplete(destination, oldestAt);
-	await flushCheckpoint("final checkpoint");
+	await flushCheckpoint("final local checkpoint", false);
+	} finally {
+		resumeRemoteFlush();
+	}
+	await flushCheckpoint("final checkpoint", true);
 	return { read: totalRead, added: totalAdded, oldestAt, errors, lastError };
 }
 

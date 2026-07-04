@@ -21,7 +21,10 @@ export class GithubContentsClient {
 	async read(filePath: string): Promise<GithubTextFile | null> {
 		const url = new URL(this.url(filePath));
 		url.searchParams.set("ref", appConfig.pushSubscriptionsGithubBranch);
-		const response = await fetch(url, { headers: this.headers() });
+		const response = await fetch(url, {
+			headers: this.headers(),
+			signal: AbortSignal.timeout(appConfig.githubContentsTimeoutMs),
+		});
 		if (response.status === 404) return null;
 		if (!response.ok) throw new Error(`GitHub read failed: HTTP ${response.status}`);
 		const file = await response.json() as GithubFileResponse;
@@ -71,6 +74,7 @@ export class GithubContentsClient {
 		return await fetch(this.url(filePath), {
 			method: "PUT",
 			headers: { ...this.headers(), "Content-Type": "application/json" },
+			signal: AbortSignal.timeout(appConfig.githubContentsTimeoutMs),
 			body: JSON.stringify({
 				message,
 				content: Buffer.from(content, "utf8").toString("base64"),
@@ -84,6 +88,7 @@ export class GithubContentsClient {
 		const response = await fetch(this.url(filePath), {
 			method: "DELETE",
 			headers: { ...this.headers(), "Content-Type": "application/json" },
+			signal: AbortSignal.timeout(appConfig.githubContentsTimeoutMs),
 			body: JSON.stringify({
 				message,
 				sha,
