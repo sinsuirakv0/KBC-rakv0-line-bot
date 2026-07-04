@@ -998,7 +998,7 @@ export const logCommand: LineCommand = {
 			}
 		}
 
-		const rows = messageLogStore.search(message.destination, query, target?.mid, MAX_LOG_ROWS);
+		const rows = await messageLogStore.search(message.destination, query, target?.mid, MAX_LOG_ROWS);
 		if (rows.length === 0) {
 			await message.send(target
 				? `${target.name} の「${query}」を含む発言は保存済みログに見つかりませんでした。`

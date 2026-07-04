@@ -122,11 +122,28 @@ interface MessageLogMembersFile {
 	members: StoredMemberProfile[];
 }
 
-const EMPTY_LEGACY_LOG: LegacyMessageLogFile = { version: 1, chats: [] };
 const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+function emptyManifest(): MessageLogManifest {
+	return {
+		version: 2,
+		format: "kbc-line-message-log",
+		generatedAt: new Date().toISOString(),
+		chats: [],
+	};
+}
 
 function chatKey(value: Pick<StoredChat, "kind" | "chatMid">): string {
 	return `${value.kind}:${value.chatMid}`;
+}
+
+function bucketKey(value: Pick<StoredChat, "kind" | "chatMid">, date: string): string {
+	return `${chatKey(value)}|${date}`;
+}
+
+function splitBucketKey(value: string): { key: string; date: string } {
+	const index = value.lastIndexOf("|");
+	return { key: value.slice(0, index), date: value.slice(index + 1) };
 }
 
 function normalizeText(value: string): string {
@@ -192,6 +209,34 @@ function remotePathFor(relativePath: string): string {
 	return `${remoteRoot()}/${relativePath}`;
 }
 
+function encodeWrappedJson(value: unknown): string {
+	return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function decodeWrappedJson(content: string): unknown {
+	const parsed = JSON.parse(content) as unknown;
+	if (parsed && typeof parsed === "object") {
+		const raw = parsed as { encoding?: unknown; data?: unknown };
+		if (raw.encoding === "gzip+base64") {
+			if (typeof raw.data !== "string") throw new Error("Compressed message log has no data");
+			return JSON.parse(gunzipSync(Buffer.from(raw.data, "base64")).toString("utf8")) as unknown;
+		}
+	}
+	return parsed;
+}
+
+function bytesOfJson(value: unknown): number {
+	return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function sortMessages(messages: StoredMessageLog[]): StoredMessageLog[] {
+	return [...messages].sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+}
+
+function sortMessagesDesc(messages: StoredMessageLog[]): StoredMessageLog[] {
+	return [...messages].sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id));
+}
+
 function parseMembers(value: unknown): StoredMemberProfile[] {
 	const members = Array.isArray(value) ? value : [];
 	return members.flatMap((member) => {
@@ -246,7 +291,7 @@ function parseMessage(message: unknown, chat: Pick<StoredChat, "kind" | "chatMid
 }
 
 function parseLegacyLog(value: unknown): LegacyMessageLogFile {
-	if (!value || typeof value !== "object") return structuredClone(EMPTY_LEGACY_LOG);
+	if (!value || typeof value !== "object") return { version: 1, chats: [] };
 	const raw = value as Partial<LegacyMessageLogFile>;
 	const chats = Array.isArray(raw.chats) ? raw.chats : [];
 	return {
@@ -273,38 +318,6 @@ function parseLegacyLog(value: unknown): LegacyMessageLogFile {
 			}];
 		}),
 	};
-}
-
-function decodeWrappedJson(content: string): unknown {
-	const parsed = JSON.parse(content) as unknown;
-	if (parsed && typeof parsed === "object") {
-		const raw = parsed as { encoding?: unknown; data?: unknown };
-		if (raw.encoding === "gzip+base64") {
-			if (typeof raw.data !== "string") throw new Error("Compressed message log has no data");
-			return JSON.parse(gunzipSync(Buffer.from(raw.data, "base64")).toString("utf8")) as unknown;
-		}
-	}
-	return parsed;
-}
-
-function encodeWrappedJson(value: unknown): string {
-	return `${JSON.stringify(value, null, 2)}\n`;
-}
-
-function bytesOfJson(value: unknown): number {
-	return Buffer.byteLength(JSON.stringify(value), "utf8");
-}
-
-function sortMessages(messages: StoredMessageLog[]): StoredMessageLog[] {
-	return [...messages].sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
-}
-
-function dedupeMessages(messages: StoredMessageLog[]): StoredMessageLog[] {
-	const map = new Map<string, StoredMessageLog>();
-	for (const message of sortMessages(messages)) {
-		map.set(message.id, message);
-	}
-	return [...map.values()];
 }
 
 function partFile(
@@ -337,68 +350,52 @@ function membersFile(chat: Pick<StoredChat, "kind" | "chatMid" | "scopeMid" | "c
 }
 
 class MessageLogStore {
-	private data: LegacyMessageLogFile = structuredClone(EMPTY_LEGACY_LOG);
+	private manifest: MessageLogManifest = emptyManifest();
 	private chatsByKey = new Map<string, StoredChat>();
+	private manifestChatsByKey = new Map<string, MessageLogManifestChat>();
 	private messagesByChat = new Map<string, Map<string, StoredMessageLog>>();
+	private membersLoaded = new Set<string>();
 	private fileShas = new Map<string, string | undefined>();
+	private pendingRemotePaths = new Set<string>();
+	private dirtyMessages = new Map<string, Map<string, StoredMessageLog>>();
+	private dirtyMembers = new Set<string>();
 	private saveTimer: NodeJS.Timeout | undefined;
 	private saveQueue: Promise<void> = Promise.resolve();
 	private dirty = false;
 	private remoteFlushSuspendCount = 0;
 	private autoFlushSuspendCount = 0;
-	private dirtyDates = new Set<string>();
-	private dirtyMembers = new Set<string>();
 	private importedLegacy = false;
 
 	async initialize(): Promise<void> {
 		await fs.mkdir(localRoot(), { recursive: true });
 		if (githubContentsClient.enabled) {
 			try {
-				if (await this.restoreSplitFromGitHub()) {
-					this.rebuildIndexes();
-					console.log(`[message-log] loaded ${this.countMessages()} message(s) from split GitHub storage`);
+				if (await this.restoreManifestFromGitHub()) {
+					console.log(`[message-log] loaded manifest from GitHub (${this.manifest.chats.length} chat(s)); message parts are lazy-loaded`);
+					this.warmLowPriorityLocalCache();
 					return;
 				}
 			} catch (error) {
-				console.warn("[message-log] split GitHub restore failed", error);
-			}
-			try {
-				const legacy = await githubContentsClient.read(appConfig.messageLogGithubPath);
-				if (legacy) {
-					this.data = parseLegacyLog(decodeWrappedJson(legacy.content));
-					this.importedLegacy = true;
-					this.markAllDirty();
-					await this.writeSplitLocal();
-					this.rebuildIndexes();
-					console.log(`[message-log] imported ${this.countMessages()} legacy message(s) from GitHub`);
-					return;
-				}
-			} catch (error) {
-				console.warn("[message-log] legacy GitHub restore failed", error);
+				console.warn("[message-log] GitHub manifest restore failed", error);
 			}
 		}
 		try {
-			if (await this.restoreSplitFromLocal()) {
-				this.rebuildIndexes();
-				console.log(`[message-log] loaded ${this.countMessages()} message(s) from split local storage`);
+			if (await this.restoreManifestFromLocal()) {
+				console.log(`[message-log] loaded local manifest (${this.manifest.chats.length} chat(s)); message parts are lazy-loaded`);
 				return;
 			}
 		} catch (error) {
-			if (!this.isNotFoundError(error)) {
-				console.warn("[message-log] split local restore failed", error);
-			}
+			if (!this.isNotFoundError(error)) console.warn("[message-log] local manifest restore failed", error);
 		}
 		try {
-			this.data = parseLegacyLog(JSON.parse(await fs.readFile(appConfig.messageLogFile, "utf8")) as unknown);
-			this.importedLegacy = true;
-			this.markAllDirty();
-			await this.writeSplitLocal();
-			this.rebuildIndexes();
+			const legacy = parseLegacyLog(JSON.parse(await fs.readFile(appConfig.messageLogFile, "utf8")) as unknown);
+			await this.importLegacy(legacy);
+			console.log(`[message-log] imported ${legacy.chats.reduce((sum, chat) => sum + chat.messages.length, 0)} legacy message(s)`);
+			return;
 		} catch {
-			await this.writeManifestLocal(this.buildPersistence().manifest);
-			this.rebuildIndexes();
+			await this.writeManifestLocal();
 		}
-		console.log(`[message-log] loaded ${this.countMessages()} message(s)`);
+		console.log("[message-log] initialized empty lazy storage");
 	}
 
 	record(message: StoredMessageLog): boolean {
@@ -424,6 +421,7 @@ class MessageLogStore {
 			}
 			return false;
 		}
+
 		this.recordMember({
 			kind: message.kind,
 			chatMid: message.chatMid,
@@ -437,11 +435,13 @@ class MessageLogStore {
 			messageCountDelta: 1,
 			source: "message",
 		}, false);
+
 		const stored = { ...message };
 		chat.messages.push(stored);
 		messagesById.set(stored.id, stored);
-		if (!chat.oldestMessageAt || message.createdAt < chat.oldestMessageAt) {
-			chat.oldestMessageAt = message.createdAt;
+		if (!chat.oldestMessageAt || stored.createdAt < chat.oldestMessageAt) {
+			chat.oldestMessageAt = stored.createdAt;
+			this.getOrCreateManifestChat(chat).oldestMessageAt = stored.createdAt;
 		}
 		this.markMessageDirty(stored);
 		this.scheduleSave();
@@ -504,29 +504,55 @@ class MessageLogStore {
 		return added;
 	}
 
-	search(
+	async search(
 		destination: Pick<LineDestination, "kind" | "chatMid">,
 		query: string,
 		senderMid?: string,
 		limit = 1000,
-	): StoredMessageLog[] {
+	): Promise<StoredMessageLog[]> {
 		const chat = this.chatsByKey.get(chatKey(destination));
-		if (!chat) return [];
+		const manifestChat = this.manifestChatsByKey.get(chatKey(destination));
+		if (!chat && !manifestChat) return [];
 		const normalizedQuery = normalizeText(query);
-		return chat.messages
-			.filter((message) => !senderMid || message.senderMid === senderMid)
-			.filter((message) => normalizeText(message.content).includes(normalizedQuery))
-			.sort((left, right) => right.createdAt - left.createdAt)
-			.slice(0, limit)
-			.map((message) => ({ ...message }));
+		const rows: StoredMessageLog[] = [];
+		const seen = new Set<string>();
+		const consider = (message: StoredMessageLog) => {
+			if (seen.has(message.id)) return;
+			seen.add(message.id);
+			if (senderMid && message.senderMid !== senderMid) return;
+			if (!normalizeText(message.content).includes(normalizedQuery)) return;
+			rows.push({ ...message });
+		};
+
+		for (const message of sortMessagesDesc(chat?.messages ?? [])) {
+			consider(message);
+			if (rows.length >= limit) return rows;
+		}
+
+		const parts = [...(manifestChat?.parts ?? [])]
+			.sort((left, right) => (right.lastCreatedAt ?? 0) - (left.lastCreatedAt ?? 0));
+		for (const part of parts) {
+			const file = await this.readPartFile(part.path, manifestChat);
+			if (!file) continue;
+			for (const message of sortMessagesDesc(file.messages)) {
+				consider(message);
+				if (rows.length >= limit) return rows;
+			}
+		}
+		return rows;
 	}
 
 	markBackfillComplete(destination: Pick<LineDestination, "kind" | "chatMid">, oldestMessageAt?: number): void {
 		const chat = this.chatsByKey.get(chatKey(destination));
 		if (!chat) return;
-		chat.backfillCompletedAt = new Date().toISOString();
+		const now = new Date().toISOString();
+		chat.backfillCompletedAt = now;
 		if (oldestMessageAt) chat.oldestMessageAt = oldestMessageAt;
+		const manifestChat = this.getOrCreateManifestChat(chat);
+		manifestChat.backfillCompletedAt = now;
+		if (oldestMessageAt) manifestChat.oldestMessageAt = oldestMessageAt;
 		this.dirtyMembers.add(chatKey(chat));
+		this.dirty = true;
 		this.scheduleSave();
 	}
 
@@ -535,40 +561,14 @@ class MessageLogStore {
 			clearTimeout(this.saveTimer);
 			this.saveTimer = undefined;
 		}
-		if (!this.dirty) {
-			await this.saveQueue;
-			return {
-				localFiles: 0,
-				remoteFiles: 0,
-				remoteEnabled: githubContentsClient.enabled,
-				remoteSkipped: false,
-			};
-		}
-		this.dirty = false;
-		const dirtyDates = new Set(this.dirtyDates);
-		const dirtyMembers = new Set(this.dirtyMembers);
-		this.dirtyDates.clear();
-		this.dirtyMembers.clear();
-		if (this.importedLegacy || dirtyDates.size === 0 && dirtyMembers.size === 0) {
-			this.markAllDirty();
-			for (const item of this.dirtyDates) dirtyDates.add(item);
-			for (const item of this.dirtyMembers) dirtyMembers.add(item);
-			this.dirtyDates.clear();
-			this.dirtyMembers.clear();
-			this.importedLegacy = false;
-		}
-		const persistence = this.buildPersistence();
 		const operation = this.saveQueue.then(async (): Promise<MessageLogFlushResult> => {
-			const localFiles = await this.writeSplitLocal(persistence, dirtyDates, dirtyMembers);
+			const localFiles = await this.persistLocalDirty();
 			let remoteFiles = 0;
 			let remoteSkipped = false;
 			if (githubContentsClient.enabled && this.remoteFlushSuspendCount === 0) {
-				remoteFiles = await this.writeSplitRemote(persistence, dirtyDates, dirtyMembers);
-			} else if (githubContentsClient.enabled) {
+				remoteFiles = await this.flushPendingRemote();
+			} else if (githubContentsClient.enabled && this.pendingRemotePaths.size > 0) {
 				remoteSkipped = true;
-				this.dirty = true;
-				for (const item of dirtyDates) this.dirtyDates.add(item);
-				for (const item of dirtyMembers) this.dirtyMembers.add(item);
 			}
 			return {
 				localFiles,
@@ -580,18 +580,13 @@ class MessageLogStore {
 		this.saveQueue = operation.then(() => undefined).catch((error) => {
 			console.error("[message-log] save failed", error);
 			this.dirty = true;
-			for (const item of dirtyDates) this.dirtyDates.add(item);
-			for (const item of dirtyMembers) this.dirtyMembers.add(item);
 			this.scheduleSave();
 		});
 		return await operation;
 	}
 
 	async checkpointLocal(): Promise<void> {
-		const dirtyDates = new Set(this.dirtyDates);
-		const dirtyMembers = new Set(this.dirtyMembers);
-		if (dirtyDates.size === 0 && dirtyMembers.size === 0) return;
-		await this.writeSplitLocal(this.buildPersistence(), dirtyDates, dirtyMembers);
+		await this.persistLocalDirty();
 	}
 
 	async flushLocalOnly(): Promise<number> {
@@ -599,21 +594,7 @@ class MessageLogStore {
 			clearTimeout(this.saveTimer);
 			this.saveTimer = undefined;
 		}
-		if (!this.dirty) return 0;
-		this.dirty = false;
-		const dirtyDates = new Set(this.dirtyDates);
-		const dirtyMembers = new Set(this.dirtyMembers);
-		this.dirtyDates.clear();
-		this.dirtyMembers.clear();
-		if (this.importedLegacy || dirtyDates.size === 0 && dirtyMembers.size === 0) {
-			this.markAllDirty();
-			for (const item of this.dirtyDates) dirtyDates.add(item);
-			for (const item of this.dirtyMembers) dirtyMembers.add(item);
-			this.dirtyDates.clear();
-			this.dirtyMembers.clear();
-			this.importedLegacy = false;
-		}
-		return await this.writeSplitLocal(this.buildPersistence(), dirtyDates, dirtyMembers);
+		return await this.persistLocalDirty();
 	}
 
 	suspendRemoteFlush(): () => void {
@@ -640,34 +621,44 @@ class MessageLogStore {
 		};
 	}
 
-	private async restoreSplitFromGitHub(): Promise<boolean> {
+	private async restoreManifestFromGitHub(): Promise<boolean> {
 		const manifestPath = remotePathFor("manifest.json");
 		const remote = await githubContentsClient.read(manifestPath);
 		if (!remote) return false;
 		this.fileShas.set(manifestPath, remote.sha);
-		const manifest = this.parseManifest(decodeWrappedJson(remote.content));
-		this.data = await this.loadManifest(manifest, async (relativePath) => {
-			const filePath = remotePathFor(relativePath);
-			const file = await githubContentsClient.read(filePath);
-			if (!file) throw new Error(`Missing remote message log file: ${filePath}`);
-			this.fileShas.set(filePath, file.sha);
-			return decodeWrappedJson(file.content);
-		});
-		await this.writeSplitLocal(this.buildPersistence());
+		this.setManifest(this.parseManifest(decodeWrappedJson(remote.content)));
+		await this.writeManifestLocal();
 		return true;
 	}
 
-	private async restoreSplitFromLocal(): Promise<boolean> {
-		const manifestFile = localPathFor("manifest.json");
-		const manifest = this.parseManifest(JSON.parse(await fs.readFile(manifestFile, "utf8")) as unknown);
-		this.data = await this.loadManifest(manifest, async (relativePath) => {
-			return JSON.parse(await fs.readFile(localPathFor(relativePath), "utf8")) as unknown;
-		});
+	private async restoreManifestFromLocal(): Promise<boolean> {
+		const manifest = this.parseManifest(JSON.parse(await fs.readFile(localPathFor("manifest.json"), "utf8")) as unknown);
+		this.setManifest(manifest);
 		return true;
 	}
 
-	private isNotFoundError(error: unknown): boolean {
-		return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT");
+	private setManifest(manifest: MessageLogManifest): void {
+		this.manifest = manifest;
+		this.chatsByKey.clear();
+		this.manifestChatsByKey.clear();
+		this.messagesByChat.clear();
+		this.membersLoaded.clear();
+		for (const manifestChat of manifest.chats) {
+			const chat: StoredChat = {
+				kind: manifestChat.kind,
+				chatMid: manifestChat.chatMid,
+				scopeMid: manifestChat.scopeMid,
+				chatType: manifestChat.chatType,
+				backfillCompletedAt: manifestChat.backfillCompletedAt,
+				oldestMessageAt: manifestChat.oldestMessageAt,
+				messages: [],
+				members: [],
+			};
+			const key = chatKey(chat);
+			this.chatsByKey.set(key, chat);
+			this.manifestChatsByKey.set(key, manifestChat);
+			this.messagesByChat.set(key, new Map());
+		}
 	}
 
 	private parseManifest(value: unknown): MessageLogManifest {
@@ -709,187 +700,190 @@ class MessageLogStore {
 		};
 	}
 
-	private async loadManifest(
-		manifest: MessageLogManifest,
-		readJson: (relativePath: string) => Promise<unknown>,
-	): Promise<LegacyMessageLogFile> {
-		const chats: StoredChat[] = [];
-		for (const manifestChat of manifest.chats) {
-			const membersRaw = await readJson(manifestChat.membersPath).catch(() => undefined);
-			const membersFileRaw = membersRaw as Partial<MessageLogMembersFile> | undefined;
-			const members = parseMembers(membersFileRaw?.members);
-			const messages: StoredMessageLog[] = [];
-			for (const part of manifestChat.parts) {
-				const raw = await readJson(part.path);
-				const file = raw as Partial<MessageLogPartFile>;
-				const base = {
-					kind: manifestChat.kind,
-					chatMid: manifestChat.chatMid,
-					scopeMid: manifestChat.scopeMid,
-					chatType: manifestChat.chatType,
-				};
-				for (const message of Array.isArray(file.messages) ? file.messages : []) {
-					const parsed = parseMessage(message, base);
-					if (parsed) messages.push(parsed);
-				}
-			}
-			chats.push({
-				kind: manifestChat.kind,
-				chatMid: manifestChat.chatMid,
-				scopeMid: manifestChat.scopeMid,
-				chatType: manifestChat.chatType,
-				backfillCompletedAt: manifestChat.backfillCompletedAt,
-				oldestMessageAt: manifestChat.oldestMessageAt,
-				messages: dedupeMessages(messages),
-				members,
-			});
-		}
-		return { version: 1, chats };
-	}
-
-	private buildPersistence(): {
-		manifest: MessageLogManifest;
-		parts: Map<string, MessageLogPartFile>;
-		members: Map<string, MessageLogMembersFile>;
-		partDates: Map<string, string>;
-		memberChats: Map<string, string>;
-	} {
-		const parts = new Map<string, MessageLogPartFile>();
-		const members = new Map<string, MessageLogMembersFile>();
-		const partDates = new Map<string, string>();
-		const memberChats = new Map<string, string>();
-		const manifest: MessageLogManifest = {
-			version: 2,
-			format: "kbc-line-message-log",
-			generatedAt: new Date().toISOString(),
-			chats: [],
-		};
-
-		for (const chat of this.data.chats) {
-			const chatParts: MessageLogPartMeta[] = [];
-			const byDate = new Map<string, StoredMessageLog[]>();
-			for (const message of dedupeMessages(chat.messages)) {
-				const date = jstDateKey(message.createdAt);
-				const bucket = byDate.get(date) ?? [];
-				bucket.push(message);
-				byDate.set(date, bucket);
-			}
-			for (const [date, dateMessages] of [...byDate.entries()].sort(([left], [right]) => left.localeCompare(right))) {
-				let part = 1;
-				let current: StoredMessageLog[] = [];
-				const flushPart = () => {
-					if (current.length === 0) return;
-					const relativePath = relativePartPath(chat, date, part);
-					const file = partFile(chat, date, part, current);
-					const bytes = bytesOfJson(file);
-					parts.set(relativePath, file);
-					partDates.set(relativePath, `${chatKey(chat)}|${date}`);
-					chatParts.push({
-						path: relativePath,
-						date,
-						part,
-						count: current.length,
-						firstCreatedAt: current.at(0)?.createdAt,
-						lastCreatedAt: current.at(-1)?.createdAt,
-						bytes,
-					});
-					part += 1;
-					current = [];
-				};
-				for (const message of sortMessages(dateMessages)) {
-					const candidate = [...current, message];
-					if (current.length > 0 && bytesOfJson(partFile(chat, date, part, candidate)) > appConfig.messageLogPartMaxBytes) {
-						flushPart();
-					}
-					current.push(message);
-				}
-				flushPart();
-			}
-			const membersPath = relativeMembersPath(chat);
-			members.set(membersPath, membersFile(chat));
-			memberChats.set(membersPath, chatKey(chat));
-			manifest.chats.push({
+	private async importLegacy(legacy: LegacyMessageLogFile): Promise<void> {
+		this.manifest = emptyManifest();
+		this.chatsByKey.clear();
+		this.manifestChatsByKey.clear();
+		this.messagesByChat.clear();
+		this.membersLoaded.clear();
+		for (const chat of legacy.chats) {
+			const stored = this.getOrCreateChat({
+				id: "",
 				kind: chat.kind,
 				chatMid: chat.chatMid,
 				scopeMid: chat.scopeMid,
 				chatType: chat.chatType,
-				backfillCompletedAt: chat.backfillCompletedAt,
-				oldestMessageAt: chat.oldestMessageAt,
-				membersPath,
-				parts: chatParts,
+				senderMid: "",
+				createdAt: Date.now(),
+				content: "(chat)",
 			});
+			stored.backfillCompletedAt = chat.backfillCompletedAt;
+			stored.oldestMessageAt = chat.oldestMessageAt;
+			stored.members = chat.members;
+			this.membersLoaded.add(chatKey(stored));
+			for (const message of chat.messages) this.record(message);
+			this.dirtyMembers.add(chatKey(stored));
 		}
-		return { manifest, parts, members, partDates, memberChats };
+		this.importedLegacy = true;
+		await this.persistLocalDirty();
 	}
 
-	private async writeSplitLocal(
-		persistence = this.buildPersistence(),
-		dirtyDates?: Set<string>,
-		dirtyMembers?: Set<string>,
-	): Promise<number> {
+	private async persistLocalDirty(): Promise<number> {
+		if (!this.dirty && this.dirtyMessages.size === 0 && this.dirtyMembers.size === 0 && !this.importedLegacy) {
+			return 0;
+		}
 		let written = 0;
-		await this.writeManifestLocal(persistence.manifest);
-		written += 1;
-		for (const [relativePath, file] of persistence.parts) {
-			const dirtyKey = persistence.partDates.get(relativePath);
-			if (dirtyDates && dirtyKey && !dirtyDates.has(dirtyKey)) continue;
-			await this.writeLocalJson(relativePath, file);
+		const dirtyMessages = new Map(this.dirtyMessages);
+		const dirtyMembers = new Set(this.dirtyMembers);
+		this.dirtyMessages.clear();
+		this.dirtyMembers.clear();
+		this.dirty = false;
+		this.importedLegacy = false;
+
+		for (const [rawBucketKey, messagesById] of dirtyMessages) {
+			const { key, date } = splitBucketKey(rawBucketKey);
+			const chat = this.chatsByKey.get(key);
+			if (!chat || messagesById.size === 0) continue;
+			const manifestChat = this.getOrCreateManifestChat(chat);
+			let part = Math.max(0, ...manifestChat.parts.filter((item) => item.date === date).map((item) => item.part)) + 1;
+			let current: StoredMessageLog[] = [];
+			const flushPart = async () => {
+				if (current.length === 0) return;
+				const relativePath = relativePartPath(chat, date, part);
+				const file = partFile(chat, date, part, sortMessages(current));
+				await this.writeLocalJson(relativePath, file);
+				const meta: MessageLogPartMeta = {
+					path: relativePath,
+					date,
+					part,
+					count: file.messages.length,
+					firstCreatedAt: file.messages.at(0)?.createdAt,
+					lastCreatedAt: file.messages.at(-1)?.createdAt,
+					bytes: bytesOfJson(file),
+				};
+				manifestChat.parts.push(meta);
+				this.pendingRemotePaths.add(relativePath);
+				written += 1;
+				part += 1;
+				current = [];
+			};
+			for (const message of sortMessages([...messagesById.values()])) {
+				const candidate = [...current, message];
+				if (current.length > 0 && bytesOfJson(partFile(chat, date, part, candidate)) > appConfig.messageLogPartMaxBytes) {
+					await flushPart();
+				}
+				current.push(message);
+			}
+			await flushPart();
+			const flushedIds = new Set(messagesById.keys());
+			chat.messages = chat.messages.filter((message) => !flushedIds.has(message.id));
+			const indexedMessages = this.messagesByChat.get(key);
+			for (const id of flushedIds) indexedMessages?.delete(id);
+		}
+
+		for (const key of dirtyMembers) {
+			const chat = this.chatsByKey.get(key);
+			if (!chat) continue;
+			await this.ensureMembersLoaded(chat);
+			const relativePath = relativeMembersPath(chat);
+			await this.writeLocalJson(relativePath, membersFile(chat));
+			this.pendingRemotePaths.add(relativePath);
 			written += 1;
 		}
-		for (const [relativePath, file] of persistence.members) {
-			const dirtyKey = persistence.memberChats.get(relativePath);
-			if (dirtyMembers && dirtyKey && !dirtyMembers.has(dirtyKey)) continue;
-			await this.writeLocalJson(relativePath, file);
+
+		if (written > 0 || dirtyMembers.size > 0 || dirtyMessages.size > 0) {
+			await this.writeManifestLocal();
+			this.pendingRemotePaths.add("manifest.json");
 			written += 1;
 		}
 		return written;
 	}
 
-	private async writeSplitRemote(
-		persistence: ReturnType<MessageLogStore["buildPersistence"]>,
-		dirtyDates: Set<string>,
-		dirtyMembers: Set<string>,
-	): Promise<number> {
+	private async flushPendingRemote(): Promise<number> {
+		if (this.pendingRemotePaths.size === 0) return 0;
 		let written = 0;
-		for (const [relativePath, file] of persistence.parts) {
-			const dirtyKey = persistence.partDates.get(relativePath);
-			if (dirtyKey && !dirtyDates.has(dirtyKey)) continue;
-			await this.writeRemoteJson(relativePath, file);
+		const paths = [...this.pendingRemotePaths].sort((left, right) => {
+			if (left === "manifest.json") return 1;
+			if (right === "manifest.json") return -1;
+			return left.localeCompare(right);
+		});
+		for (const relativePath of paths) {
+			const content = await fs.readFile(localPathFor(relativePath), "utf8");
+			const filePath = remotePathFor(relativePath);
+			const nextSha = await githubContentsClient.write(
+				filePath,
+				content,
+				"Update LINE message log",
+				this.fileShas.get(filePath),
+			);
+			this.fileShas.set(filePath, nextSha);
+			this.pendingRemotePaths.delete(relativePath);
 			written += 1;
 		}
-		for (const [relativePath, file] of persistence.members) {
-			const dirtyKey = persistence.memberChats.get(relativePath);
-			if (dirtyKey && !dirtyMembers.has(dirtyKey)) continue;
-			await this.writeRemoteJson(relativePath, file);
-			written += 1;
-		}
-		await this.writeRemoteJson("manifest.json", persistence.manifest);
-		written += 1;
 		return written;
 	}
 
-	private async writeManifestLocal(manifest: MessageLogManifest): Promise<void> {
-		await this.writeLocalJson("manifest.json", manifest);
+	private async readPartFile(relativePath: string, manifestChat?: MessageLogManifestChat): Promise<MessageLogPartFile | undefined> {
+		const raw = await this.readJson(relativePath);
+		if (!raw) return undefined;
+		const base = manifestChat ?? this.manifest.chats.find((chat) => chat.parts.some((part) => part.path === relativePath));
+		if (!base) return undefined;
+		const file = raw as Partial<MessageLogPartFile>;
+		return {
+			version: 2,
+			kind: base.kind,
+			chatMid: base.chatMid,
+			scopeMid: base.scopeMid,
+			chatType: base.chatType,
+			date: typeof file.date === "string" ? file.date : "",
+			part: Number(file.part) || 1,
+			messages: (Array.isArray(file.messages) ? file.messages : []).flatMap((message) => {
+				const parsed = parseMessage(message, base);
+				return parsed ? [parsed] : [];
+			}),
+		};
 	}
 
-	private async writeLocalJson(relativePath: string, value: unknown): Promise<void> {
-		const filePath = localPathFor(relativePath);
-		await fs.mkdir(path.dirname(filePath), { recursive: true });
-		const temporary = `${filePath}.tmp`;
-		await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-		await fs.rename(temporary, filePath);
+	private async ensureMembersLoaded(chat: StoredChat): Promise<void> {
+		const key = chatKey(chat);
+		if (this.membersLoaded.has(key)) return;
+		const raw = await this.readJson(relativeMembersPath(chat));
+		const existingMembers = parseMembers((raw as Partial<MessageLogMembersFile> | undefined)?.members);
+		const merged = new Map<string, StoredMemberProfile>();
+		for (const member of existingMembers) merged.set(member.mid, member);
+		for (const member of chat.members) merged.set(member.mid, this.mergeMember(merged.get(member.mid), member));
+		chat.members = [...merged.values()];
+		this.membersLoaded.add(key);
 	}
 
-	private async writeRemoteJson(relativePath: string, value: unknown): Promise<void> {
-		const filePath = remotePathFor(relativePath);
-		const sha = this.fileShas.get(filePath);
-		const nextSha = await githubContentsClient.write(
-			filePath,
-			encodeWrappedJson(value),
-			"Update LINE message log",
-			sha,
-		);
-		this.fileShas.set(filePath, nextSha);
+	private mergeMember(existing: StoredMemberProfile | undefined, next: StoredMemberProfile): StoredMemberProfile {
+		if (!existing) return next;
+		return {
+			...existing,
+			...next,
+			names: [...new Set([...existing.names, ...next.names])],
+			messageCount: Math.max(existing.messageCount, next.messageCount),
+			sources: [...new Set([...existing.sources, ...next.sources])],
+			firstSeenAt: existing.firstSeenAt < next.firstSeenAt ? existing.firstSeenAt : next.firstSeenAt,
+			lastSeenAt: existing.lastSeenAt > next.lastSeenAt ? existing.lastSeenAt : next.lastSeenAt,
+			lastMessageAt: Math.max(existing.lastMessageAt ?? 0, next.lastMessageAt ?? 0) || undefined,
+			extra: { ...(existing.extra ?? {}), ...(next.extra ?? {}) },
+		};
+	}
+
+	private async readJson(relativePath: string): Promise<unknown | undefined> {
+		try {
+			return JSON.parse(await fs.readFile(localPathFor(relativePath), "utf8")) as unknown;
+		} catch (error) {
+			if (!this.isNotFoundError(error)) throw error;
+		}
+		if (!githubContentsClient.enabled) return undefined;
+		const remote = await githubContentsClient.read(remotePathFor(relativePath));
+		if (!remote) return undefined;
+		this.fileShas.set(remotePathFor(relativePath), remote.sha);
+		const parsed = decodeWrappedJson(remote.content);
+		await this.writeLocalJson(relativePath, parsed);
+		return parsed;
 	}
 
 	private getOrCreateChat(message: StoredMessageLog): StoredChat {
@@ -904,39 +898,64 @@ class MessageLogStore {
 			messages: [],
 			members: [],
 		};
-		this.data.chats.push(chat);
 		this.chatsByKey.set(key, chat);
 		this.messagesByChat.set(key, new Map());
-		this.dirtyMembers.add(chatKey(chat));
+		this.getOrCreateManifestChat(chat);
+		this.dirtyMembers.add(key);
 		return chat;
 	}
 
-	private rebuildIndexes(): void {
-		this.chatsByKey.clear();
-		this.messagesByChat.clear();
-		for (const chat of this.data.chats) {
-			const key = chatKey(chat);
-			this.chatsByKey.set(key, chat);
-			this.messagesByChat.set(key, new Map(chat.messages.map((message) => [message.id, message])));
-		}
+	private getOrCreateManifestChat(chat: Pick<StoredChat, "kind" | "chatMid" | "scopeMid" | "chatType" | "backfillCompletedAt" | "oldestMessageAt">): MessageLogManifestChat {
+		const key = chatKey(chat);
+		const existing = this.manifestChatsByKey.get(key);
+		if (existing) return existing;
+		const manifestChat: MessageLogManifestChat = {
+			kind: chat.kind,
+			chatMid: chat.chatMid,
+			scopeMid: chat.scopeMid,
+			chatType: chat.chatType,
+			backfillCompletedAt: chat.backfillCompletedAt,
+			oldestMessageAt: chat.oldestMessageAt,
+			membersPath: relativeMembersPath(chat),
+			parts: [],
+		};
+		this.manifest.chats.push(manifestChat);
+		this.manifestChatsByKey.set(key, manifestChat);
+		return manifestChat;
 	}
 
 	private markMessageDirty(message: StoredMessageLog): void {
-		this.dirtyDates.add(`${chatKey(message)}|${jstDateKey(message.createdAt)}`);
-	}
-
-	private markAllDirty(): void {
-		for (const chat of this.data.chats) {
-			this.dirtyMembers.add(chatKey(chat));
-			for (const message of chat.messages) {
-				this.markMessageDirty(message);
-			}
-		}
+		const date = jstDateKey(message.createdAt);
+		const key = bucketKey(message, date);
+		const messages = this.dirtyMessages.get(key) ?? new Map<string, StoredMessageLog>();
+		messages.set(message.id, message);
+		this.dirtyMessages.set(key, messages);
 		this.dirty = true;
 	}
 
-	private countMessages(): number {
-		return this.data.chats.reduce((sum, chat) => sum + chat.messages.length, 0);
+	private async writeManifestLocal(): Promise<void> {
+		this.manifest.generatedAt = new Date().toISOString();
+		await this.writeLocalJson("manifest.json", this.manifest);
+	}
+
+	private async writeLocalJson(relativePath: string, value: unknown): Promise<void> {
+		const filePath = localPathFor(relativePath);
+		await fs.mkdir(path.dirname(filePath), { recursive: true });
+		const temporary = `${filePath}.tmp`;
+		await fs.writeFile(temporary, encodeWrappedJson(value), "utf8");
+		await fs.rename(temporary, filePath);
+	}
+
+	private warmLowPriorityLocalCache(): void {
+		setTimeout(() => {
+			void this.writeManifestLocal().catch((error) => {
+				console.warn("[message-log] low priority manifest cache failed", error);
+			});
+		}, 5_000);
+	}
+
+	private isNotFoundError(error: unknown): boolean {
+		return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT");
 	}
 
 	private scheduleSave(): void {
