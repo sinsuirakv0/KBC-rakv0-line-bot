@@ -113,7 +113,7 @@ function cleanDisplayName(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();
 	if (!trimmed || looksLikeSquareMemberMid(trimmed)) return undefined;
 	if (["(名前なし)", "名前なし", "名前不明", "(取得失敗)", "取得失敗"].includes(trimmed)) return undefined;
-	if (!/[0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]/.test(trimmed)) return undefined;
+	if (/^[\p{C}\s]+$/u.test(trimmed)) return undefined;
 	return trimmed;
 }
 

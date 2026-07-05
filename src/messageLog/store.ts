@@ -182,6 +182,7 @@ function cleanMemberName(value: string | undefined): string | undefined {
 	if (!trimmed) return undefined;
 	if (/^[up][0-9a-f]{8,}$/i.test(trimmed)) return undefined;
 	if (["(名前なし)", "名前なし", "名前不明", "(取得失敗)", "取得失敗"].includes(trimmed)) return undefined;
+	if (/^[\p{C}\s]+$/u.test(trimmed)) return undefined;
 	return trimmed;
 }
 

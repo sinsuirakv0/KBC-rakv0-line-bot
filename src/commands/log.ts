@@ -94,6 +94,9 @@ interface MemberRefreshRecord {
 interface MemberRefreshResult {
 	chatMembers: number;
 	directoryMembers: number;
+	historyMembers: number;
+	historyPages: number;
+	historyReachedCutoff: boolean;
 	directResolved: number;
 	updated: number;
 	unnamed: number;
@@ -106,6 +109,9 @@ const MAX_LOG_ROWS = 1000;
 const LOG_PAGE_SIZE = 10;
 const DEFAULT_LOG_LOOKBACK_DAYS = 30;
 const DEFAULT_LOG_LOOKBACK_MS = DEFAULT_LOG_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+const MEMBER_UPDATE_HISTORY_LOOKBACK_DAYS = 183;
+const MEMBER_UPDATE_HISTORY_LOOKBACK_MS = MEMBER_UPDATE_HISTORY_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+const MEMBER_UPDATE_HISTORY_MAX_PAGES = 2500;
 const LOG_TARGET_SELECTION_EXPIRES_MS = 10 * 60_000;
 const LOG_DIRECT_NAME_RESOLVE_LIMIT = 200;
 const LOG_DIRECT_NAME_CACHE_MS = 60 * 60_000;
@@ -209,7 +215,7 @@ function cleanDisplayName(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();
 	if (!trimmed || looksLikeUserMid(trimmed)) return undefined;
 	if (["(名前なし)", "名前なし", "名前不明", "(取得失敗)", "取得失敗"].includes(trimmed)) return undefined;
-	if (!/[0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]/.test(trimmed)) return undefined;
+	if (/^[\p{C}\s]+$/u.test(trimmed)) return undefined;
 	return trimmed;
 }
 
@@ -671,6 +677,75 @@ async function resolveSquareMemberNamesDirect(
 	return resolved;
 }
 
+async function scanRecentMemberHistoryForNames(
+	client: Client,
+	destination: LineDestination,
+	cutoffAt: number,
+): Promise<{ members: number; pages: number; reachedCutoff: boolean; errors: string[] }> {
+	const namedMembers = new Set<string>();
+	const errors: string[] = [];
+	let pages = 0;
+	let reachedCutoff = false;
+	let continuationToken: string | undefined;
+	let syncToken: string | undefined;
+
+	const processEvents = (events: SquareHistoryEvent[]) => {
+		recordEventNames(destination, events);
+		for (const event of events) {
+			for (const member of eventMembers(event)) {
+				if (cleanDisplayName(member.name)) namedMembers.add(member.mid);
+			}
+			for (const member of eventMemberProfiles(event)) {
+				if (cleanDisplayName(member.name)) namedMembers.add(member.mid);
+			}
+			const createdAt = Number(event.createdTime);
+			if (Number.isFinite(createdAt) && createdAt > 0 && createdAt < cutoffAt) {
+				reachedCutoff = true;
+			}
+		}
+	};
+
+	try {
+		for (let page = 0; page < 10; page++) {
+			const response = await fetchSquareChatEvents(client, {
+				squareChatMid: destination.chatMid,
+				syncToken,
+				limit: 100,
+				direction: "FORWARD",
+				fetchType: "DEFAULT",
+			});
+			pages += 1;
+			syncToken = response.syncToken;
+			processEvents(response.events as SquareHistoryEvent[]);
+			if (response.events.length === 0) break;
+			await sleep(50);
+		}
+		if (!syncToken) return { members: namedMembers.size, pages, reachedCutoff, errors };
+
+		for (let page = 0; page < MEMBER_UPDATE_HISTORY_MAX_PAGES; page++) {
+			const response = await fetchSquareChatEvents(client, {
+				squareChatMid: destination.chatMid,
+				syncToken,
+				direction: "BACKWARD",
+				inclusive: page === 0 ? "ON" : "OFF",
+				fetchType: "DEFAULT",
+				limit: 100,
+				...(continuationToken ? { continuationToken } : {}),
+			});
+			pages += 1;
+			syncToken = response.syncToken;
+			continuationToken = response.continuationToken || undefined;
+			processEvents(response.events as SquareHistoryEvent[]);
+			if (reachedCutoff || !continuationToken) break;
+			await sleep(80);
+		}
+	} catch (error) {
+		errors.push(`recent history: ${error instanceof Error ? error.message : String(error)}`);
+	}
+
+	return { members: namedMembers.size, pages, reachedCutoff, errors };
+}
+
 async function refreshSquareMemberJson(
 	client: Client,
 	destination: LineDestination,
@@ -680,6 +755,9 @@ async function refreshSquareMemberJson(
 	const errors: string[] = [];
 	let chatMembers = 0;
 	let directoryMembers = 0;
+	let historyMembers = 0;
+	let historyPages = 0;
+	let historyReachedCutoff = false;
 	let directResolved = 0;
 
 	try {
@@ -726,6 +804,16 @@ async function refreshSquareMemberJson(
 		errors.push(`square directory: ${error instanceof Error ? error.message : String(error)}`);
 	}
 
+	const historyResult = await scanRecentMemberHistoryForNames(
+		client,
+		destination,
+		Date.now() - MEMBER_UPDATE_HISTORY_LOOKBACK_MS,
+	);
+	historyMembers = historyResult.members;
+	historyPages = historyResult.pages;
+	historyReachedCutoff = historyResult.reachedCutoff;
+	errors.push(...historyResult.errors);
+
 	const unnamedMids = [...records.values()]
 		.filter((member) => !member.name)
 		.map((member) => member.mid);
@@ -764,6 +852,9 @@ async function refreshSquareMemberJson(
 	return {
 		chatMembers,
 		directoryMembers,
+		historyMembers,
+		historyPages,
+		historyReachedCutoff,
 		directResolved,
 		updated: records.size,
 		unnamed: [...records.values()].filter((member) => !member.name).length,
@@ -1460,13 +1551,15 @@ export const logCommand: LineCommand = {
 				await message.send("メンバーJSON更新はOpenChatでのみ使用できます。");
 				return;
 			}
-			await message.send("メンバーJSON更新を開始しました。");
+			await message.send(`メンバーJSON更新を開始しました。\n現在メンバーと退会済みを含む直近${MEMBER_UPDATE_HISTORY_LOOKBACK_DAYS}日分の履歴を確認します。`);
 			try {
 				const result = await refreshSquareMemberJson(message.client, message.destination);
 				const lines = [
 					"メンバーJSON更新が完了しました。",
 					`現在チャット取得: ${result.chatMembers}人`,
 					`OC全体取得: ${result.directoryMembers}人`,
+					`履歴取得: ${result.historyMembers}人 / ${result.historyPages}ページ`,
+					`半年地点到達: ${result.historyReachedCutoff ? "はい" : "いいえ"}`,
 					`個別名前取得: ${result.directResolved}人`,
 					`保存/更新: ${result.updated}人`,
 					`名前未取得: ${result.unnamed}人`,
