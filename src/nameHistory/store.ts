@@ -34,6 +34,7 @@ export interface NameHistoryEntry {
 
 const EMPTY_HISTORY: NameHistoryFile = { version: 1, users: [] };
 const SAVE_DELAY_MS = 10_000;
+let lastParseDroppedEntries = 0;
 
 function keyOf(value: Pick<StoredUser, "kind" | "scopeMid" | "mid">): string {
 	return `${value.kind}:${value.scopeMid}:${value.mid}`;
@@ -53,6 +54,7 @@ function cleanStoredName(value: string | undefined): string | undefined {
 }
 
 function parseHistory(value: unknown): NameHistoryFile {
+	lastParseDroppedEntries = 0;
 	if (!value || typeof value !== "object") return structuredClone(EMPTY_HISTORY);
 	const raw = value as Partial<NameHistoryFile>;
 	const users = Array.isArray(raw.users) ? raw.users : [];
@@ -67,11 +69,17 @@ function parseHistory(value: unknown): NameHistoryFile {
 				scopeMid: user.scopeMid,
 				mid: user.mid,
 				names: names.flatMap((name) => {
-					if (!name || typeof name.name !== "string" || !name.name.trim()) return [];
+					const cleanedName = cleanStoredName(typeof name?.name === "string" ? name.name : undefined);
+					if (!cleanedName) {
+						lastParseDroppedEntries += 1;
+						return [];
+					}
+					const firstSeenAt = typeof name.firstSeenAt === "string" ? name.firstSeenAt : nowIso();
+					const lastSeenAt = typeof name.lastSeenAt === "string" ? name.lastSeenAt : firstSeenAt;
 					return [{
-						name: name.name,
-						firstSeenAt: typeof name.firstSeenAt === "string" ? name.firstSeenAt : nowIso(),
-						lastSeenAt: typeof name.lastSeenAt === "string" ? name.lastSeenAt : nowIso(),
+						name: cleanedName,
+						firstSeenAt: firstSeenAt < lastSeenAt ? firstSeenAt : lastSeenAt,
+						lastSeenAt: lastSeenAt > firstSeenAt ? lastSeenAt : firstSeenAt,
 						count: Number.isInteger(name.count) && name.count > 0 ? name.count : 1,
 					}];
 				}),
@@ -95,6 +103,7 @@ class MemberNameHistoryStore {
 				if (remote) {
 					this.data = parseHistory(JSON.parse(remote.content));
 					this.githubSha = remote.sha;
+					if (lastParseDroppedEntries > 0) this.dirty = true;
 					await this.writeLocal();
 					console.log(`[name-history] loaded ${this.data.users.length} user(s) from GitHub`);
 					return;
@@ -105,6 +114,7 @@ class MemberNameHistoryStore {
 		}
 		try {
 			this.data = parseHistory(JSON.parse(await fs.readFile(appConfig.memberNameHistoryFile, "utf8")));
+			if (lastParseDroppedEntries > 0) this.dirty = true;
 		} catch {
 			await this.writeLocal();
 		}
@@ -128,7 +138,8 @@ class MemberNameHistoryStore {
 		}
 		const entry = user.names.find((item) => item.name === normalizedName);
 		if (entry) {
-			entry.lastSeenAt = seenIso;
+			if (seenIso < entry.firstSeenAt) entry.firstSeenAt = seenIso;
+			if (seenIso > entry.lastSeenAt) entry.lastSeenAt = seenIso;
 			entry.count += 1;
 		} else {
 			user.names.push({
@@ -190,6 +201,7 @@ class MemberNameHistoryStore {
 			clearTimeout(this.saveTimer);
 			this.saveTimer = undefined;
 		}
+		if (this.normalizeData() > 0) this.dirty = true;
 		if (!this.dirty) {
 			await this.saveQueue;
 			return;
@@ -224,6 +236,47 @@ class MemberNameHistoryStore {
 				console.error("[name-history] scheduled save failed", error);
 			});
 		}, SAVE_DELAY_MS);
+	}
+
+	private normalizeData(): number {
+		let changed = 0;
+		const normalizedUsers: StoredUser[] = [];
+		for (const user of this.data.users) {
+			const namesByName = new Map<string, StoredName>();
+			for (const entry of user.names) {
+				const cleanedName = cleanStoredName(entry.name);
+				if (!cleanedName) {
+					changed += 1;
+					continue;
+				}
+				const firstSeenAt = entry.firstSeenAt < entry.lastSeenAt ? entry.firstSeenAt : entry.lastSeenAt;
+				const lastSeenAt = entry.lastSeenAt > entry.firstSeenAt ? entry.lastSeenAt : entry.firstSeenAt;
+				const existing = namesByName.get(cleanedName);
+				if (existing) {
+					existing.firstSeenAt = existing.firstSeenAt < firstSeenAt ? existing.firstSeenAt : firstSeenAt;
+					existing.lastSeenAt = existing.lastSeenAt > lastSeenAt ? existing.lastSeenAt : lastSeenAt;
+					existing.count += entry.count;
+					changed += 1;
+					continue;
+				}
+				if (cleanedName !== entry.name || firstSeenAt !== entry.firstSeenAt || lastSeenAt !== entry.lastSeenAt) {
+					changed += 1;
+				}
+				namesByName.set(cleanedName, {
+					name: cleanedName,
+					firstSeenAt,
+					lastSeenAt,
+					count: entry.count,
+				});
+			}
+			if (namesByName.size === 0) {
+				changed += 1;
+				continue;
+			}
+			normalizedUsers.push({ ...user, names: [...namesByName.values()] });
+		}
+		if (changed > 0) this.data.users = normalizedUsers;
+		return changed;
 	}
 
 	private async writeLocal(value: NameHistoryFile = this.data): Promise<void> {
