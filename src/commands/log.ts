@@ -681,6 +681,7 @@ async function scanRecentMemberHistoryForNames(
 	client: Client,
 	destination: LineDestination,
 	cutoffAt: number,
+	records: Map<string, MemberRefreshRecord>,
 ): Promise<{ members: number; pages: number; reachedCutoff: boolean; errors: string[] }> {
 	const namedMembers = new Set<string>();
 	const errors: string[] = [];
@@ -693,10 +694,32 @@ async function scanRecentMemberHistoryForNames(
 		recordEventNames(destination, events);
 		for (const event of events) {
 			for (const member of eventMembers(event)) {
-				if (cleanDisplayName(member.name)) namedMembers.add(member.mid);
+				if (cleanDisplayName(member.name)) {
+					namedMembers.add(member.mid);
+					const existing = records.get(member.mid);
+					records.set(member.mid, {
+						mid: member.mid,
+						name: member.name,
+						state: existing?.state ?? "UNKNOWN",
+						role: existing?.role,
+						seenAt: existing?.seenAt,
+						source: existing?.source ?? "historyEventName",
+						extra: { ...(existing?.extra ?? {}), historySource: "eventMembers" },
+					});
+				}
 			}
 			for (const member of eventMemberProfiles(event)) {
 				if (cleanDisplayName(member.name)) namedMembers.add(member.mid);
+				const existing = records.get(member.mid);
+				records.set(member.mid, {
+					mid: member.mid,
+					name: member.name ?? existing?.name,
+					state: member.state,
+					role: member.role ?? existing?.role,
+					seenAt: member.seenAt ?? existing?.seenAt,
+					source: member.source,
+					extra: { ...(existing?.extra ?? {}), ...(member.extra ?? {}) },
+				});
 			}
 			const createdAt = Number(event.createdTime);
 			if (Number.isFinite(createdAt) && createdAt > 0 && createdAt < cutoffAt) {
@@ -808,6 +831,7 @@ async function refreshSquareMemberJson(
 		client,
 		destination,
 		Date.now() - MEMBER_UPDATE_HISTORY_LOOKBACK_MS,
+		records,
 	);
 	historyMembers = historyResult.members;
 	historyPages = historyResult.pages;
