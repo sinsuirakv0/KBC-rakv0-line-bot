@@ -163,6 +163,16 @@ function splitLogSearchArgs(args: string[]): { all: boolean; args: string[] } {
 	return { all, args: filtered };
 }
 
+function looksLikeUserMid(value: string): boolean {
+	return /^[up][0-9a-f]{8,}$/i.test(value.trim());
+}
+
+function displayNameOrUnknown(value: string | undefined): string {
+	const trimmed = value?.trim();
+	if (!trimmed || looksLikeUserMid(trimmed)) return "名前不明";
+	return trimmed;
+}
+
 async function dismissProgressMessage(message: Parameters<LineCommand["execute"]>[0]["message"], messageId?: string): Promise<void> {
 	if (!messageId) return;
 	try {
@@ -662,7 +672,7 @@ function formatLogRows(rows: LogEntry[]): string[] {
 
 function formatStoredRows(rows: StoredMessageLog[], includeSender: boolean): string[] {
 	return rows.map((row) => {
-		const sender = row.senderName || row.senderMid;
+		const sender = displayNameOrUnknown(row.senderName);
 		return includeSender
 			? `${formatLogTime(row.createdAt)}:${sender}:${row.content}`
 			: `${formatLogTime(row.createdAt)}:${row.content}`;
@@ -1003,7 +1013,7 @@ export const logCommand: LineCommand = {
 				await sendSearchResults(
 					message,
 					"対象候補",
-					ambiguous.map((member) => `${member.name}\nMID: ${member.mid}`),
+					ambiguous.map((member) => `${displayNameOrUnknown(member.name)}\nMID: ${member.mid}`),
 					LOG_PAGE_SIZE,
 				);
 				return;
@@ -1016,12 +1026,12 @@ export const logCommand: LineCommand = {
 			await memberNameHistoryStore.flush();
 			const entries = memberNameHistoryStore.get("square", message.destination.scopeMid, target.mid);
 			if (entries.length === 0) {
-				await message.send(`${target.name}\n過去の名前はまだ保存されていません。`);
+				await message.send(`${displayNameOrUnknown(target.name)}\n過去の名前はまだ保存されていません。`);
 				return;
 			}
 			await sendSearchResults(
 				message,
-				`${target.name} 名前履歴`,
+				`${displayNameOrUnknown(target.name)} 名前履歴`,
 				formatNameHistoryRows(entries),
 				LOG_PAGE_SIZE,
 			);
@@ -1048,7 +1058,7 @@ export const logCommand: LineCommand = {
 				await sendSearchResults(
 					message,
 					"対象候補",
-					ambiguous.map((member) => `${member.name}\nMID: ${member.mid}`),
+					ambiguous.map((member) => `${displayNameOrUnknown(member.name)}\nMID: ${member.mid}`),
 					LOG_PAGE_SIZE,
 				);
 				return;
@@ -1060,14 +1070,16 @@ export const logCommand: LineCommand = {
 		}
 
 		const sinceCreatedAt = parsedSearch.all ? undefined : Date.now() - DEFAULT_LOG_LOOKBACK_MS;
-		let progressMessageId: string | undefined;
-		if (parsedSearch.all) {
-			progressMessageId = await message.send([
+		const progressMessageId = await message.send(
+			(parsedSearch.all ? [
 				"全期間検索を開始します。",
 				"ログ量によってはかなり重くなります。連打しないでください。",
 				"探索中...",
-			].join("\n"));
-		}
+			] : [
+				"ログ検索を開始します。",
+				"探索中...",
+			]).join("\n"),
+		);
 		try {
 			const rows = await messageLogStore.search(message.destination, query, {
 				senderMid: target?.mid,
@@ -1080,13 +1092,13 @@ export const logCommand: LineCommand = {
 					? "全期間"
 					: `直近${DEFAULT_LOG_LOOKBACK_DAYS}日 (${formatLogDate(sinceCreatedAt ?? Date.now())}以降)`;
 				await message.send(target
-					? `${target.name} の「${query}」を含む発言は${scopeText}の保存済みログに見つかりませんでした。`
+					? `${displayNameOrUnknown(target.name)} の「${query}」を含む発言は${scopeText}の保存済みログに見つかりませんでした。`
 					: `このトークで「${query}」を含む発言は${scopeText}の保存済みログに見つかりませんでした。`);
 				return;
 			}
 
 			const title = [
-				target ? `${target.name} log "${query}"` : `talk log "${query}"`,
+				target ? `${displayNameOrUnknown(target.name)} log "${query}"` : `talk log "${query}"`,
 				parsedSearch.all ? "全期間" : `直近${DEFAULT_LOG_LOOKBACK_DAYS}日`,
 				rows.length >= MAX_LOG_ROWS ? `最大${MAX_LOG_ROWS}件` : "",
 			].filter(Boolean).join(" / ");
