@@ -17,6 +17,7 @@ import { runtimeStore } from "./runtime/store.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
 import { botStopTargetFromDestination, permissionStore } from "./permissions/store.js";
 import { memberNameHistoryStore } from "./nameHistory/store.js";
+import { startMessageLogAutoHistoryScheduler } from "./messageLog/autoHistory.js";
 import { messageLogStore, type StoredMessageLog } from "./messageLog/store.js";
 
 interface RawTalkMessage {
@@ -832,6 +833,7 @@ async function main(): Promise<void> {
 	]);
 	startEventPushScheduler(() => activeClient, shutdownController.signal);
 	startPushReminderScheduler(() => activeClient, shutdownController.signal);
+	startMessageLogAutoHistoryScheduler(() => activeClient, shutdownController.signal);
 	const storage = await initializeLineStorage();
 	while (!shutdownController.signal.aborted) {
 		try {

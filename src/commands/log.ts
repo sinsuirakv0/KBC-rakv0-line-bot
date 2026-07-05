@@ -1,5 +1,6 @@
 import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
+import { getActiveHistoryJob, tryStartHistoryJob, finishHistoryJob } from "../messageLog/historyJobs.js";
 import { messageLogStore, type MessageLogFlushResult, type StoredMemberState, type StoredMessageLog } from "../messageLog/store.js";
 import { memberNameHistoryStore } from "../nameHistory/store.js";
 import { permissionDeniedText, permissionStore, targetFromDestination } from "../permissions/store.js";
@@ -81,11 +82,6 @@ interface ResolvedTarget {
 
 const MAX_LOG_ROWS = 1000;
 const LOG_PAGE_SIZE = 20;
-let activeBackfill: {
-	key: string;
-	requester: string;
-	startedAt: number;
-} | undefined;
 let activeMessageLogSync: Promise<string> | undefined;
 let messageLogSyncRequested = false;
 
@@ -769,19 +765,24 @@ async function startBackfill(message: Parameters<LineCommand["execute"]>[0]["mes
 		return;
 	}
 	const key = backfillKey(message.destination);
-	if (activeBackfill) {
+	const activeJob = getActiveHistoryJob();
+	if (activeJob) {
 		await message.send([
 			"現在、別の履歴取得が実行中です。",
-			`実行者: ${activeBackfill.requester}`,
-			`開始: ${formatLogTime(activeBackfill.startedAt)}`,
-			`経過: ${formatDuration(Date.now() - activeBackfill.startedAt)}`,
+			`実行者: ${activeJob.type === "auto" ? "自動履歴保存" : activeJob.requester}`,
+			`開始: ${formatLogTime(activeJob.startedAt)}`,
+			`経過: ${formatDuration(Date.now() - activeJob.startedAt)}`,
 			"完了後にもう一度実行してください。",
 		].join("\n"));
 		return;
 	}
 	const startedAt = Date.now();
 	const requester = message.destination.senderName || message.destination.senderMid;
-	activeBackfill = { key, requester, startedAt };
+	const jobId = `manual:${key}:${startedAt}`;
+	if (!tryStartHistoryJob({ id: jobId, key, requester, startedAt, type: "manual" })) {
+		await message.send("現在、別の履歴取得が実行中です。完了後にもう一度実行してください。");
+		return;
+	}
 	const destination = { ...message.destination };
 	await message.send("履歴取得を開始しました。完了までバックグラウンドでゆっくり読み込みます。");
 	void backfillSquareHistory(message.client, destination)
@@ -822,7 +823,7 @@ async function startBackfill(message: Parameters<LineCommand["execute"]>[0]["mes
 			}
 		})
 		.finally(() => {
-			if (activeBackfill?.key === key) activeBackfill = undefined;
+			finishHistoryJob(jobId);
 		});
 }
 

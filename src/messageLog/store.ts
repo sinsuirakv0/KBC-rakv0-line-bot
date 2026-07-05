@@ -58,6 +58,26 @@ export interface MessageLogFlushResult {
 	remoteSkipped: boolean;
 }
 
+export interface MessageLogAutoHistoryState {
+	syncToken?: string;
+	continuationToken?: string;
+	updatedAt?: string;
+	finishedAt?: string;
+	lastMode?: "recent" | "backfill";
+}
+
+export interface MessageLogChatSummary {
+	kind: "talk" | "square";
+	chatMid: string;
+	scopeMid: string;
+	chatType: "USER" | "GROUP" | "ROOM" | "SQUARE";
+	backfillCompletedAt?: string;
+	oldestMessageAt?: number;
+	latestMessageAt?: number;
+	parts: number;
+	autoHistory?: MessageLogAutoHistoryState;
+}
+
 interface StoredChat {
 	kind: "talk" | "square";
 	chatMid: string;
@@ -90,6 +110,7 @@ interface MessageLogManifestChat {
 	oldestMessageAt?: number;
 	membersPath: string;
 	parts: MessageLogPartMeta[];
+	autoHistory?: MessageLogAutoHistoryState;
 }
 
 interface MessageLogPartMeta {
@@ -365,6 +386,7 @@ class MessageLogStore {
 	private remoteFlushSuspendCount = 0;
 	private autoFlushSuspendCount = 0;
 	private importedLegacy = false;
+	private lastActivityAt = 0;
 
 	async initialize(): Promise<void> {
 		await fs.mkdir(localRoot(), { recursive: true });
@@ -400,6 +422,8 @@ class MessageLogStore {
 
 	record(message: StoredMessageLog): boolean {
 		if (!message.id || !message.chatMid || !message.senderMid || !message.content) return false;
+		const source = typeof message.metadata?.source === "string" ? message.metadata.source : "";
+		if (source.startsWith("live-")) this.lastActivityAt = Date.now();
 		const chat = this.getOrCreateChat(message);
 		const key = chatKey(chat);
 		const messagesById = this.messagesByChat.get(key) ?? new Map<string, StoredMessageLog>();
@@ -504,6 +528,52 @@ class MessageLogStore {
 		return added;
 	}
 
+	listSquareChats(): MessageLogChatSummary[] {
+		return this.manifest.chats
+			.filter((chat) => chat.kind === "square")
+			.map((chat) => ({
+				kind: chat.kind,
+				chatMid: chat.chatMid,
+				scopeMid: chat.scopeMid,
+				chatType: chat.chatType,
+				backfillCompletedAt: chat.backfillCompletedAt,
+				oldestMessageAt: chat.oldestMessageAt,
+				latestMessageAt: chat.parts.reduce<number | undefined>((latest, part) => {
+					if (part.lastCreatedAt === undefined) return latest;
+					return latest === undefined || part.lastCreatedAt > latest ? part.lastCreatedAt : latest;
+				}, undefined),
+				parts: chat.parts.length,
+				autoHistory: chat.autoHistory ? { ...chat.autoHistory } : undefined,
+			}));
+	}
+
+	updateAutoHistoryState(
+		destination: Pick<LineDestination, "kind" | "chatMid" | "scopeMid" | "chatType">,
+		state: MessageLogAutoHistoryState,
+		progress?: { oldestMessageAt?: number },
+	): void {
+		if (destination.kind !== "square") return;
+		const manifestChat = this.getOrCreateManifestChat({
+			kind: destination.kind,
+			chatMid: destination.chatMid,
+			scopeMid: destination.scopeMid,
+			chatType: destination.chatType,
+		});
+		manifestChat.autoHistory = { ...state, updatedAt: new Date().toISOString() };
+		if (progress?.oldestMessageAt !== undefined &&
+			(!manifestChat.oldestMessageAt || progress.oldestMessageAt < manifestChat.oldestMessageAt)) {
+			manifestChat.oldestMessageAt = progress.oldestMessageAt;
+			const chat = this.chatsByKey.get(chatKey(destination));
+			if (chat) chat.oldestMessageAt = progress.oldestMessageAt;
+		}
+		this.dirty = true;
+		this.scheduleSave();
+	}
+
+	getLastActivityAt(): number {
+		return this.lastActivityAt;
+	}
+
 	async search(
 		destination: Pick<LineDestination, "kind" | "chatMid">,
 		query: string,
@@ -551,6 +621,13 @@ class MessageLogStore {
 		const manifestChat = this.getOrCreateManifestChat(chat);
 		manifestChat.backfillCompletedAt = now;
 		if (oldestMessageAt) manifestChat.oldestMessageAt = oldestMessageAt;
+		manifestChat.autoHistory = {
+			...(manifestChat.autoHistory ?? {}),
+			continuationToken: undefined,
+			finishedAt: new Date().toISOString(),
+			lastMode: "backfill",
+			updatedAt: new Date().toISOString(),
+		};
 		this.dirtyMembers.add(chatKey(chat));
 		this.dirty = true;
 		this.scheduleSave();
@@ -683,6 +760,7 @@ class MessageLogStore {
 					backfillCompletedAt: typeof chat.backfillCompletedAt === "string" ? chat.backfillCompletedAt : undefined,
 					oldestMessageAt: Number.isFinite(chat.oldestMessageAt) ? Number(chat.oldestMessageAt) : undefined,
 					membersPath: chat.membersPath,
+					autoHistory: this.parseAutoHistory(chat.autoHistory),
 					parts: chat.parts.flatMap((part) => {
 						if (!part || typeof part.path !== "string" || typeof part.date !== "string") return [];
 						return [{
@@ -697,6 +775,18 @@ class MessageLogStore {
 					}),
 				}];
 			}),
+		};
+	}
+
+	private parseAutoHistory(value: unknown): MessageLogAutoHistoryState | undefined {
+		if (!value || typeof value !== "object") return undefined;
+		const raw = value as Partial<MessageLogAutoHistoryState>;
+		return {
+			syncToken: typeof raw.syncToken === "string" ? raw.syncToken : undefined,
+			continuationToken: typeof raw.continuationToken === "string" ? raw.continuationToken : undefined,
+			updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : undefined,
+			finishedAt: typeof raw.finishedAt === "string" ? raw.finishedAt : undefined,
+			lastMode: raw.lastMode === "recent" || raw.lastMode === "backfill" ? raw.lastMode : undefined,
 		};
 	}
 
@@ -928,6 +1018,7 @@ class MessageLogStore {
 			backfillCompletedAt: chat.backfillCompletedAt,
 			oldestMessageAt: chat.oldestMessageAt,
 			membersPath: relativeMembersPath(chat),
+			autoHistory: undefined,
 			parts: [],
 		};
 		this.manifest.chats.push(manifestChat);

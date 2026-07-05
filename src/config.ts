@@ -104,6 +104,13 @@ export const appConfig = {
 	messageLogBackfillRemoteFlushPages: Number(process.env.MESSAGE_LOG_BACKFILL_REMOTE_FLUSH_PAGES || 2),
 	messageLogPartMaxBytes: Number(process.env.MESSAGE_LOG_PART_MAX_BYTES || 5 * 1024 * 1024),
 	messageLogAutoFlushMs: Number(process.env.MESSAGE_LOG_AUTO_FLUSH_MS || 120_000),
+	messageLogAutoHistoryEnabled: boolEnv("MESSAGE_LOG_AUTO_HISTORY_ENABLED", true),
+	messageLogAutoHistoryIntervalMs: Number(process.env.MESSAGE_LOG_AUTO_HISTORY_INTERVAL_MS || 10 * 60_000),
+	messageLogAutoHistoryIdleMs: Number(process.env.MESSAGE_LOG_AUTO_HISTORY_IDLE_MS || 10 * 60_000),
+	messageLogAutoHistoryQuietStartHour: Number(process.env.MESSAGE_LOG_AUTO_HISTORY_QUIET_START_HOUR || 2),
+	messageLogAutoHistoryQuietEndHour: Number(process.env.MESSAGE_LOG_AUTO_HISTORY_QUIET_END_HOUR || 6),
+	messageLogAutoHistoryRecentPages: Number(process.env.MESSAGE_LOG_AUTO_HISTORY_RECENT_PAGES || 2),
+	messageLogAutoHistoryBackfillPages: Number(process.env.MESSAGE_LOG_AUTO_HISTORY_BACKFILL_PAGES || 3),
 	githubContentsTimeoutMs: Number(process.env.GITHUB_CONTENTS_TIMEOUT_MS || 60_000),
 };
 
