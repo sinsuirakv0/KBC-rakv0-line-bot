@@ -80,6 +80,26 @@ interface ResolvedTarget {
 	ambiguous?: MemberInfo[];
 }
 
+interface MemberRefreshRecord {
+	mid: string;
+	name?: string;
+	state: StoredMemberState;
+	role?: string;
+	seenAt?: number;
+	source: string;
+	extra?: Record<string, unknown>;
+}
+
+interface MemberRefreshResult {
+	chatMembers: number;
+	directoryMembers: number;
+	updated: number;
+	unnamed: number;
+	localFiles: number;
+	syncStarted: boolean;
+	errors: string[];
+}
+
 const MAX_LOG_ROWS = 1000;
 const LOG_PAGE_SIZE = 10;
 const DEFAULT_LOG_LOOKBACK_DAYS = 30;
@@ -180,11 +200,15 @@ function looksLikeUserMid(value: string): boolean {
 	return /^[up][0-9a-f]{8,}$/i.test(value.trim());
 }
 
-function displayNameOrUnknown(value: string | undefined): string {
+function cleanDisplayName(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();
-	if (!trimmed || looksLikeUserMid(trimmed)) return "名前不明";
-	if (!/[0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]/.test(trimmed)) return "名前不明";
+	if (!trimmed || looksLikeUserMid(trimmed)) return undefined;
+	if (!/[0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]/.test(trimmed)) return undefined;
 	return trimmed;
+}
+
+function displayNameOrUnknown(value: string | undefined): string {
+	return cleanDisplayName(value) ?? "名前不明";
 }
 
 function destinationKey(message: ReplyableLineMessage): string {
@@ -474,6 +498,140 @@ function recordEventNames(destination: LineDestination, events: SquareHistoryEve
 	}
 }
 
+function memberStateFromRaw(value: unknown, fallback: StoredMemberState): StoredMemberState {
+	const text = String(value ?? "").toUpperCase();
+	if (text.includes("JOINED")) return "JOINED";
+	if (text.includes("LEFT")) return "LEFT";
+	if (text.includes("KICK") || text.includes("KICK_OUT")) return "KICK_OUT";
+	if (text.includes("BANNED")) return "BANNED";
+	return fallback;
+}
+
+function memberCreatedAt(value: unknown): number | undefined {
+	const createdAt = Number(value);
+	return Number.isFinite(createdAt) && createdAt > 0 ? createdAt : undefined;
+}
+
+function addMemberRefreshRecord(
+	records: Map<string, MemberRefreshRecord>,
+	member: Partial<SquareHistoryMember> | undefined,
+	source: string,
+	fallbackState: StoredMemberState,
+): boolean {
+	const mid = typeof member?.squareMemberMid === "string" ? member.squareMemberMid : undefined;
+	if (!mid) return false;
+	const name = cleanDisplayName(typeof member?.displayName === "string" ? member.displayName : undefined);
+	const state = memberStateFromRaw(member?.membershipState, fallbackState);
+	const next: MemberRefreshRecord = {
+		mid,
+		name,
+		state,
+		role: member?.role === undefined ? undefined : String(member.role),
+		seenAt: memberCreatedAt(member?.createdAt),
+		source,
+		extra: {
+			source,
+			...(member?.squareMid === undefined ? {} : { squareMid: member.squareMid }),
+			...(member?.membershipState === undefined ? {} : { membershipState: String(member.membershipState) }),
+		},
+	};
+	const existing = records.get(mid);
+	records.set(mid, {
+		...existing,
+		...next,
+		name: next.name ?? existing?.name,
+		role: next.role ?? existing?.role,
+		seenAt: next.seenAt ?? existing?.seenAt,
+		extra: { ...(existing?.extra ?? {}), ...(next.extra ?? {}) },
+	});
+	return true;
+}
+
+async function refreshSquareMemberJson(
+	client: Client,
+	destination: LineDestination,
+): Promise<MemberRefreshResult> {
+	if (destination.kind !== "square") throw new Error("メンバーJSON更新はOpenChatでのみ使用できます");
+	const records = new Map<string, MemberRefreshRecord>();
+	const errors: string[] = [];
+	let chatMembers = 0;
+	let directoryMembers = 0;
+
+	try {
+		const squareChat = await client.getSquareChat(destination.chatMid);
+		for (const member of await squareChat.getMembers()) {
+			if (addMemberRefreshRecord(records, member, "manualChatMembers", "JOINED")) chatMembers += 1;
+		}
+	} catch (error) {
+		errors.push(`chat members: ${error instanceof Error ? error.message : String(error)}`);
+	}
+
+	try {
+		let continuationToken: string | undefined;
+		for (let page = 0; page < 1000; page++) {
+			const response = await client.base.square.searchSquareMembers({
+				request: {
+					squareMid: destination.scopeMid,
+					searchOption: {
+						membershipState: "JOINED",
+						memberRoles: [],
+						displayName: "",
+						ableToReceiveMessage: "NONE",
+						ableToReceiveFriendRequest: "NONE",
+						chatMidToExcludeMembers: "",
+						includingMe: true,
+						excludeBlockedMembers: false,
+						includingMeOnlyMatch: false,
+					},
+					continuationToken,
+					limit: 100,
+				},
+			});
+			for (const member of response.members) {
+				if (addMemberRefreshRecord(records, member, "manualSquareMembers", "JOINED")) directoryMembers += 1;
+			}
+			continuationToken = response.continuationToken || undefined;
+			if (!continuationToken || response.members.length === 0) break;
+			await sleep(80);
+		}
+	} catch (error) {
+		errors.push(`square directory: ${error instanceof Error ? error.message : String(error)}`);
+	}
+
+	for (const member of records.values()) {
+		if (member.name) memberNameHistoryStore.record("square", destination.scopeMid, member.mid, member.name, member.seenAt);
+		messageLogStore.recordMember({
+			kind: "square",
+			chatMid: destination.chatMid,
+			scopeMid: destination.scopeMid,
+			chatType: "SQUARE",
+			mid: member.mid,
+			name: member.name,
+			state: member.state,
+			role: member.role,
+			seenAt: member.seenAt,
+			source: member.source,
+			extra: member.extra,
+		});
+	}
+
+	const localFiles = await messageLogStore.flushLocalOnly();
+	const sync = queueMessageLogSync();
+	void sync.promise.catch((error) => {
+		console.error("[log:member-update] GitHub sync failed", error);
+	});
+
+	return {
+		chatMembers,
+		directoryMembers,
+		updated: records.size,
+		unnamed: [...records.values()].filter((member) => !member.name).length,
+		localFiles,
+		syncStarted: sync.started,
+		errors,
+	};
+}
+
 async function searchSquareMembersByName(
 	client: Client,
 	destination: LineDestination,
@@ -750,9 +908,16 @@ function formatLogRows(rows: LogEntry[]): string[] {
 	return rows.map((row) => `${formatLogTime(row.createdAt)}:${row.content}`);
 }
 
-function formatStoredRows(rows: StoredMessageLog[], includeSender: boolean): string[] {
+async function formatStoredRows(
+	message: ReplyableLineMessage,
+	rows: StoredMessageLog[],
+	includeSender: boolean,
+): Promise<string[]> {
+	const memberNames = includeSender
+		? await messageLogStore.getMemberNames(message.destination, rows.map((row) => row.senderMid))
+		: new Map<string, string>();
 	return rows.map((row) => {
-		const sender = displayNameOrUnknown(row.senderName);
+		const sender = displayNameOrUnknown(cleanDisplayName(row.senderName) ?? memberNames.get(row.senderMid));
 		return includeSender
 			? `${formatLogTime(row.createdAt)}:${sender}:${row.content}`
 			: `${formatLogTime(row.createdAt)}:${row.content}`;
@@ -793,7 +958,7 @@ async function runLogSearch(
 		await sendSearchResults(
 			message,
 			title,
-			formatStoredRows(rows, !target),
+			await formatStoredRows(message, rows, !target),
 			LOG_PAGE_SIZE,
 		);
 	} catch (error) {
@@ -1104,9 +1269,47 @@ export const logCommand: LineCommand = {
 				"  このOpenChatの過去履歴をゆっくり保存します。",
 				"!log sync",
 				"  保存済みログをGitHubへ手動同期します。",
+				"!log member update",
+				"  現在のOCメンバー名をmembers.jsonへ再取得します。管理者のみ。",
 				"!log name <メンバー名>",
 				"  保存済みの過去の名前を表示します。",
 			].join("\n"));
+			return;
+		}
+
+		if (["member", "members"].includes(args[0]?.toLowerCase() ?? "")) {
+			if (!["update", "sync", "refresh"].includes(args[1]?.toLowerCase() ?? "")) {
+				await message.send("使い方: !log member update\n現在のOCメンバー名をmembers.jsonへ再取得します。");
+				return;
+			}
+			const target = targetFromDestination(message.destination);
+			if (!permissionStore.hasAtLeast(target, message.destination.senderMid, "admin")) {
+				await message.send(permissionDeniedText("admin"));
+				return;
+			}
+			if (message.destination.kind !== "square") {
+				await message.send("メンバーJSON更新はOpenChatでのみ使用できます。");
+				return;
+			}
+			await message.send("メンバーJSON更新を開始しました。");
+			try {
+				const result = await refreshSquareMemberJson(message.client, message.destination);
+				const lines = [
+					"メンバーJSON更新が完了しました。",
+					`現在チャット取得: ${result.chatMembers}人`,
+					`OC全体取得: ${result.directoryMembers}人`,
+					`保存/更新: ${result.updated}人`,
+					`名前不明: ${result.unnamed}人`,
+					`ローカル保存: ${result.localFiles}ファイル`,
+					result.syncStarted ? "GitHub同期: 開始しました" : "GitHub同期: 実行中の同期に追加しました",
+				];
+				if (result.errors.length > 0) {
+					lines.push("", "一部エラー:", ...result.errors.slice(0, 3));
+				}
+				await message.send(lines.join("\n"));
+			} catch (error) {
+				await message.send(`メンバーJSON更新に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+			}
 			return;
 		}
 

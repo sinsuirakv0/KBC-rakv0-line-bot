@@ -580,6 +580,32 @@ class MessageLogStore {
 		return this.lastActivityAt;
 	}
 
+	async getMemberNames(
+		destination: Pick<LineDestination, "kind" | "chatMid" | "scopeMid">,
+		mids: string[],
+	): Promise<Map<string, string>> {
+		const wanted = new Set(mids.filter(Boolean));
+		const names = new Map<string, string>();
+		const collect = async (chat: StoredChat) => {
+			await this.ensureMembersLoaded(chat);
+			for (const member of chat.members) {
+				if (!wanted.has(member.mid) || names.has(member.mid)) continue;
+				const name = member.currentName || member.names.at(-1);
+				if (name?.trim()) names.set(member.mid, name);
+			}
+		};
+		const primary = this.chatsByKey.get(chatKey(destination));
+		if (primary) await collect(primary);
+		if (destination.kind === "square" && names.size < wanted.size) {
+			for (const chat of this.chatsByKey.values()) {
+				if (chat.kind !== "square" || chat.scopeMid !== destination.scopeMid || chat.chatMid === destination.chatMid) continue;
+				await collect(chat);
+				if (names.size >= wanted.size) break;
+			}
+		}
+		return names;
+	}
+
 	async search(
 		destination: Pick<LineDestination, "kind" | "chatMid">,
 		query: string,
