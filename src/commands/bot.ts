@@ -347,14 +347,14 @@ function benchmarkText(result: BenchmarkResult): string {
 }
 
 async function sendBenchmark(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
-	const { message, args } = command;
+	const { message, args, progress } = command;
 	const target = targetFromDestination(message.destination);
 	if (!permissionStore.hasAtLeast(target, message.destination.senderMid, "admin")) {
 		await message.send(permissionDeniedText("admin"));
 		return;
 	}
 	const profile = benchmarkProfile(args[2]);
-	await message.send(`性能テストを開始します。mode: ${profile.name}`);
+	await progress.update(`性能テストを開始します。mode: ${profile.name}`);
 	try {
 		const result = await runBenchmark(profile);
 		await message.send(benchmarkText(result));

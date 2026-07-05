@@ -1607,7 +1607,7 @@ async function runQueuedMessageLogSync(): Promise<string> {
 
 export const logCommand: LineCommand = {
 	name: "log",
-	async execute({ message, args }) {
+	async execute({ message, args, progress }) {
 		if (args[0]?.toLowerCase() === "help") {
 			await message.send([
 				"!log <検索語>",
@@ -1642,7 +1642,7 @@ export const logCommand: LineCommand = {
 				await message.send("メンバーJSON更新はOpenChatでのみ使用できます。");
 				return;
 			}
-			await message.send(`メンバーJSON更新を開始しました。\n現在メンバーと退会済みを含む直近${MEMBER_UPDATE_HISTORY_LOOKBACK_DAYS}日分の履歴を確認します。`);
+			await progress.update(`メンバーJSON更新を開始しました。\n現在メンバーと退会済みを含む直近${MEMBER_UPDATE_HISTORY_LOOKBACK_DAYS}日分の履歴を確認します。`);
 			try {
 				const result = await refreshSquareMemberJson(message.client, message.destination);
 				const lines = [

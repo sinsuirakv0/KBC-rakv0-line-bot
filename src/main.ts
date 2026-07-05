@@ -423,6 +423,26 @@ class SquareReplyTarget implements ReplyableLineMessage {
 			image.filename,
 		);
 	}
+
+	async deleteMessage(messageId: string): Promise<void> {
+		try {
+			await this.client.base.square.destroyMessage({
+				squareChatMid: this.destination.chatMid,
+				messageId,
+			});
+			return;
+		} catch (destroyError) {
+			try {
+				await this.client.base.square.unsendMessage({
+					squareChatMid: this.destination.chatMid,
+					messageId,
+				});
+			} catch (unsendError) {
+				console.warn("[square] progress message deletion failed", { destroyError, unsendError });
+				throw unsendError;
+			}
+		}
+	}
 }
 
 class RawTalkReplyTarget implements ReplyableLineMessage {
@@ -482,6 +502,10 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 		});
 		if (!sent.id) throw new Error("画像メッセージIDを取得できませんでした");
 		await this.client.base.obs.uploadObjTalk(to, "image", image.blob, sent.id, image.filename);
+	}
+
+	async deleteMessage(messageId: string): Promise<void> {
+		await this.client.base.talk.unsendMessage({ messageId });
 	}
 
 	private sendTo(): string {

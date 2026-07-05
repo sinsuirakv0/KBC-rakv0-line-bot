@@ -51,6 +51,7 @@ export interface ReplyableLineMessage {
 	send(text: string): Promise<string | undefined>;
 	sendMention?(text: string, mentions: OutgoingMention[]): Promise<string | undefined>;
 	sendImage(image: OutgoingImage): Promise<void>;
+	deleteMessage?(messageId: string): Promise<void>;
 	client: Client;
 	destination: LineDestination;
 	mentionMids: string[];
@@ -83,6 +84,13 @@ export interface CommandContext {
 	message: ReplyableLineMessage;
 	command: string;
 	args: string[];
+	progress: CommandProgress;
+}
+
+export interface CommandProgress {
+	update(text: string): Promise<string | undefined>;
+	finish(): Promise<void>;
+	detach(): void;
 }
 
 export interface LineCommand {

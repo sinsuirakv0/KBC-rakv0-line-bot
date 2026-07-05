@@ -1,5 +1,6 @@
 import { appConfig } from "../config.js";
 import type { LineCommand, ReplyableLineMessage } from "./shared.js";
+import { startCommandProgress } from "./progress.js";
 import { banCommand } from "./ban.js";
 import { botCommand } from "./bot.js";
 import { enemyCommand } from "./enemy.js";
@@ -49,6 +50,11 @@ export async function handleLineCommand(messageText: string, message: ReplyableL
 	const command = commands.get(name);
 	if (!command) return false;
 	rankingStore.record(message.destination);
-	await command.execute({ message, command: name, args });
+	const progress = await startCommandProgress(message, name);
+	try {
+		await command.execute({ message, command: name, args, progress });
+	} finally {
+		await progress.finish();
+	}
 	return true;
 }
