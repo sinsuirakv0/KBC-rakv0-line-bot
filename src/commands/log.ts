@@ -5,7 +5,7 @@ import { messageLogStore, type MessageLogFlushResult, type StoredMemberState, ty
 import { memberNameHistoryStore } from "../nameHistory/store.js";
 import { permissionDeniedText, permissionStore, targetFromDestination } from "../permissions/store.js";
 import { sendSearchResults } from "./searchPages.js";
-import type { LineCommand, LineDestination } from "./shared.js";
+import type { LineCommand, LineDestination, ReplyableLineMessage } from "./shared.js";
 
 type SquareMembershipState = "LEFT" | "KICK_OUT" | "BANNED" | "JOINED";
 
@@ -81,11 +81,24 @@ interface ResolvedTarget {
 }
 
 const MAX_LOG_ROWS = 1000;
-const LOG_PAGE_SIZE = 20;
+const LOG_PAGE_SIZE = 10;
 const DEFAULT_LOG_LOOKBACK_DAYS = 30;
 const DEFAULT_LOG_LOOKBACK_MS = DEFAULT_LOG_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+const LOG_TARGET_SELECTION_EXPIRES_MS = 10 * 60_000;
 let activeMessageLogSync: Promise<string> | undefined;
 let messageLogSyncRequested = false;
+
+interface LogTargetSelectionSession {
+	query: string;
+	all: boolean;
+	candidates: MemberInfo[];
+	destinationKey: string;
+	senderMid: string;
+	expiresAt: number;
+}
+
+const targetSelectionSessions = new Map<string, LogTargetSelectionSession>();
+const recentTargetSelectionSessions = new Map<string, LogTargetSelectionSession>();
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -170,10 +183,61 @@ function looksLikeUserMid(value: string): boolean {
 function displayNameOrUnknown(value: string | undefined): string {
 	const trimmed = value?.trim();
 	if (!trimmed || looksLikeUserMid(trimmed)) return "名前不明";
+	if (!/[0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]/.test(trimmed)) return "名前不明";
 	return trimmed;
 }
 
-async function dismissProgressMessage(message: Parameters<LineCommand["execute"]>[0]["message"], messageId?: string): Promise<void> {
+function destinationKey(message: ReplyableLineMessage): string {
+	return `${message.destination.kind}:${message.destination.chatMid}`;
+}
+
+function recentSelectionKey(message: ReplyableLineMessage): string {
+	return `${destinationKey(message)}:${message.destination.senderMid}`;
+}
+
+function cleanupTargetSelectionSessions(): void {
+	const now = Date.now();
+	for (const [messageId, session] of targetSelectionSessions) {
+		if (session.expiresAt <= now) targetSelectionSessions.delete(messageId);
+	}
+	for (const [key, session] of recentTargetSelectionSessions) {
+		if (session.expiresAt <= now) recentTargetSelectionSessions.delete(key);
+	}
+}
+
+function formatTargetSelectionPrompt(query: string, candidates: MemberInfo[]): string {
+	return [
+		`「${query}」の対象候補`,
+		...candidates.slice(0, 10).map((member, index) =>
+			`${index + 1}. ${displayNameOrUnknown(member.name)}\nMID: ${member.mid}`
+		),
+		"",
+		"対象番号をこのメッセージに返信してください。",
+	].join("\n");
+}
+
+async function sendTargetSelection(
+	message: ReplyableLineMessage,
+	query: string,
+	all: boolean,
+	candidates: MemberInfo[],
+): Promise<void> {
+	cleanupTargetSelectionSessions();
+	const visibleCandidates = candidates.slice(0, 10);
+	const session: LogTargetSelectionSession = {
+		query,
+		all,
+		candidates: visibleCandidates,
+		destinationKey: destinationKey(message),
+		senderMid: message.destination.senderMid,
+		expiresAt: Date.now() + LOG_TARGET_SELECTION_EXPIRES_MS,
+	};
+	const messageId = await message.send(formatTargetSelectionPrompt(query, visibleCandidates));
+	if (messageId) targetSelectionSessions.set(messageId, session);
+	recentTargetSelectionSessions.set(recentSelectionKey(message), session);
+}
+
+async function dismissProgressMessage(message: ReplyableLineMessage, messageId?: string): Promise<void> {
 	if (!messageId) return;
 	try {
 		if (message.destination.kind === "square") {
@@ -187,6 +251,22 @@ async function dismissProgressMessage(message: Parameters<LineCommand["execute"]
 	} catch (error) {
 		console.warn(`[log] progress message cleanup failed for ${messageId}`, error);
 	}
+}
+
+async function sendLogSearchProgress(
+	message: ReplyableLineMessage,
+	all: boolean,
+): Promise<string | undefined> {
+	return await message.send(
+		(all ? [
+			"全期間検索を開始します。",
+			"ログ量によってはかなり重くなります。連打しないでください。",
+			"探索中...",
+		] : [
+			"ログ検索を開始します。",
+			"探索中...",
+		]).join("\n"),
+	);
 }
 
 function contentTypeLabel(contentType: string | number | undefined, hasContent: boolean | undefined): string {
@@ -679,6 +759,74 @@ function formatStoredRows(rows: StoredMessageLog[], includeSender: boolean): str
 	});
 }
 
+async function runLogSearch(
+	message: ReplyableLineMessage,
+	query: string,
+	all: boolean,
+	target?: MemberInfo,
+	progressMessageId?: string,
+): Promise<void> {
+	const activeProgressMessageId = progressMessageId ?? await sendLogSearchProgress(message, all);
+	const sinceCreatedAt = all ? undefined : Date.now() - DEFAULT_LOG_LOOKBACK_MS;
+	try {
+		const rows = await messageLogStore.search(message.destination, query, {
+			senderMid: target?.mid,
+			limit: MAX_LOG_ROWS,
+			sinceCreatedAt,
+		});
+		await dismissProgressMessage(message, activeProgressMessageId);
+		if (rows.length === 0) {
+			const scopeText = all
+				? "全期間"
+				: `直近${DEFAULT_LOG_LOOKBACK_DAYS}日 (${formatLogDate(sinceCreatedAt ?? Date.now())}以降)`;
+			await message.send(target
+				? `${displayNameOrUnknown(target.name)} の「${query}」を含む発言は${scopeText}の保存済みログに見つかりませんでした。`
+				: `このトークで「${query}」を含む発言は${scopeText}の保存済みログに見つかりませんでした。`);
+			return;
+		}
+
+		const title = [
+			target ? `${displayNameOrUnknown(target.name)} log "${query}"` : `talk log "${query}"`,
+			all ? "全期間" : `直近${DEFAULT_LOG_LOOKBACK_DAYS}日`,
+			rows.length >= MAX_LOG_ROWS ? `最大${MAX_LOG_ROWS}件` : "",
+		].filter(Boolean).join(" / ");
+		await sendSearchResults(
+			message,
+			title,
+			formatStoredRows(rows, !target),
+			LOG_PAGE_SIZE,
+		);
+	} catch (error) {
+		await dismissProgressMessage(message, activeProgressMessageId);
+		await message.send(`ログ検索に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
+export async function handleLogTargetSelectionReply(
+	messageText: string,
+	message: ReplyableLineMessage,
+): Promise<boolean> {
+	cleanupTargetSelectionSessions();
+	const raw = messageText.trim();
+	const choice = Number.parseInt(raw, 10);
+	if (!Number.isInteger(choice) || String(choice) !== raw || choice < 1) return false;
+	const session = message.replyToMessageId
+		? targetSelectionSessions.get(message.replyToMessageId)
+		: recentTargetSelectionSessions.get(recentSelectionKey(message));
+	if (!session) return false;
+	if (session.destinationKey !== destinationKey(message) || session.senderMid !== message.destination.senderMid) return false;
+	if (choice > session.candidates.length) {
+		await message.send(`対象番号は1~${session.candidates.length}で指定してください。`);
+		return true;
+	}
+	if (message.replyToMessageId) targetSelectionSessions.delete(message.replyToMessageId);
+	recentTargetSelectionSessions.delete(recentSelectionKey(message));
+	const target = session.candidates[choice - 1];
+	const progressMessageId = await sendLogSearchProgress(message, session.all);
+	await runLogSearch(message, session.query, session.all, target, progressMessageId);
+	return true;
+}
+
 function formatNameHistoryRows(entries: ReturnType<typeof memberNameHistoryStore.get>): string[] {
 	return entries.map((entry) => {
 		const first = formatLogTime(Date.parse(entry.firstSeenAt));
@@ -1046,68 +1194,35 @@ export const logCommand: LineCommand = {
 		}
 
 		const targetNameArgs = parsedSearch.args.slice(1);
-		if (mentionedMid || targetNameArgs.length > 0) {
-			if (message.destination.kind !== "square") {
-				await message.send("名前指定の!log検索はOpenChatでのみ使用できます。");
-				return;
-			}
-			const resolved = await resolveTarget(message.client, message.destination, targetNameArgs, mentionedMid);
-			target = resolved?.member;
-			ambiguous = resolved?.ambiguous;
-			if (ambiguous && ambiguous.length > 1) {
-				await sendSearchResults(
-					message,
-					"対象候補",
-					ambiguous.map((member) => `${displayNameOrUnknown(member.name)}\nMID: ${member.mid}`),
-					LOG_PAGE_SIZE,
-				);
-				return;
-			}
-			if (!target) {
-				await message.send("対象メンバーが見つかりませんでした。");
-				return;
-			}
+		if ((mentionedMid || targetNameArgs.length > 0) && message.destination.kind !== "square") {
+			await message.send("名前指定の!log検索はOpenChatでのみ使用できます。");
+			return;
 		}
 
-		const sinceCreatedAt = parsedSearch.all ? undefined : Date.now() - DEFAULT_LOG_LOOKBACK_MS;
-		const progressMessageId = await message.send(
-			(parsedSearch.all ? [
-				"全期間検索を開始します。",
-				"ログ量によってはかなり重くなります。連打しないでください。",
-				"探索中...",
-			] : [
-				"ログ検索を開始します。",
-				"探索中...",
-			]).join("\n"),
-		);
+		const progressMessageId = await sendLogSearchProgress(message, parsedSearch.all);
 		try {
-			const rows = await messageLogStore.search(message.destination, query, {
-				senderMid: target?.mid,
-				limit: MAX_LOG_ROWS,
-				sinceCreatedAt,
-			});
-			await dismissProgressMessage(message, progressMessageId);
-			if (rows.length === 0) {
-				const scopeText = parsedSearch.all
-					? "全期間"
-					: `直近${DEFAULT_LOG_LOOKBACK_DAYS}日 (${formatLogDate(sinceCreatedAt ?? Date.now())}以降)`;
-				await message.send(target
-					? `${displayNameOrUnknown(target.name)} の「${query}」を含む発言は${scopeText}の保存済みログに見つかりませんでした。`
-					: `このトークで「${query}」を含む発言は${scopeText}の保存済みログに見つかりませんでした。`);
-				return;
+			if (mentionedMid || targetNameArgs.length > 0) {
+				if (message.destination.kind !== "square") {
+					await dismissProgressMessage(message, progressMessageId);
+					await message.send("名前指定の!log検索はOpenChatでのみ使用できます。");
+					return;
+				}
+				const resolved = await resolveTarget(message.client, message.destination, targetNameArgs, mentionedMid);
+				target = resolved?.member;
+				ambiguous = resolved?.ambiguous;
+				if (ambiguous && ambiguous.length > 1) {
+					await dismissProgressMessage(message, progressMessageId);
+					await sendTargetSelection(message, query, parsedSearch.all, ambiguous);
+					return;
+				}
+				if (!target) {
+					await dismissProgressMessage(message, progressMessageId);
+					await message.send("対象メンバーが見つかりませんでした。");
+					return;
+				}
 			}
 
-			const title = [
-				target ? `${displayNameOrUnknown(target.name)} log "${query}"` : `talk log "${query}"`,
-				parsedSearch.all ? "全期間" : `直近${DEFAULT_LOG_LOOKBACK_DAYS}日`,
-				rows.length >= MAX_LOG_ROWS ? `最大${MAX_LOG_ROWS}件` : "",
-			].filter(Boolean).join(" / ");
-			await sendSearchResults(
-				message,
-				title,
-				formatStoredRows(rows, !target),
-				LOG_PAGE_SIZE,
-			);
+			await runLogSearch(message, query, parsedSearch.all, target, progressMessageId);
 		} catch (error) {
 			await dismissProgressMessage(message, progressMessageId);
 			await message.send(`ログ検索に失敗しました: ${error instanceof Error ? error.message : String(error)}`);

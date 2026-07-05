@@ -3,6 +3,7 @@ import { appConfig } from "./config.js";
 import { handleLineCommand } from "./commands/index.js";
 import type { OutgoingImage, OutgoingMention, ReplyableLineMessage } from "./commands/shared.js";
 import { handleSearchPageReply } from "./commands/searchPages.js";
+import { handleLogTargetSelectionReply } from "./commands/log.js";
 import { handlePing } from "./handlers/ping.js";
 import { createLineClient, isAuthenticationError } from "./lineClient.js";
 import { startEventPushScheduler } from "./eventPush/scheduler.js";
@@ -201,6 +202,7 @@ async function handleSquareMessage(client: Client, message: SquareMessage): Prom
 	if (typeof message.text !== "string") return;
 	if (shouldIgnoreStoppedText(message.text, target)) return;
 	if (!message.text.startsWith(appConfig.commandPrefix)) {
+		if (await handleLogTargetSelectionReply(message.text, target)) return;
 		await handleSearchPageReply(message.text, target);
 		return;
 	}
@@ -551,6 +553,7 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 	recordTalkMessage(raw, target.destination, parsed);
 	if (shouldIgnoreStoppedText(parsed.text, target)) return;
 	if (!parsed.text.startsWith(appConfig.commandPrefix)) {
+		if (await handleLogTargetSelectionReply(parsed.text, target)) return;
 		await handleSearchPageReply(parsed.text, target);
 		return;
 	}
