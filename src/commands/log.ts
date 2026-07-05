@@ -82,6 +82,8 @@ interface ResolvedTarget {
 
 const MAX_LOG_ROWS = 1000;
 const LOG_PAGE_SIZE = 20;
+const DEFAULT_LOG_LOOKBACK_DAYS = 30;
+const DEFAULT_LOG_LOOKBACK_MS = DEFAULT_LOG_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
 let activeMessageLogSync: Promise<string> | undefined;
 let messageLogSyncRequested = false;
 
@@ -134,6 +136,47 @@ function formatLogTime(createdAt: number): string {
 	const hh = String(date.getUTCHours()).padStart(2, "0");
 	const min = String(date.getUTCMinutes()).padStart(2, "0");
 	return `${yy}/${mm}/${dd}/${hh}:${min}`;
+}
+
+function formatLogDate(createdAt: number): string {
+	const date = new Date(createdAt + 9 * 60 * 60 * 1000);
+	const yy = String(date.getUTCFullYear()).slice(-2);
+	const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
+	const dd = String(date.getUTCDate()).padStart(2, "0");
+	return `${yy}/${mm}/${dd}`;
+}
+
+function isAllSearchToken(value: string): boolean {
+	return value.toLowerCase() === "all" || value.toLowerCase() === "--all";
+}
+
+function splitLogSearchArgs(args: string[]): { all: boolean; args: string[] } {
+	let all = false;
+	const filtered: string[] = [];
+	for (const arg of args) {
+		if (isAllSearchToken(arg)) {
+			all = true;
+			continue;
+		}
+		filtered.push(arg);
+	}
+	return { all, args: filtered };
+}
+
+async function dismissProgressMessage(message: Parameters<LineCommand["execute"]>[0]["message"], messageId?: string): Promise<void> {
+	if (!messageId) return;
+	try {
+		if (message.destination.kind === "square") {
+			await message.client.base.square.destroyMessage({
+				squareChatMid: message.destination.chatMid,
+				messageId,
+			});
+			return;
+		}
+		await message.client.base.talk.unsendMessage({ messageId });
+	} catch (error) {
+		console.warn(`[log] progress message cleanup failed for ${messageId}`, error);
+	}
 }
 
 function contentTypeLabel(contentType: string | number | undefined, hasContent: boolean | undefined): string {
@@ -894,9 +937,11 @@ export const logCommand: LineCommand = {
 		if (args[0]?.toLowerCase() === "help") {
 			await message.send([
 				"!log <検索語>",
-				"  このトーク全体から検索語を含む発言を表示します。",
+				"  このトークの直近30日から検索語を含む発言を表示します。",
 				"!log <検索語> <メンバー名>",
-				"  その人の発言から検索語を含むものだけ表示します。",
+				"  その人の直近30日の発言から検索語を含むものだけ表示します。",
+				"!log <検索語> all",
+				"  全期間から検索します。重いので連打しないでください。",
 				"!log get",
 				"  このOpenChatの過去履歴をゆっくり保存します。",
 				"!log sync",
@@ -983,13 +1028,14 @@ export const logCommand: LineCommand = {
 			return;
 		}
 
-		const query = args[0]?.trim();
+		const parsedSearch = splitLogSearchArgs(args);
+		const query = parsedSearch.args[0]?.trim();
 		if (!query) {
 			await message.send("検索語を指定してください。\n使い方: !log <検索語> [メンバー名]");
 			return;
 		}
 
-		const targetNameArgs = args.slice(1);
+		const targetNameArgs = parsedSearch.args.slice(1);
 		if (mentionedMid || targetNameArgs.length > 0) {
 			if (message.destination.kind !== "square") {
 				await message.send("名前指定の!log検索はOpenChatでのみ使用できます。");
@@ -1013,19 +1059,46 @@ export const logCommand: LineCommand = {
 			}
 		}
 
-		const rows = await messageLogStore.search(message.destination, query, target?.mid, MAX_LOG_ROWS);
-		if (rows.length === 0) {
-			await message.send(target
-				? `${target.name} の「${query}」を含む発言は保存済みログに見つかりませんでした。`
-				: `このトークで「${query}」を含む発言は保存済みログに見つかりませんでした。`);
-			return;
+		const sinceCreatedAt = parsedSearch.all ? undefined : Date.now() - DEFAULT_LOG_LOOKBACK_MS;
+		let progressMessageId: string | undefined;
+		if (parsedSearch.all) {
+			progressMessageId = await message.send([
+				"全期間検索を開始します。",
+				"ログ量によってはかなり重くなります。連打しないでください。",
+				"探索中...",
+			].join("\n"));
 		}
+		try {
+			const rows = await messageLogStore.search(message.destination, query, {
+				senderMid: target?.mid,
+				limit: MAX_LOG_ROWS,
+				sinceCreatedAt,
+			});
+			await dismissProgressMessage(message, progressMessageId);
+			if (rows.length === 0) {
+				const scopeText = parsedSearch.all
+					? "全期間"
+					: `直近${DEFAULT_LOG_LOOKBACK_DAYS}日 (${formatLogDate(sinceCreatedAt ?? Date.now())}以降)`;
+				await message.send(target
+					? `${target.name} の「${query}」を含む発言は${scopeText}の保存済みログに見つかりませんでした。`
+					: `このトークで「${query}」を含む発言は${scopeText}の保存済みログに見つかりませんでした。`);
+				return;
+			}
 
-		await sendSearchResults(
-			message,
-			target ? `${target.name} log "${query}"` : `talk log "${query}"`,
-			formatStoredRows(rows, !target),
-			LOG_PAGE_SIZE,
-		);
+			const title = [
+				target ? `${target.name} log "${query}"` : `talk log "${query}"`,
+				parsedSearch.all ? "全期間" : `直近${DEFAULT_LOG_LOOKBACK_DAYS}日`,
+				rows.length >= MAX_LOG_ROWS ? `最大${MAX_LOG_ROWS}件` : "",
+			].filter(Boolean).join(" / ");
+			await sendSearchResults(
+				message,
+				title,
+				formatStoredRows(rows, !target),
+				LOG_PAGE_SIZE,
+			);
+		} catch (error) {
+			await dismissProgressMessage(message, progressMessageId);
+			await message.send(`ログ検索に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+		}
 	},
 };

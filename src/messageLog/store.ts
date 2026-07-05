@@ -78,6 +78,12 @@ export interface MessageLogChatSummary {
 	autoHistory?: MessageLogAutoHistoryState;
 }
 
+export interface MessageLogSearchOptions {
+	senderMid?: string;
+	limit?: number;
+	sinceCreatedAt?: number;
+}
+
 interface StoredChat {
 	kind: "talk" | "square";
 	chatMid: string;
@@ -577,24 +583,28 @@ class MessageLogStore {
 	async search(
 		destination: Pick<LineDestination, "kind" | "chatMid">,
 		query: string,
-		senderMid?: string,
-		limit = 1000,
+		options: MessageLogSearchOptions = {},
 	): Promise<StoredMessageLog[]> {
 		const chat = this.chatsByKey.get(chatKey(destination));
 		const manifestChat = this.manifestChatsByKey.get(chatKey(destination));
 		if (!chat && !manifestChat) return [];
+		const senderMid = options.senderMid;
+		const limit = options.limit ?? 1000;
+		const sinceCreatedAt = options.sinceCreatedAt;
 		const normalizedQuery = normalizeText(query);
 		const rows: StoredMessageLog[] = [];
 		const seen = new Set<string>();
 		const consider = (message: StoredMessageLog) => {
 			if (seen.has(message.id)) return;
 			seen.add(message.id);
+			if (sinceCreatedAt !== undefined && message.createdAt < sinceCreatedAt) return;
 			if (senderMid && message.senderMid !== senderMid) return;
 			if (!normalizeText(message.content).includes(normalizedQuery)) return;
 			rows.push({ ...message });
 		};
 
 		for (const message of sortMessagesDesc(chat?.messages ?? [])) {
+			if (sinceCreatedAt !== undefined && message.createdAt < sinceCreatedAt) break;
 			consider(message);
 			if (rows.length >= limit) return rows;
 		}
@@ -602,9 +612,11 @@ class MessageLogStore {
 		const parts = [...(manifestChat?.parts ?? [])]
 			.sort((left, right) => (right.lastCreatedAt ?? 0) - (left.lastCreatedAt ?? 0));
 		for (const part of parts) {
+			if (sinceCreatedAt !== undefined && part.lastCreatedAt !== undefined && part.lastCreatedAt < sinceCreatedAt) break;
 			const file = await this.readPartFile(part.path, manifestChat);
 			if (!file) continue;
 			for (const message of sortMessagesDesc(file.messages)) {
+				if (sinceCreatedAt !== undefined && message.createdAt < sinceCreatedAt) break;
 				consider(message);
 				if (rows.length >= limit) return rows;
 			}
