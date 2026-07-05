@@ -12,6 +12,10 @@ export interface GithubTextFile {
 }
 
 export class GithubContentsClient {
+	private mutationQueue: Promise<void> = Promise.resolve();
+	private lastMutationFinishedAt = 0;
+	private queuedMutations = 0;
+
 	get enabled(): boolean {
 		return Boolean(
 			appConfig.pushSubscriptionsGithubRepo && appConfig.pushSubscriptionsGithubToken,
@@ -49,6 +53,27 @@ export class GithubContentsClient {
 	}
 
 	async write(
+		filePath: string,
+		content: string,
+		message: string,
+		sha?: string,
+	): Promise<string | undefined> {
+		return await this.enqueueMutation(`write:${filePath}`, async () =>
+			await this.writeNow(filePath, content, message, sha)
+		);
+	}
+
+	async delete(filePath: string, message: string, sha: string): Promise<void> {
+		await this.enqueueMutation(`delete:${filePath}`, async () => {
+			await this.deleteNow(filePath, message, sha);
+		});
+	}
+
+	get pendingMutationCount(): number {
+		return this.queuedMutations;
+	}
+
+	private async writeNow(
 		filePath: string,
 		content: string,
 		message: string,
@@ -94,7 +119,7 @@ export class GithubContentsClient {
 		});
 	}
 
-	async delete(filePath: string, message: string, sha: string): Promise<void> {
+	private async deleteNow(filePath: string, message: string, sha: string): Promise<void> {
 		const response = await fetch(this.url(filePath), {
 			method: "DELETE",
 			headers: { ...this.headers(), "Content-Type": "application/json" },
@@ -109,6 +134,41 @@ export class GithubContentsClient {
 			const detail = await response.text();
 			throw new Error(`GitHub delete failed: HTTP ${response.status} ${detail.slice(0, 300)}`);
 		}
+	}
+
+	private async enqueueMutation<T>(label: string, operation: () => Promise<T>): Promise<T> {
+		this.queuedMutations += 1;
+		let release!: () => void;
+		const turn = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const previous = this.mutationQueue;
+		this.mutationQueue = previous.then(() => turn, () => turn);
+		try {
+			await previous.catch(() => {});
+			await this.waitForMutationInterval();
+			const startedAt = Date.now();
+			try {
+				const result = await operation();
+				const elapsedMs = Date.now() - startedAt;
+				if (elapsedMs >= 5_000 || this.queuedMutations > 1) {
+					console.log(`[github] ${label} completed in ${elapsedMs}ms queue=${Math.max(0, this.queuedMutations - 1)}`);
+				}
+				return result;
+			} finally {
+				this.lastMutationFinishedAt = Date.now();
+			}
+		} finally {
+			this.queuedMutations = Math.max(0, this.queuedMutations - 1);
+			release();
+		}
+	}
+
+	private async waitForMutationInterval(): Promise<void> {
+		const intervalMs = Math.max(0, appConfig.githubContentsWriteIntervalMs);
+		if (intervalMs === 0 || this.lastMutationFinishedAt === 0) return;
+		const waitMs = intervalMs - (Date.now() - this.lastMutationFinishedAt);
+		if (waitMs > 0) await this.sleep(waitMs);
 	}
 
 	private url(filePath: string): string {

@@ -56,6 +56,7 @@ export interface MessageLogFlushResult {
 	remoteFiles: number;
 	remoteEnabled: boolean;
 	remoteSkipped: boolean;
+	remotePending: number;
 }
 
 export interface MessageLogAutoHistoryState {
@@ -730,6 +731,7 @@ class MessageLogStore {
 				remoteFiles,
 				remoteEnabled: githubContentsClient.enabled,
 				remoteSkipped,
+				remotePending: this.pendingRemotePaths.size,
 			};
 		});
 		this.saveQueue = operation.then(() => undefined).catch((error) => {
@@ -742,6 +744,10 @@ class MessageLogStore {
 
 	async checkpointLocal(): Promise<void> {
 		await this.persistLocalDirty();
+	}
+
+	pendingRemoteCount(): number {
+		return this.pendingRemotePaths.size;
 	}
 
 	async flushLocalOnly(): Promise<number> {
@@ -972,11 +978,15 @@ class MessageLogStore {
 		let written = 0;
 		let nonManifestFailed = false;
 		const errors: string[] = [];
-		const paths = [...this.pendingRemotePaths].sort((left, right) => {
-			if (left === "manifest.json") return 1;
-			if (right === "manifest.json") return -1;
-			return left.localeCompare(right);
-		});
+		const maxFiles = Math.max(1, appConfig.messageLogRemoteFlushMaxFiles);
+		const nonManifestPaths = [...this.pendingRemotePaths]
+			.filter((item) => item !== "manifest.json")
+			.sort((left, right) => left.localeCompare(right));
+		const paths = nonManifestPaths.slice(0, maxFiles);
+		const canWriteManifest = this.pendingRemotePaths.has("manifest.json") &&
+			nonManifestPaths.length <= paths.length &&
+			paths.length < maxFiles;
+		if (canWriteManifest) paths.push("manifest.json");
 		for (const relativePath of paths) {
 			if (relativePath === "manifest.json" && nonManifestFailed) continue;
 			try {

@@ -102,6 +102,7 @@ export const appConfig = {
 	messageLogBackfillDelayMs: Number(process.env.MESSAGE_LOG_BACKFILL_DELAY_MS || 1_500),
 	messageLogBackfillLocalFlushPages: Number(process.env.MESSAGE_LOG_BACKFILL_LOCAL_FLUSH_PAGES || 2),
 	messageLogBackfillRemoteFlushPages: Number(process.env.MESSAGE_LOG_BACKFILL_REMOTE_FLUSH_PAGES || 2),
+	messageLogRemoteFlushMaxFiles: Number(process.env.MESSAGE_LOG_REMOTE_FLUSH_MAX_FILES || 8),
 	messageLogPartMaxBytes: Number(process.env.MESSAGE_LOG_PART_MAX_BYTES || 5 * 1024 * 1024),
 	messageLogAutoFlushMs: Number(process.env.MESSAGE_LOG_AUTO_FLUSH_MS || 120_000),
 	messageLogAutoHistoryEnabled: boolEnv("MESSAGE_LOG_AUTO_HISTORY_ENABLED", true),
@@ -112,6 +113,7 @@ export const appConfig = {
 	messageLogAutoHistoryRecentPages: Number(process.env.MESSAGE_LOG_AUTO_HISTORY_RECENT_PAGES || 2),
 	messageLogAutoHistoryBackfillPages: Number(process.env.MESSAGE_LOG_AUTO_HISTORY_BACKFILL_PAGES || 3),
 	githubContentsTimeoutMs: Number(process.env.GITHUB_CONTENTS_TIMEOUT_MS || 60_000),
+	githubContentsWriteIntervalMs: Number(process.env.GITHUB_CONTENTS_WRITE_INTERVAL_MS || 1_000),
 };
 
 export function getPasswordCredentials(): { email: string; password: string } {

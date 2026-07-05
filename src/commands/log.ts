@@ -1566,19 +1566,37 @@ function formatMessageLogSyncResult(result: MessageLogFlushResult): string {
 		return [
 			"ログのGitHub同期は保留されました。",
 			`ローカル保存: ${result.localFiles}ファイル`,
+			`GitHub未同期: ${result.remotePending}ファイル`,
 		].join("\n");
 	}
+	const title = result.remotePending > 0
+		? "ログのGitHub同期を小分けで進めました。"
+		: "ログのGitHub同期が完了しました。";
 	return [
-		"ログのGitHub同期が完了しました。",
+		title,
 		`GitHub保存: ${result.remoteFiles}ファイル`,
+		`GitHub未同期: ${result.remotePending}ファイル`,
 		`ローカル保存: ${result.localFiles}ファイル`,
 	].join("\n");
 }
 
 async function syncMessageLogToGitHub(): Promise<string> {
-	const logResult = await messageLogStore.flush();
+	let logResult = await messageLogStore.flush();
+	const totalResult: MessageLogFlushResult = { ...logResult };
+	let batches = 1;
+	while (logResult.remoteEnabled && !logResult.remoteSkipped && logResult.remotePending > 0) {
+		await sleep(Math.max(250, appConfig.githubContentsWriteIntervalMs));
+		logResult = await messageLogStore.flush();
+		totalResult.localFiles += logResult.localFiles;
+		totalResult.remoteFiles += logResult.remoteFiles;
+		totalResult.remoteEnabled = logResult.remoteEnabled;
+		totalResult.remoteSkipped = logResult.remoteSkipped;
+		totalResult.remotePending = logResult.remotePending;
+		batches += 1;
+	}
 	await memberNameHistoryStore.flush();
-	return formatMessageLogSyncResult(logResult);
+	const text = formatMessageLogSyncResult(totalResult);
+	return batches > 1 ? `${text}\n同期バッチ: ${batches}回` : text;
 }
 
 function queueMessageLogSync(): { started: boolean; promise: Promise<string> } {
