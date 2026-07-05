@@ -40,6 +40,7 @@ interface SquareHistoryEvent {
 		notifiedKickoutFromSquare?: { kickees?: SquareHistoryMember[] };
 		notifiedUpdateSquareMemberProfile?: { squareMember?: SquareHistoryMember };
 		notifiedUpdateSquareMember?: { squareMember?: SquareHistoryMember };
+		notificationMessage?: SquareHistoryMessagePayload;
 	};
 }
 
@@ -93,6 +94,7 @@ interface MemberRefreshRecord {
 interface MemberRefreshResult {
 	chatMembers: number;
 	directoryMembers: number;
+	directResolved: number;
 	updated: number;
 	unnamed: number;
 	localFiles: number;
@@ -105,6 +107,8 @@ const LOG_PAGE_SIZE = 10;
 const DEFAULT_LOG_LOOKBACK_DAYS = 30;
 const DEFAULT_LOG_LOOKBACK_MS = DEFAULT_LOG_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
 const LOG_TARGET_SELECTION_EXPIRES_MS = 10 * 60_000;
+const LOG_DIRECT_NAME_RESOLVE_LIMIT = 200;
+const LOG_DIRECT_NAME_CACHE_MS = 60 * 60_000;
 let activeMessageLogSync: Promise<string> | undefined;
 let messageLogSyncRequested = false;
 
@@ -119,6 +123,7 @@ interface LogTargetSelectionSession {
 
 const targetSelectionSessions = new Map<string, LogTargetSelectionSession>();
 const recentTargetSelectionSessions = new Map<string, LogTargetSelectionSession>();
+const directNameCache = new Map<string, { name: string; expiresAt: number }>();
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -203,12 +208,13 @@ function looksLikeUserMid(value: string): boolean {
 function cleanDisplayName(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();
 	if (!trimmed || looksLikeUserMid(trimmed)) return undefined;
+	if (["(名前なし)", "名前なし", "名前不明", "(取得失敗)", "取得失敗"].includes(trimmed)) return undefined;
 	if (!/[0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]/.test(trimmed)) return undefined;
 	return trimmed;
 }
 
-function displayNameOrUnknown(value: string | undefined): string {
-	return cleanDisplayName(value) ?? "名前不明";
+function displayNameOrMid(value: string | undefined, mid: string): string {
+	return cleanDisplayName(value) ?? mid;
 }
 
 function destinationKey(message: ReplyableLineMessage): string {
@@ -233,7 +239,7 @@ function formatTargetSelectionPrompt(query: string, candidates: MemberInfo[]): s
 	return [
 		`「${query}」の対象候補`,
 		...candidates.slice(0, 10).map((member, index) =>
-			`${index + 1}. ${displayNameOrUnknown(member.name)}\nMID: ${member.mid}`
+			`${index + 1}. ${displayNameOrMid(member.name, member.mid)}\nMID: ${member.mid}`
 		),
 		"",
 		"対象番号をこのメッセージに返信してください。",
@@ -331,8 +337,33 @@ function formatContent(payload: SquareHistoryMessagePayload): string {
 	return text || "(本文なし)";
 }
 
+function eventMessagePayload(event: SquareHistoryEvent): SquareHistoryMessagePayload | undefined {
+	return event.payload?.receiveMessage ?? event.payload?.sendMessage ?? event.payload?.notificationMessage;
+}
+
+function notificationTextFromEvent(event: SquareHistoryEvent): string | undefined {
+	return event.payload?.notificationMessage?.squareMessage?.message?.text?.replace(/\s+/g, " ").trim();
+}
+
+function nameFromLeaveNotification(event: SquareHistoryEvent): string | undefined {
+	const text = notificationTextFromEvent(event);
+	if (!text) return undefined;
+	const patterns = [
+		/^(.+?)(?:さん)?が(?:退会|退出|退室)しました[。.]?$/,
+		/^(.+?)(?:さん)?が(?:トーク|OpenChat|オープンチャット)から(?:退会|退出|退室)しました[。.]?$/,
+		/^(.+?) left (?:the )?(?:chat|openchat|open chat)[.]?$/i,
+		/^(.+?) has left (?:the )?(?:chat|openchat|open chat)[.]?$/i,
+	];
+	for (const pattern of patterns) {
+		const match = text.match(pattern);
+		const name = cleanDisplayName(match?.[1]);
+		if (name) return name;
+	}
+	return undefined;
+}
+
 function logEntryFromEvent(event: SquareHistoryEvent, targetMid: string, filter: string): LogEntry | undefined {
-	const payload = event.payload?.receiveMessage ?? event.payload?.sendMessage;
+	const payload = eventMessagePayload(event);
 	const message = payload?.squareMessage?.message;
 	if (!message || message.from !== targetMid) return undefined;
 	const content = formatContent(payload);
@@ -343,7 +374,7 @@ function logEntryFromEvent(event: SquareHistoryEvent, targetMid: string, filter:
 }
 
 function messageLogFromEvent(destination: LineDestination, event: SquareHistoryEvent): StoredMessageLog | undefined {
-	const payload = event.payload?.receiveMessage ?? event.payload?.sendMessage;
+	const payload = eventMessagePayload(event);
 	if (!payload) return undefined;
 	const message = payload?.squareMessage?.message;
 	if (!message?.from) return undefined;
@@ -388,8 +419,9 @@ function recordMessageLogsFromEvents(destination: LineDestination, events: Squar
 function eventMembers(event: SquareHistoryEvent): MemberInfo[] {
 	const members: MemberInfo[] = [];
 	const add = (member: SquareHistoryMember | undefined) => {
-		if (member?.squareMemberMid?.startsWith("p") && member.displayName) {
-			members.push({ mid: member.squareMemberMid, name: member.displayName });
+		const name = cleanDisplayName(member?.displayName);
+		if (member?.squareMemberMid?.startsWith("p") && name) {
+			members.push({ mid: member.squareMemberMid, name });
 		}
 	};
 	add(event.payload?.notifiedCreateSquareMember?.squareMember);
@@ -400,23 +432,34 @@ function eventMembers(event: SquareHistoryEvent): MemberInfo[] {
 	add(event.payload?.notifiedUpdateSquareMember?.squareMember);
 	for (const member of event.payload?.notifiedKickoutFromSquare?.kickees ?? []) add(member);
 
-	const messagePayload = event.payload?.receiveMessage ?? event.payload?.sendMessage;
+	const leftMemberMid = event.payload?.notifiedLeaveSquareChat?.squareMemberMid;
+	const leftMemberName = nameFromLeaveNotification(event);
+	if (leftMemberMid?.startsWith("p") && leftMemberName) {
+		members.push({ mid: leftMemberMid, name: leftMemberName });
+	}
+
+	const messagePayload = eventMessagePayload(event);
 	const messageMid = messagePayload?.squareMessage?.message?.from;
-	if (messageMid?.startsWith("p") && messagePayload?.senderDisplayName) {
-		members.push({ mid: messageMid, name: messagePayload.senderDisplayName });
+	const messageSenderName = cleanDisplayName(messagePayload?.senderDisplayName);
+	if (messageMid?.startsWith("p") && messageSenderName) {
+		members.push({ mid: messageMid, name: messageSenderName });
 	}
 
 	return members;
 }
 
-function eventMemberProfiles(event: SquareHistoryEvent): Array<MemberInfo & {
+function eventMemberProfiles(event: SquareHistoryEvent): Array<{
+	mid: string;
+	name?: string;
 	state: StoredMemberState;
 	role?: string;
 	seenAt?: number;
 	source: string;
 	extra?: Record<string, unknown>;
 }> {
-	const profiles: Array<MemberInfo & {
+	const profiles: Array<{
+		mid: string;
+		name?: string;
 		state: StoredMemberState;
 		role?: string;
 		seenAt?: number;
@@ -434,7 +477,7 @@ function eventMemberProfiles(event: SquareHistoryEvent): Array<MemberInfo & {
 		if (!member?.squareMemberMid?.startsWith("p")) return;
 		profiles.push({
 			mid: member.squareMemberMid,
-			name: member.displayName || "(名前なし)",
+			name: cleanDisplayName(member.displayName),
 			state,
 			role: member.role === undefined ? undefined : String(member.role),
 			seenAt: Number(member.createdAt) > 0 ? Number(member.createdAt) : seenAt,
@@ -457,12 +500,24 @@ function eventMemberProfiles(event: SquareHistoryEvent): Array<MemberInfo & {
 		add(member, "KICK_OUT", "kickoutFromSquare");
 	}
 
-	const messagePayload = event.payload?.receiveMessage ?? event.payload?.sendMessage;
+	const leftMemberMid = event.payload?.notifiedLeaveSquareChat?.squareMemberMid;
+	if (leftMemberMid?.startsWith("p")) {
+		profiles.push({
+			mid: leftMemberMid,
+			name: nameFromLeaveNotification(event),
+			state: "LEFT",
+			seenAt,
+			source: "leaveSquareChatNotification",
+			extra: { notificationText: notificationTextFromEvent(event) },
+		});
+	}
+
+	const messagePayload = eventMessagePayload(event);
 	const message = messagePayload?.squareMessage?.message;
 	if (message?.from?.startsWith("p")) {
 		profiles.push({
 			mid: message.from,
-			name: messagePayload?.senderDisplayName || "(名前なし)",
+			name: cleanDisplayName(messagePayload?.senderDisplayName),
 			state: "JOINED",
 			seenAt: Number(message.createdTime) > 0 ? Number(message.createdTime) : seenAt,
 			source: "message",
@@ -547,6 +602,75 @@ function addMemberRefreshRecord(
 	return true;
 }
 
+function directNameCacheKey(scopeMid: string, mid: string): string {
+	return `${scopeMid}:${mid}`;
+}
+
+function cachedDirectName(scopeMid: string, mid: string): string | undefined {
+	const cached = directNameCache.get(directNameCacheKey(scopeMid, mid));
+	if (!cached) return undefined;
+	if (cached.expiresAt <= Date.now()) {
+		directNameCache.delete(directNameCacheKey(scopeMid, mid));
+		return undefined;
+	}
+	return cached.name;
+}
+
+function setCachedDirectName(scopeMid: string, mid: string, name: string): void {
+	directNameCache.set(directNameCacheKey(scopeMid, mid), {
+		name,
+		expiresAt: Date.now() + LOG_DIRECT_NAME_CACHE_MS,
+	});
+}
+
+async function resolveSquareMemberNamesDirect(
+	client: Client,
+	destination: LineDestination,
+	mids: string[],
+): Promise<Map<string, string>> {
+	if (destination.kind !== "square") return new Map();
+	const uniqueMids = [...new Set(mids)]
+		.filter((mid) => mid.startsWith("p"))
+		.slice(0, LOG_DIRECT_NAME_RESOLVE_LIMIT);
+	const resolved = new Map<string, string>();
+	for (const mid of uniqueMids) {
+		const cached = cachedDirectName(destination.scopeMid, mid);
+		if (cached) {
+			resolved.set(mid, cached);
+			continue;
+		}
+		try {
+			const response = await client.base.square.getSquareMember({ squareMemberMid: mid });
+			const member = response.squareMember;
+			if (member.squareMid && member.squareMid !== destination.scopeMid) continue;
+			const name = cleanDisplayName(member.displayName);
+			if (!name) continue;
+			resolved.set(mid, name);
+			setCachedDirectName(destination.scopeMid, mid, name);
+			memberNameHistoryStore.record("square", destination.scopeMid, mid, name);
+			messageLogStore.recordMember({
+				kind: "square",
+				chatMid: destination.chatMid,
+				scopeMid: destination.scopeMid,
+				chatType: "SQUARE",
+				mid,
+				name,
+				state: memberStateFromRaw(member.membershipState, "UNKNOWN"),
+				role: member.role === undefined ? undefined : String(member.role),
+				seenAt: memberCreatedAt(member.createdAt),
+				source: "directGetSquareMember",
+				extra: {
+					...(member.squareMid ? { squareMid: member.squareMid } : {}),
+					...(member.membershipState === undefined ? {} : { membershipState: String(member.membershipState) }),
+				},
+			});
+		} catch (error) {
+			console.warn(`[log] direct member name resolve failed for ${mid}`, error);
+		}
+	}
+	return resolved;
+}
+
 async function refreshSquareMemberJson(
 	client: Client,
 	destination: LineDestination,
@@ -556,6 +680,7 @@ async function refreshSquareMemberJson(
 	const errors: string[] = [];
 	let chatMembers = 0;
 	let directoryMembers = 0;
+	let directResolved = 0;
 
 	try {
 		const squareChat = await client.getSquareChat(destination.chatMid);
@@ -567,35 +692,50 @@ async function refreshSquareMemberJson(
 	}
 
 	try {
-		let continuationToken: string | undefined;
-		for (let page = 0; page < 1000; page++) {
-			const response = await client.base.square.searchSquareMembers({
-				request: {
-					squareMid: destination.scopeMid,
-					searchOption: {
-						membershipState: "JOINED",
-						memberRoles: [],
-						displayName: "",
-						ableToReceiveMessage: "NONE",
-						ableToReceiveFriendRequest: "NONE",
-						chatMidToExcludeMembers: "",
-						includingMe: true,
-						excludeBlockedMembers: false,
-						includingMeOnlyMatch: false,
+		const states: SquareMembershipState[] = ["JOINED", "LEFT", "KICK_OUT", "BANNED"];
+		for (const state of states) {
+			let continuationToken: string | undefined;
+			for (let page = 0; page < 1000; page++) {
+				const response = await client.base.square.searchSquareMembers({
+					request: {
+						squareMid: destination.scopeMid,
+						searchOption: {
+							membershipState: state,
+							memberRoles: [],
+							displayName: "",
+							ableToReceiveMessage: "NONE",
+							ableToReceiveFriendRequest: "NONE",
+							chatMidToExcludeMembers: "",
+							includingMe: true,
+							excludeBlockedMembers: false,
+							includingMeOnlyMatch: false,
+						},
+						continuationToken,
+						limit: 100,
 					},
-					continuationToken,
-					limit: 100,
-				},
-			});
-			for (const member of response.members) {
-				if (addMemberRefreshRecord(records, member, "manualSquareMembers", "JOINED")) directoryMembers += 1;
+				});
+				for (const member of response.members) {
+					if (addMemberRefreshRecord(records, member, `manualSquareMembers:${state}`, state)) directoryMembers += 1;
+				}
+				continuationToken = response.continuationToken || undefined;
+				if (!continuationToken || response.members.length === 0) break;
+				await sleep(80);
 			}
-			continuationToken = response.continuationToken || undefined;
-			if (!continuationToken || response.members.length === 0) break;
-			await sleep(80);
 		}
 	} catch (error) {
 		errors.push(`square directory: ${error instanceof Error ? error.message : String(error)}`);
+	}
+
+	const unnamedMids = [...records.values()]
+		.filter((member) => !member.name)
+		.map((member) => member.mid);
+	if (unnamedMids.length > 0) {
+		const directNames = await resolveSquareMemberNamesDirect(client, destination, unnamedMids);
+		directResolved = directNames.size;
+		for (const [mid, name] of directNames) {
+			const member = records.get(mid);
+			if (member) member.name = name;
+		}
 	}
 
 	for (const member of records.values()) {
@@ -624,6 +764,7 @@ async function refreshSquareMemberJson(
 	return {
 		chatMembers,
 		directoryMembers,
+		directResolved,
 		updated: records.size,
 		unnamed: [...records.values()].filter((member) => !member.name).length,
 		localFiles,
@@ -673,7 +814,7 @@ async function searchSquareMembersByName(
 				for (const member of response.members) {
 					const info = {
 						mid: member.squareMemberMid,
-						name: member.displayName || "(名前なし)",
+						name: cleanDisplayName(member.displayName) ?? member.squareMemberMid,
 					};
 					memberNameHistoryStore.record("square", destination.scopeMid, info.mid, info.name);
 					messageLogStore.recordMember({
@@ -711,7 +852,7 @@ async function resolveMentionedMember(
 	mid: string,
 ): Promise<MemberInfo> {
 	const response = await client.base.square.getSquareMember({ squareMemberMid: mid });
-	const name = response.squareMember.displayName || "(名前なし)";
+	const name = cleanDisplayName(response.squareMember.displayName) ?? mid;
 	memberNameHistoryStore.record("square", destination.scopeMid, mid, name);
 	return { mid, name };
 }
@@ -916,8 +1057,36 @@ async function formatStoredRows(
 	const memberNames = includeSender
 		? await messageLogStore.getMemberNames(message.destination, rows.map((row) => row.senderMid))
 		: new Map<string, string>();
+	const historyNames = new Map<string, string>();
+	if (includeSender && message.destination.kind === "square") {
+		for (const row of rows) {
+			if (historyNames.has(row.senderMid)) continue;
+			const historyName = memberNameHistoryStore.get("square", message.destination.scopeMid, row.senderMid)[0]?.name;
+			const cleanHistoryName = cleanDisplayName(historyName);
+			if (cleanHistoryName) historyNames.set(row.senderMid, cleanHistoryName);
+		}
+	}
+	const unresolvedMids = includeSender && message.destination.kind === "square"
+		? rows
+			.filter((row) =>
+				row.senderMid.startsWith("p") &&
+				!cleanDisplayName(row.senderName) &&
+				!cleanDisplayName(memberNames.get(row.senderMid)) &&
+				!historyNames.has(row.senderMid)
+			)
+			.map((row) => row.senderMid)
+		: [];
+	const directNames = unresolvedMids.length > 0
+		? await resolveSquareMemberNamesDirect(message.client, message.destination, unresolvedMids)
+		: new Map<string, string>();
 	return rows.map((row) => {
-		const sender = displayNameOrUnknown(cleanDisplayName(row.senderName) ?? memberNames.get(row.senderMid));
+		const sender = displayNameOrMid(
+			cleanDisplayName(row.senderName) ??
+				cleanDisplayName(memberNames.get(row.senderMid)) ??
+				historyNames.get(row.senderMid) ??
+				directNames.get(row.senderMid),
+			row.senderMid,
+		);
 		return includeSender
 			? `${formatLogTime(row.createdAt)}:${sender}:${row.content}`
 			: `${formatLogTime(row.createdAt)}:${row.content}`;
@@ -945,13 +1114,13 @@ async function runLogSearch(
 				? "全期間"
 				: `直近${DEFAULT_LOG_LOOKBACK_DAYS}日 (${formatLogDate(sinceCreatedAt ?? Date.now())}以降)`;
 			await message.send(target
-				? `${displayNameOrUnknown(target.name)} の「${query}」を含む発言は${scopeText}の保存済みログに見つかりませんでした。`
+				? `${displayNameOrMid(target.name, target.mid)} の「${query}」を含む発言は${scopeText}の保存済みログに見つかりませんでした。`
 				: `このトークで「${query}」を含む発言は${scopeText}の保存済みログに見つかりませんでした。`);
 			return;
 		}
 
 		const title = [
-			target ? `${displayNameOrUnknown(target.name)} log "${query}"` : `talk log "${query}"`,
+			target ? `${displayNameOrMid(target.name, target.mid)} log "${query}"` : `talk log "${query}"`,
 			all ? "全期間" : `直近${DEFAULT_LOG_LOOKBACK_DAYS}日`,
 			rows.length >= MAX_LOG_ROWS ? `最大${MAX_LOG_ROWS}件` : "",
 		].filter(Boolean).join(" / ");
@@ -1298,8 +1467,9 @@ export const logCommand: LineCommand = {
 					"メンバーJSON更新が完了しました。",
 					`現在チャット取得: ${result.chatMembers}人`,
 					`OC全体取得: ${result.directoryMembers}人`,
+					`個別名前取得: ${result.directResolved}人`,
 					`保存/更新: ${result.updated}人`,
-					`名前不明: ${result.unnamed}人`,
+					`名前未取得: ${result.unnamed}人`,
 					`ローカル保存: ${result.localFiles}ファイル`,
 					result.syncStarted ? "GitHub同期: 開始しました" : "GitHub同期: 実行中の同期に追加しました",
 				];
@@ -1364,7 +1534,7 @@ export const logCommand: LineCommand = {
 				await sendSearchResults(
 					message,
 					"対象候補",
-					ambiguous.map((member) => `${displayNameOrUnknown(member.name)}\nMID: ${member.mid}`),
+					ambiguous.map((member) => `${displayNameOrMid(member.name, member.mid)}\nMID: ${member.mid}`),
 					LOG_PAGE_SIZE,
 				);
 				return;
@@ -1377,12 +1547,12 @@ export const logCommand: LineCommand = {
 			await memberNameHistoryStore.flush();
 			const entries = memberNameHistoryStore.get("square", message.destination.scopeMid, target.mid);
 			if (entries.length === 0) {
-				await message.send(`${displayNameOrUnknown(target.name)}\n過去の名前はまだ保存されていません。`);
+				await message.send(`${displayNameOrMid(target.name, target.mid)}\n過去の名前はまだ保存されていません。`);
 				return;
 			}
 			await sendSearchResults(
 				message,
-				`${displayNameOrUnknown(target.name)} 名前履歴`,
+				`${displayNameOrMid(target.name, target.mid)} 名前履歴`,
 				formatNameHistoryRows(entries),
 				LOG_PAGE_SIZE,
 			);

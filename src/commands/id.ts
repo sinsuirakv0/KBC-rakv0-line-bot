@@ -22,6 +22,7 @@ interface OldSearchEvent {
 		notifiedKickoutFromSquare?: { kickees?: OldSearchSquareMember[] };
 		notifiedUpdateSquareMemberProfile?: { squareMember?: OldSearchSquareMember };
 		notifiedUpdateSquareMember?: { squareMember?: OldSearchSquareMember };
+		notificationMessage?: OldSearchMessagePayload;
 	};
 }
 
@@ -37,6 +38,7 @@ interface OldSearchMessagePayload {
 	squareMessage?: {
 		message?: {
 			from?: string;
+			text?: string;
 		};
 	};
 }
@@ -107,6 +109,37 @@ function normalizeText(value: string): string {
 	return value.normalize("NFKC").toLowerCase();
 }
 
+function cleanDisplayName(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed || /^p[0-9a-f]{8,}$/i.test(trimmed)) return undefined;
+	if (["(名前なし)", "名前なし", "名前不明", "(取得失敗)", "取得失敗"].includes(trimmed)) return undefined;
+	if (!/[0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]/.test(trimmed)) return undefined;
+	return trimmed;
+}
+
+function eventMessagePayload(event: OldSearchEvent): OldSearchMessagePayload | undefined {
+	return event.payload?.receiveMessage ?? event.payload?.sendMessage ?? event.payload?.notificationMessage;
+}
+
+function notificationTextFromEvent(event: OldSearchEvent): string | undefined {
+	return event.payload?.notificationMessage?.squareMessage?.message?.text?.replace(/\s+/g, " ").trim();
+}
+
+function nameFromLeaveNotification(event: OldSearchEvent): string | undefined {
+	const text = notificationTextFromEvent(event);
+	if (!text) return undefined;
+	for (const pattern of [
+		/^(.+?)(?:さん)?が(?:退会|退出|退室)しました[。.]?$/,
+		/^(.+?)(?:さん)?が(?:トーク|OpenChat|オープンチャット)から(?:退会|退出|退室)しました[。.]?$/,
+		/^(.+?) left (?:the )?(?:chat|openchat|open chat)[.]?$/i,
+		/^(.+?) has left (?:the )?(?:chat|openchat|open chat)[.]?$/i,
+	]) {
+		const name = cleanDisplayName(text.match(pattern)?.[1]);
+		if (name) return name;
+	}
+	return undefined;
+}
+
 function compactSearchText(value: string): string {
 	return normalizeText(value).replace(/[\s\u3000\-_.・/\\()[\]{}「」『』【】!！?？~〜～、。，．,]/g, "");
 }
@@ -161,14 +194,14 @@ async function resolvePersonName(
 	try {
 		if (destination.kind === "square") {
 			const response = await client.base.square.getSquareMember({ squareMemberMid: mid });
-			return response.squareMember.displayName || "(名前なし)";
+			return cleanDisplayName(response.squareMember.displayName) ?? mid;
 		}
 
 		const user = await client.getUser(mid);
-		return userNameFromRaw(user.raw) || "(名前なし)";
+		return cleanDisplayName(userNameFromRaw(user.raw)) ?? mid;
 	} catch (error) {
 		console.warn(`[id] failed to resolve person name for ${mid}`, error);
-		return "(取得失敗)";
+		return mid;
 	}
 }
 
@@ -176,7 +209,7 @@ async function resolveTalkName(client: Client, destination: LineDestination): Pr
 	try {
 		if (destination.kind === "square") {
 			const squareChat = await client.getSquareChat(destination.chatMid);
-			return squareChat.name || "(名前なし)";
+			return cleanDisplayName(squareChat.name) ?? destination.chatMid;
 		}
 
 		if (destination.chatType === "USER") {
@@ -184,20 +217,20 @@ async function resolveTalkName(client: Client, destination: LineDestination): Pr
 		}
 
 		const chat = await client.getChat(destination.chatMid);
-		return chat.name || "(名前なし)";
+		return cleanDisplayName(chat.name) ?? destination.chatMid;
 	} catch (error) {
 		console.warn(`[id] failed to resolve talk name for ${destination.chatMid}`, error);
-		return "(取得失敗)";
+		return destination.chatMid;
 	}
 }
 
 async function resolveTalkMember(client: Client, mid: string): Promise<MemberInfo> {
 	try {
 		const user = await client.getUser(mid);
-		return { mid, name: userNameFromRaw(user.raw) || "(名前なし)" };
+		return { mid, name: cleanDisplayName(userNameFromRaw(user.raw)) ?? mid };
 	} catch (error) {
 		console.warn(`[id] failed to resolve talk member ${mid}`, error);
-		return { mid, name: "(取得失敗)" };
+		return { mid, name: mid };
 	}
 }
 
@@ -207,7 +240,7 @@ async function listMembers(client: Client, destination: LineDestination): Promis
 		const members = await squareChat.getMembers();
 		return members.map((member) => ({
 			mid: member.squareMemberMid,
-			name: member.displayName || "(名前なし)",
+			name: cleanDisplayName(member.displayName) ?? member.squareMemberMid,
 		}));
 	}
 
@@ -319,7 +352,7 @@ async function searchJoinedSquareMembers(
 			for (const member of response.members) {
 				const info = {
 					mid: member.squareMemberMid,
-					name: member.displayName || "(名前なし)",
+					name: cleanDisplayName(member.displayName) ?? member.squareMemberMid,
 				};
 				const includes = normalizeText(info.name).includes(normalizedQuery);
 				const loose = looseNameMatches(info.name, query);
@@ -347,7 +380,7 @@ function eventMember(event: OldSearchEvent): MemberInfo | undefined {
 	if (memberPayload?.squareMemberMid?.startsWith("p")) {
 		return {
 			mid: memberPayload.squareMemberMid,
-			name: memberPayload.displayName || "(名前なし)",
+			name: cleanDisplayName(memberPayload.displayName) ?? memberPayload.squareMemberMid,
 		};
 	}
 
@@ -355,7 +388,7 @@ function eventMember(event: OldSearchEvent): MemberInfo | undefined {
 	if (chatMemberMid?.startsWith("p")) {
 		return {
 			mid: chatMemberMid,
-			name: memberPayload?.displayName || "(名前なし)",
+			name: cleanDisplayName(memberPayload?.displayName) ?? chatMemberMid,
 		};
 	}
 
@@ -363,16 +396,16 @@ function eventMember(event: OldSearchEvent): MemberInfo | undefined {
 	if (leftMemberMid?.startsWith("p")) {
 		return {
 			mid: leftMemberMid,
-			name: "(名前なし)",
+			name: nameFromLeaveNotification(event) ?? leftMemberMid,
 		};
 	}
 
-	const payload = event.payload?.receiveMessage ?? event.payload?.sendMessage;
+	const payload = eventMessagePayload(event);
 	const mid = payload?.squareMessage?.message?.from;
 	if (!mid?.startsWith("p")) return undefined;
 	return {
 		mid,
-		name: payload?.senderDisplayName || "(名前なし)",
+		name: cleanDisplayName(payload?.senderDisplayName) ?? mid,
 	};
 }
 
@@ -485,12 +518,12 @@ async function searchSquareMemberDirectory(
 		try {
 			const response = await client.base.square.getSquareMember({ squareMemberMid: mentionedMid });
 			debug?.add(
-				`getSquareMember result squareMid=${response.squareMember.squareMid} name="${response.squareMember.displayName || "(名前なし)"}"`,
+				`getSquareMember result squareMid=${response.squareMember.squareMid} name="${cleanDisplayName(response.squareMember.displayName) ?? response.squareMember.squareMemberMid}"`,
 			);
 			if (response.squareMember.squareMid === destination.scopeMid) {
 				return {
 					mid: response.squareMember.squareMemberMid,
-					name: response.squareMember.displayName || "(名前なし)",
+					name: cleanDisplayName(response.squareMember.displayName) ?? response.squareMember.squareMemberMid,
 				};
 			}
 		} catch (error) {
@@ -540,7 +573,7 @@ async function searchSquareMemberDirectory(
 				for (const member of response.members) {
 					const info = {
 						mid: member.squareMemberMid,
-						name: member.displayName || "(名前なし)",
+						name: cleanDisplayName(member.displayName) ?? member.squareMemberMid,
 					};
 					const includes = normalizeText(info.name).includes(normalizedQuery);
 					const loose = looseNameMatches(info.name, query);

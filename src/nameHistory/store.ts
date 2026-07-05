@@ -43,6 +43,14 @@ function nowIso(time = Date.now()): string {
 	return new Date(time).toISOString();
 }
 
+function cleanStoredName(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed) return undefined;
+	if (/^[up][0-9a-f]{8,}$/i.test(trimmed)) return undefined;
+	if (["(名前なし)", "名前なし", "名前不明", "(取得失敗)", "取得失敗"].includes(trimmed)) return undefined;
+	return trimmed;
+}
+
 function parseHistory(value: unknown): NameHistoryFile {
 	if (!value || typeof value !== "object") return structuredClone(EMPTY_HISTORY);
 	const raw = value as Partial<NameHistoryFile>;
@@ -109,7 +117,7 @@ class MemberNameHistoryStore {
 		name: string | undefined,
 		seenAt = Date.now(),
 	): void {
-		const normalizedName = name?.trim();
+		const normalizedName = cleanStoredName(name);
 		if (!normalizedName || !mid || !scopeMid) return;
 		const seenIso = nowIso(seenAt);
 		let user = this.data.users.find((item) => keyOf(item) === `${kind}:${scopeMid}:${mid}`);

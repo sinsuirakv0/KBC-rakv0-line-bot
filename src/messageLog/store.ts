@@ -177,6 +177,14 @@ function normalizeText(value: string): string {
 	return value.normalize("NFKC").toLowerCase();
 }
 
+function cleanMemberName(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed) return undefined;
+	if (/^[up][0-9a-f]{8,}$/i.test(trimmed)) return undefined;
+	if (["(名前なし)", "名前なし", "名前不明", "(取得失敗)", "取得失敗"].includes(trimmed)) return undefined;
+	return trimmed;
+}
+
 function normalizedRoot(value: string): string {
 	const trimmed = value.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
 	if (trimmed.endsWith(".json")) return trimmed.slice(0, -".json".length);
@@ -480,6 +488,7 @@ class MessageLogStore {
 
 	recordMember(input: MemberProfileInput, schedule = true): void {
 		if (!input.mid || !input.chatMid || !input.scopeMid) return;
+		const cleanName = cleanMemberName(input.name);
 		const chat = this.getOrCreateChat({
 			id: "",
 			kind: input.kind,
@@ -495,8 +504,8 @@ class MessageLogStore {
 		if (!member) {
 			member = {
 				mid: input.mid,
-				currentName: input.name,
-				names: input.name ? [input.name] : [],
+				currentName: cleanName,
+				names: cleanName ? [cleanName] : [],
 				state: input.state ?? "UNKNOWN",
 				role: input.role,
 				firstSeenAt: seenAt,
@@ -508,9 +517,9 @@ class MessageLogStore {
 			};
 			chat.members.push(member);
 		}
-		if (input.name?.trim()) {
-			member.currentName = input.name;
-			if (!member.names.includes(input.name)) member.names.push(input.name);
+		if (cleanName) {
+			member.currentName = cleanName;
+			if (!member.names.includes(cleanName)) member.names.push(cleanName);
 		}
 		if (input.state) member.state = input.state;
 		if (input.role) member.role = input.role;

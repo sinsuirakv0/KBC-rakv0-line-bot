@@ -128,6 +128,29 @@ function messageContent(text: string | undefined, contentType: string | number |
 	return normalizedText || "(本文なし)";
 }
 
+function cleanSquareDisplayName(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed || /^p[0-9a-f]{8,}$/i.test(trimmed)) return undefined;
+	if (["(名前なし)", "名前なし", "名前不明", "(取得失敗)", "取得失敗"].includes(trimmed)) return undefined;
+	if (!/[0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]/.test(trimmed)) return undefined;
+	return trimmed;
+}
+
+function nameFromLeaveNotificationText(text: string | undefined): string | undefined {
+	const normalized = text?.replace(/\s+/g, " ").trim();
+	if (!normalized) return undefined;
+	for (const pattern of [
+		/^(.+?)(?:さん)?が(?:退会|退出|退室)しました[。.]?$/,
+		/^(.+?)(?:さん)?が(?:トーク|OpenChat|オープンチャット)から(?:退会|退出|退室)しました[。.]?$/,
+		/^(.+?) left (?:the )?(?:chat|openchat|open chat)[.]?$/i,
+		/^(.+?) has left (?:the )?(?:chat|openchat|open chat)[.]?$/i,
+	]) {
+		const name = cleanSquareDisplayName(normalized.match(pattern)?.[1]);
+		if (name) return name;
+	}
+	return undefined;
+}
+
 function mentionMetadata(mentions: OutgoingMention[]): Record<string, string> {
 	return {
 		MENTION: JSON.stringify({
@@ -252,6 +275,22 @@ function recordSquareMessage(message: SquareMessage, destination: SquareReplyTar
 		},
 	};
 	messageLogStore.record(record);
+	const leftName = rawMessage.from.startsWith("p") ? nameFromLeaveNotificationText(rawMessage.text) : undefined;
+	if (leftName) {
+		memberNameHistoryStore.record("square", destination.scopeMid, rawMessage.from, leftName, createdAt);
+		messageLogStore.recordMember({
+			kind: "square",
+			chatMid: destination.chatMid,
+			scopeMid: destination.scopeMid,
+			chatType: "SQUARE",
+			mid: rawMessage.from,
+			name: leftName,
+			state: "LEFT",
+			seenAt: createdAt,
+			source: "liveLeaveNotification",
+			extra: { notificationText: rawMessage.text },
+		});
+	}
 }
 
 function resolveSquareScope(client: Client, squareChatMid: string, senderMid: string): Promise<string> {

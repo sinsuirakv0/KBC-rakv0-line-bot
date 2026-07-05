@@ -36,6 +36,7 @@ interface SquareHistoryEvent {
 		notifiedKickoutFromSquare?: { kickees?: SquareHistoryMember[] };
 		notifiedUpdateSquareMemberProfile?: { squareMember?: SquareHistoryMember };
 		notifiedUpdateSquareMember?: { squareMember?: SquareHistoryMember };
+		notificationMessage?: SquareHistoryMessagePayload;
 	};
 }
 
@@ -104,6 +105,18 @@ function contentTypeLabel(contentType: string | number | undefined, hasContent: 
 	}
 }
 
+function looksLikeSquareMemberMid(value: string): boolean {
+	return /^p[0-9a-f]{8,}$/i.test(value.trim());
+}
+
+function cleanDisplayName(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed || looksLikeSquareMemberMid(trimmed)) return undefined;
+	if (["(名前なし)", "名前なし", "名前不明", "(取得失敗)", "取得失敗"].includes(trimmed)) return undefined;
+	if (!/[0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]/.test(trimmed)) return undefined;
+	return trimmed;
+}
+
 function formatContent(payload: SquareHistoryMessagePayload): string {
 	const message = payload.squareMessage?.message;
 	const text = (message?.text ?? "").replace(/\s+/g, " ").trim();
@@ -113,8 +126,33 @@ function formatContent(payload: SquareHistoryMessagePayload): string {
 	return text || "(本文なし)";
 }
 
+function eventMessagePayload(event: SquareHistoryEvent): SquareHistoryMessagePayload | undefined {
+	return event.payload?.receiveMessage ?? event.payload?.sendMessage ?? event.payload?.notificationMessage;
+}
+
+function notificationTextFromEvent(event: SquareHistoryEvent): string | undefined {
+	return event.payload?.notificationMessage?.squareMessage?.message?.text?.replace(/\s+/g, " ").trim();
+}
+
+function nameFromLeaveNotification(event: SquareHistoryEvent): string | undefined {
+	const text = notificationTextFromEvent(event);
+	if (!text) return undefined;
+	const patterns = [
+		/^(.+?)(?:さん)?が(?:退会|退出|退室)しました[。.]?$/,
+		/^(.+?)(?:さん)?が(?:トーク|OpenChat|オープンチャット)から(?:退会|退出|退室)しました[。.]?$/,
+		/^(.+?) left (?:the )?(?:chat|openchat|open chat)[.]?$/i,
+		/^(.+?) has left (?:the )?(?:chat|openchat|open chat)[.]?$/i,
+	];
+	for (const pattern of patterns) {
+		const match = text.match(pattern);
+		const name = cleanDisplayName(match?.[1]);
+		if (name) return name;
+	}
+	return undefined;
+}
+
 function messageLogFromEvent(chat: MessageLogChatSummary, event: SquareHistoryEvent): StoredMessageLog | undefined {
-	const payload = event.payload?.receiveMessage ?? event.payload?.sendMessage;
+	const payload = eventMessagePayload(event);
 	if (!payload) return undefined;
 	const message = payload.squareMessage?.message;
 	if (!message?.from) return undefined;
@@ -144,7 +182,7 @@ function messageLogFromEvent(chat: MessageLogChatSummary, event: SquareHistoryEv
 
 function eventMembers(event: SquareHistoryEvent): Array<{
 	mid: string;
-	name: string;
+	name?: string;
 	state: StoredMemberState;
 	role?: string;
 	seenAt?: number;
@@ -153,7 +191,7 @@ function eventMembers(event: SquareHistoryEvent): Array<{
 }> {
 	const members: Array<{
 		mid: string;
-		name: string;
+		name?: string;
 		state: StoredMemberState;
 		role?: string;
 		seenAt?: number;
@@ -166,7 +204,7 @@ function eventMembers(event: SquareHistoryEvent): Array<{
 		if (!member?.squareMemberMid?.startsWith("p")) return;
 		members.push({
 			mid: member.squareMemberMid,
-			name: member.displayName || "(名前なし)",
+			name: cleanDisplayName(member.displayName),
 			state,
 			role: member.role === undefined ? undefined : String(member.role),
 			seenAt: Number(member.createdAt) > 0 ? Number(member.createdAt) : seenAt,
@@ -185,12 +223,24 @@ function eventMembers(event: SquareHistoryEvent): Array<{
 	add(event.payload?.notifiedUpdateSquareMember?.squareMember, "UNKNOWN", "autoUpdateMember");
 	for (const member of event.payload?.notifiedKickoutFromSquare?.kickees ?? []) add(member, "KICK_OUT", "autoKickoutFromSquare");
 
-	const messagePayload = event.payload?.receiveMessage ?? event.payload?.sendMessage;
+	const leftMemberMid = event.payload?.notifiedLeaveSquareChat?.squareMemberMid;
+	if (leftMemberMid?.startsWith("p")) {
+		members.push({
+			mid: leftMemberMid,
+			name: nameFromLeaveNotification(event),
+			state: "LEFT",
+			seenAt,
+			source: "autoLeaveSquareChatNotification",
+			extra: { notificationText: notificationTextFromEvent(event) },
+		});
+	}
+
+	const messagePayload = eventMessagePayload(event);
 	const message = messagePayload?.squareMessage?.message;
 	if (message?.from?.startsWith("p")) {
 		members.push({
 			mid: message.from,
-			name: messagePayload?.senderDisplayName || "(名前なし)",
+			name: cleanDisplayName(messagePayload?.senderDisplayName),
 			state: "JOINED",
 			seenAt: Number(message.createdTime) > 0 ? Number(message.createdTime) : seenAt,
 			source: "autoMessage",
