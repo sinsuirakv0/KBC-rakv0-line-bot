@@ -1,8 +1,14 @@
 import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
 import { getActiveHistoryJob, tryStartHistoryJob, finishHistoryJob } from "../messageLog/historyJobs.js";
-import { messageLogStore, type MessageLogFlushResult, type StoredMemberState, type StoredMessageLog } from "../messageLog/store.js";
-import { memberNameHistoryStore } from "../nameHistory/store.js";
+import {
+	messageLogStore,
+	type MessageLogFlushResult,
+	type StoredMemberProfile,
+	type StoredMemberState,
+	type StoredMessageLog,
+} from "../messageLog/store.js";
+import { memberNameHistoryStore, type NameHistoryEntry } from "../nameHistory/store.js";
 import { permissionDeniedText, permissionStore, targetFromDestination } from "../permissions/store.js";
 import { sendSearchResults } from "./searchPages.js";
 import type { LineCommand, LineDestination, ReplyableLineMessage } from "./shared.js";
@@ -1026,6 +1032,64 @@ async function searchHistoryMembersByName(
 		.sort((left, right) => left.name.localeCompare(right.name, "ja") || left.mid.localeCompare(right.mid));
 }
 
+function namesFromStoredMember(member: StoredMemberProfile): string[] {
+	return [...new Set([member.currentName, ...member.names]
+		.map((name) => cleanDisplayName(name))
+		.filter((name): name is string => Boolean(name)))];
+}
+
+async function searchStoredMembersByName(
+	destination: LineDestination,
+	query: string,
+): Promise<MemberInfo[]> {
+	if (destination.kind !== "square") throw new Error("!logはOpenChatでのみ使用できます");
+	const found = new Map<string, MemberInfo>();
+	for (const member of await messageLogStore.listMembers(destination)) {
+		const names = namesFromStoredMember(member);
+		const matchedName = names.find((name) => looseNameMatches(name, query));
+		if (!matchedName) continue;
+		found.set(member.mid, {
+			mid: member.mid,
+			name: cleanDisplayName(member.currentName) ?? matchedName,
+		});
+	}
+	return [...found.values()]
+		.sort((left, right) => left.name.localeCompare(right.name, "ja") || left.mid.localeCompare(right.mid));
+}
+
+async function storedNameHistoryEntries(
+	destination: LineDestination,
+	mid: string,
+): Promise<NameHistoryEntry[]> {
+	if (destination.kind !== "square") return [];
+	const member = (await messageLogStore.listMembers(destination)).find((item) => item.mid === mid);
+	if (!member) return [];
+	return namesFromStoredMember(member).map((name) => ({
+		name,
+		firstSeenAt: member.firstSeenAt,
+		lastSeenAt: member.lastSeenAt,
+		count: 1,
+	}));
+}
+
+function mergeNameHistoryEntries(entries: NameHistoryEntry[]): NameHistoryEntry[] {
+	const byName = new Map<string, NameHistoryEntry>();
+	for (const entry of entries) {
+		const name = cleanDisplayName(entry.name);
+		if (!name) continue;
+		const existing = byName.get(name);
+		if (!existing) {
+			byName.set(name, { ...entry, name });
+			continue;
+		}
+		existing.firstSeenAt = existing.firstSeenAt < entry.firstSeenAt ? existing.firstSeenAt : entry.firstSeenAt;
+		existing.lastSeenAt = existing.lastSeenAt > entry.lastSeenAt ? existing.lastSeenAt : entry.lastSeenAt;
+		existing.count += entry.count;
+	}
+	return [...byName.values()]
+		.sort((left, right) => right.lastSeenAt.localeCompare(left.lastSeenAt) || left.name.localeCompare(right.name, "ja"));
+}
+
 function uniqueMembers(members: MemberInfo[]): MemberInfo[] {
 	const byMid = new Map<string, MemberInfo>();
 	for (const member of members) byMid.set(member.mid, member);
@@ -1051,6 +1115,7 @@ async function resolveTarget(
 		const memberQuery = args.slice(0, split).join(" ").trim();
 		const filter = args.slice(split).join(" ").trim();
 		const members = uniqueMembers([
+			...await searchStoredMembersByName(destination, memberQuery),
 			...await searchSquareMembersByName(client, destination, memberQuery),
 			...await searchHistoryMembersByName(client, destination, memberQuery),
 		]);
@@ -1664,14 +1729,21 @@ export const logCommand: LineCommand = {
 			}
 			await scanNamesFromHistory(message.client, message.destination, target.mid);
 			await memberNameHistoryStore.flush();
-			const entries = memberNameHistoryStore.get("square", message.destination.scopeMid, target.mid);
+			const entries = mergeNameHistoryEntries([
+				...memberNameHistoryStore.get("square", message.destination.scopeMid, target.mid),
+				...await storedNameHistoryEntries(message.destination, target.mid),
+			]);
+			const targetLabel = displayNameOrMid(
+				cleanDisplayName(target.name) ?? entries[0]?.name,
+				target.mid,
+			);
 			if (entries.length === 0) {
-				await message.send(`${displayNameOrMid(target.name, target.mid)}\n過去の名前はまだ保存されていません。`);
+				await message.send(`${targetLabel}\n過去の名前はまだ保存されていません。`);
 				return;
 			}
 			await sendSearchResults(
 				message,
-				`${displayNameOrMid(target.name, target.mid)} 名前履歴`,
+				`${targetLabel} 名前履歴`,
 				formatNameHistoryRows(entries),
 				LOG_PAGE_SIZE,
 			);

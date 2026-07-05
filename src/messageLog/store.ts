@@ -279,8 +279,11 @@ function parseMembers(value: unknown): StoredMemberProfile[] {
 		const raw = member as Partial<StoredMemberProfile> | undefined;
 		if (!raw || typeof raw.mid !== "string") return [];
 		const names = Array.isArray(raw.names)
-			? raw.names.filter((name): name is string => typeof name === "string" && Boolean(name.trim()))
+			? [...new Set(raw.names
+				.map((name) => typeof name === "string" ? cleanMemberName(name) : undefined)
+				.filter((name): name is string => Boolean(name)))]
 			: [];
+		const currentName = cleanMemberName(typeof raw.currentName === "string" ? raw.currentName : undefined) ?? names.at(-1);
 		const firstSeenAt = typeof raw.firstSeenAt === "string" ? raw.firstSeenAt : new Date().toISOString();
 		const lastSeenAt = typeof raw.lastSeenAt === "string" ? raw.lastSeenAt : firstSeenAt;
 		const state = ["JOINED", "LEFT", "KICK_OUT", "BANNED", "UNKNOWN"].includes(String(raw.state))
@@ -288,7 +291,7 @@ function parseMembers(value: unknown): StoredMemberProfile[] {
 			: "UNKNOWN";
 		return [{
 			mid: raw.mid,
-			currentName: typeof raw.currentName === "string" ? raw.currentName : names.at(-1),
+			currentName,
 			names,
 			state,
 			role: typeof raw.role === "string" ? raw.role : undefined,
@@ -614,6 +617,32 @@ class MessageLogStore {
 			}
 		}
 		return names;
+	}
+
+	async listMembers(
+		destination: Pick<LineDestination, "kind" | "chatMid" | "scopeMid">,
+	): Promise<StoredMemberProfile[]> {
+		const membersByMid = new Map<string, StoredMemberProfile>();
+		const collect = async (chat: StoredChat) => {
+			await this.ensureMembersLoaded(chat);
+			for (const member of chat.members) {
+				membersByMid.set(member.mid, this.mergeMember(membersByMid.get(member.mid), member));
+			}
+		};
+		const primary = this.chatsByKey.get(chatKey(destination));
+		if (primary) await collect(primary);
+		if (destination.kind === "square") {
+			for (const chat of this.chatsByKey.values()) {
+				if (chat.kind !== "square" || chat.scopeMid !== destination.scopeMid || chat.chatMid === destination.chatMid) continue;
+				await collect(chat);
+			}
+		}
+		return [...membersByMid.values()].map((member) => ({
+			...member,
+			names: [...member.names],
+			sources: [...member.sources],
+			extra: member.extra ? { ...member.extra } : undefined,
+		}));
 	}
 
 	async search(
@@ -1008,10 +1037,16 @@ class MessageLogStore {
 
 	private mergeMember(existing: StoredMemberProfile | undefined, next: StoredMemberProfile): StoredMemberProfile {
 		if (!existing) return next;
+		const names = [...new Set([...existing.names, ...next.names]
+			.map((name) => cleanMemberName(name))
+			.filter((name): name is string => Boolean(name)))];
+		const currentName = cleanMemberName(next.currentName) ?? cleanMemberName(existing.currentName) ?? names.at(-1);
 		return {
 			...existing,
 			...next,
-			names: [...new Set([...existing.names, ...next.names])],
+			currentName,
+			names,
+			role: next.role ?? existing.role,
 			messageCount: Math.max(existing.messageCount, next.messageCount),
 			sources: [...new Set([...existing.sources, ...next.sources])],
 			firstSeenAt: existing.firstSeenAt < next.firstSeenAt ? existing.firstSeenAt : next.firstSeenAt,
