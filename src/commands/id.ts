@@ -162,7 +162,9 @@ function looseNameMatches(name: string, query: string): boolean {
 	const compactName = compactSearchText(name);
 	const compactQuery = compactSearchText(query);
 	if (!compactQuery) return false;
-	if (compactName.includes(compactQuery) || compactQuery.includes(compactName)) return true;
+	if (!compactName) return false;
+	if (compactName.includes(compactQuery)) return true;
+	if (compactName.length >= 2 && compactQuery.includes(compactName)) return true;
 	return compactQuery.length >= 2 && isSubsequence(compactQuery, compactName);
 }
 

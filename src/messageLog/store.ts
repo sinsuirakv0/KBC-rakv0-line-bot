@@ -635,6 +635,7 @@ class MessageLogStore {
 			seen.add(message.id);
 			if (sinceCreatedAt !== undefined && message.createdAt < sinceCreatedAt) return;
 			if (senderMid && message.senderMid !== senderMid) return;
+			if (message.content.trimStart().startsWith(appConfig.commandPrefix)) return;
 			if (!normalizeText(message.content).includes(normalizedQuery)) return;
 			rows.push({ ...message });
 		};
