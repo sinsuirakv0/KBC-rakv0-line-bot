@@ -16,6 +16,8 @@ import { pushSubscriptionStore } from "./subscriptions/store.js";
 import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
+import { handleOpenChatModeration } from "./moderation/ocModeration.js";
+import { ocModerationSettingsStore } from "./moderation/ocModerationSettings.js";
 import { botStopTargetFromDestination, permissionStore } from "./permissions/store.js";
 import { memberNameHistoryStore } from "./nameHistory/store.js";
 import { startMessageLogAutoHistoryScheduler } from "./messageLog/autoHistory.js";
@@ -222,6 +224,21 @@ async function handleSquareMessage(client: Client, message: SquareMessage): Prom
 		senderNames.get(`square:${message.from.id}`),
 	);
 	recordSquareMessage(message, target.destination);
+	const rawMessage = (message.raw as RawSquareMessage).message;
+	if (
+		rawMessage?.id &&
+		!permissionStore.isBotStopped(botStopTargetFromDestination(target.destination)) &&
+		await handleOpenChatModeration({
+			client,
+			squareChatMid: target.destination.chatMid,
+			squareMid: target.destination.scopeMid,
+			senderMid: target.destination.senderMid,
+			messageId: rawMessage.id,
+			text: rawMessage.text,
+			contentType: rawMessage.contentType,
+			createdAt: rawMessage.createdTime === undefined ? undefined : Number(rawMessage.createdTime),
+		})
+	) return;
 	if (typeof message.text !== "string") return;
 	if (shouldIgnoreStoppedText(message.text, target)) return;
 	if (!message.text.startsWith(appConfig.commandPrefix)) {
@@ -894,6 +911,7 @@ async function main(): Promise<void> {
 		runtimeStore.initialize(),
 		permissionStore.initialize(),
 		ocKickHistoryStore.initialize(),
+		ocModerationSettingsStore.initialize(),
 		memberNameHistoryStore.initialize(),
 		messageLogStore.initialize(),
 	]);
@@ -922,6 +940,7 @@ async function main(): Promise<void> {
 	await runtimeStore.flush().catch(() => {});
 	await permissionStore.flush().catch(() => {});
 	await ocKickHistoryStore.flush().catch(() => {});
+	await ocModerationSettingsStore.flush().catch(() => {});
 	await memberNameHistoryStore.flush().catch(() => {});
 	await messageLogStore.flush().catch(() => {});
 	await new Promise<void>((resolve) => eventUpdateServer.close(() => resolve()));

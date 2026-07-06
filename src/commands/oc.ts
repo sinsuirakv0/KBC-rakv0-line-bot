@@ -1,4 +1,5 @@
 import { ocKickHistoryStore } from "../moderation/ocKickHistory.js";
+import { ocModerationSettingsStore } from "../moderation/ocModerationSettings.js";
 import {
 	permissionDeniedText,
 	permissionStore,
@@ -22,6 +23,16 @@ function helpText(): string {
 	return [
 		"!oc",
 		"",
+		"!oc lineurl",
+		"  line.meを含むURLの削除を有効化",
+		"!oc lineurl del",
+		"  line.meを含むURLの削除を解除",
+		"!oc media",
+		"  同一MIDの画像/動画連投削除を有効化",
+		"!oc media del",
+		"  同一MIDの画像/動画連投削除を解除",
+		"!oc status",
+		"  OC自動削除設定を表示",
 		"!oc authority",
 		"  このOCでのbot権限を表示",
 		"!oc kick @ユーザー 理由",
@@ -105,6 +116,75 @@ function collectKickTargets(args: string[], mentions: string[]): { mids: string[
 		mids: [...mids],
 		reason: reasonParts.join(" ").trim(),
 	};
+}
+
+function enabledText(value: boolean): string {
+	return value ? "有効" : "無効";
+}
+
+function isDeleteArgs(args: string[]): boolean {
+	return args.slice(1).some((arg) => {
+		const value = arg.toLowerCase();
+		return value === "del" || value === "off" || value === "disable" || value === "解除";
+	});
+}
+
+async function canManageOpenChatSettings(command: Parameters<LineCommand["execute"]>[0]): Promise<boolean> {
+	const { message } = command;
+	const currentTarget = targetFromDestination(message.destination);
+	if (currentTarget && permissionStore.hasAtLeast(currentTarget, message.destination.senderMid, "mod")) return true;
+	if (message.destination.kind !== "square") return false;
+	try {
+		const member = await message.client.base.square.getSquareMember({
+			squareMemberMid: message.destination.senderMid,
+		});
+		return roleRank(member.squareMember.role) >= roleRank("CO_ADMIN");
+	} catch (error) {
+		console.warn(`[oc] failed to resolve setting actor role for ${message.destination.senderMid}`, error);
+		return false;
+	}
+}
+
+async function sendModerationStatus(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message } = command;
+	if (message.destination.kind !== "square") {
+		await message.send("このコマンドはOpenChatで実行してください。");
+		return;
+	}
+	const settings = ocModerationSettingsStore.snapshot(message.destination.scopeMid);
+	await message.send([
+		"OC自動削除設定",
+		`line.me URL削除: ${enabledText(settings.linkDeleteEnabled)}`,
+		`画像/動画連投削除: ${enabledText(settings.mediaBurstDeleteEnabled)}`,
+	].join("\n"));
+}
+
+async function executeModerationSetting(
+	command: Parameters<LineCommand["execute"]>[0],
+	kind: "lineurl" | "media",
+): Promise<void> {
+	const { message, args } = command;
+	if (message.destination.kind !== "square") {
+		await message.send("このコマンドはOpenChatで実行してください。");
+		return;
+	}
+	if (!await canManageOpenChatSettings(command)) {
+		await message.send("実行権限がありません。BOT管理者/モデレーター、またはこのOCの管理者/副官のみ実行できます。");
+		return;
+	}
+
+	const enabled = !isDeleteArgs(args);
+	const result = kind === "lineurl"
+		? ocModerationSettingsStore.setLinkDelete(message.destination.scopeMid, enabled, message.destination.senderMid)
+		: ocModerationSettingsStore.setMediaBurstDelete(message.destination.scopeMid, enabled, message.destination.senderMid);
+	await ocModerationSettingsStore.flush();
+
+	const label = kind === "lineurl" ? "line.me URL削除" : "画像/動画連投削除";
+	if (result === "unchanged") {
+		await message.send(`${label}はすでに${enabledText(enabled)}です。`);
+		return;
+	}
+	await message.send(`${label}を${enabled ? "有効化" : "解除"}しました。`);
 }
 
 async function authorityText(command: Parameters<LineCommand["execute"]>[0]): Promise<string> {
@@ -250,6 +330,18 @@ export const ocCommand: LineCommand = {
 			await command.message.send(await authorityText(command));
 			return;
 		}
+		if (action === "status") {
+			await sendModerationStatus(command);
+			return;
+		}
+		if (action === "lineurl" || action === "link" || action === "linkurl" || action === "adlink") {
+			await executeModerationSetting(command, "lineurl");
+			return;
+		}
+		if (action === "media" || action === "mediadel" || action === "mediaburst") {
+			await executeModerationSetting(command, "media");
+			return;
+		}
 		if (action === "kick") {
 			await executeKick(command);
 			return;
@@ -258,6 +350,6 @@ export const ocCommand: LineCommand = {
 			await command.message.send("!oc kick を使用してください。confirmは不要です。");
 			return;
 		}
-		await command.message.send("使い方: !oc [authority|kick]\n詳しくは !oc help");
+		await command.message.send("使い方: !oc [authority|kick|lineurl|media|status]\n詳しくは !oc help");
 	},
 };

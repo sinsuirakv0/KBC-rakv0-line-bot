@@ -93,6 +93,13 @@ export const appConfig = {
 	permissionsGithubPath: process.env.PERMISSIONS_GITHUB_PATH || "settings/permissions.json",
 	ocKickHistoryFile: path.resolve(process.env.OC_KICK_HISTORY_FILE || "./storage/oc-kick-history.json"),
 	ocKickHistoryGithubPath: process.env.OC_KICK_HISTORY_GITHUB_PATH || "moderation/oc-kick-history.json",
+	ocModerationSettingsFile: path.resolve(
+		process.env.OC_MODERATION_SETTINGS_FILE || "./storage/oc-moderation-settings.json",
+	),
+	ocModerationSettingsGithubPath:
+		process.env.OC_MODERATION_SETTINGS_GITHUB_PATH || "moderation/oc-moderation-settings.json",
+	ocMediaBurstWindowMs: Number(process.env.OC_MEDIA_BURST_WINDOW_MS || 60_000),
+	ocMediaBurstLimit: Number(process.env.OC_MEDIA_BURST_LIMIT || 5),
 	memberNameHistoryFile: path.resolve(process.env.MEMBER_NAME_HISTORY_FILE || "./storage/member-name-history.json"),
 	memberNameHistoryGithubPath: process.env.MEMBER_NAME_HISTORY_GITHUB_PATH || "logs/member-name-history.json",
 	memberNameScanIntervalMs: Number(process.env.MEMBER_NAME_SCAN_INTERVAL_MS || 30 * 60_000),
