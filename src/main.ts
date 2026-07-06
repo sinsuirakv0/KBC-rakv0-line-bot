@@ -16,7 +16,11 @@ import { pushSubscriptionStore } from "./subscriptions/store.js";
 import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
-import { handleOpenChatModeration } from "./moderation/ocModeration.js";
+import {
+	handleOpenChatModeration,
+	handleOpenChatPostModeration,
+	type OpenChatPostModerationEvent,
+} from "./moderation/ocModeration.js";
 import { ocModerationSettingsStore } from "./moderation/ocModerationSettings.js";
 import { botStopTargetFromDestination, permissionStore } from "./permissions/store.js";
 import { memberNameHistoryStore } from "./nameHistory/store.js";
@@ -67,6 +71,19 @@ interface RawSquareEvent {
 		receiveMessage?: {
 			squareMessage: unknown;
 		};
+		sendMessage?: {
+			squareMessage: unknown;
+		};
+		mutateMessage?: {
+			squareMessage: unknown;
+			threadMid?: string;
+		};
+		notificationPost?: {
+			squareMid?: string;
+			notificationPostType?: string | number;
+			text?: string;
+			actionUri?: string;
+		};
 	} & Record<string, unknown>;
 }
 
@@ -80,6 +97,7 @@ interface RawSquareMessage {
 		text?: string;
 		contentType?: string | number;
 		hasContent?: boolean;
+		contentMetadata?: Record<string, string>;
 	};
 }
 
@@ -214,6 +232,53 @@ function shouldIgnoreStoppedText(messageText: string, message: ReplyableLineMess
 	return permissionStore.isBotStopped(target) && !isBotStartCommand(messageText);
 }
 
+function squareMessagesFromEvent(event: RawSquareEvent): unknown[] {
+	const payload = event.payload;
+	if (!payload) return [];
+	const messages: unknown[] = [];
+	if (event.type === "NOTIFICATION_MESSAGE" && payload.notificationMessage?.squareMessage) {
+		messages.push(payload.notificationMessage.squareMessage);
+	}
+	if (event.type === "RECEIVE_MESSAGE" && payload.receiveMessage?.squareMessage) {
+		messages.push(payload.receiveMessage.squareMessage);
+	}
+	if (event.type === "SEND_MESSAGE" && payload.sendMessage?.squareMessage) {
+		messages.push(payload.sendMessage.squareMessage);
+	}
+	if (
+		event.type === "MUTATE_MESSAGE" &&
+		payload.mutateMessage?.squareMessage &&
+		!payload.mutateMessage.threadMid
+	) {
+		messages.push(payload.mutateMessage.squareMessage);
+	}
+	return messages;
+}
+
+function postModerationEventFromSquareEvent(
+	client: Client,
+	event: RawSquareEvent,
+): OpenChatPostModerationEvent | undefined {
+	const post = event.payload?.notificationPost;
+	if (event.type !== "NOTIFICATION_POST" || !post?.squareMid) return undefined;
+	return {
+		client,
+		squareMid: post.squareMid,
+		notificationPostType: post.notificationPostType,
+		text: post.text,
+		actionUri: post.actionUri,
+	};
+}
+
+function squareMentionMids(message: SquareMessage): string[] {
+	try {
+		return message.getMentions()
+			.flatMap((mention) => mention.all ? [] : [mention.mid]);
+	} catch {
+		return [];
+	}
+}
+
 async function handleSquareMessage(client: Client, message: SquareMessage): Promise<void> {
 	if (await message.isMyMessage()) return;
 	const scopeMid = await resolveSquareScope(client, message.to.id, message.from.id);
@@ -236,6 +301,7 @@ async function handleSquareMessage(client: Client, message: SquareMessage): Prom
 			messageId: rawMessage.id,
 			text: rawMessage.text,
 			contentType: rawMessage.contentType,
+			contentMetadata: rawMessage.contentMetadata,
 			createdAt: rawMessage.createdTime === undefined ? undefined : Number(rawMessage.createdTime),
 		})
 	) return;
@@ -289,6 +355,7 @@ function recordSquareMessage(message: SquareMessage, destination: SquareReplyTar
 			to: rawMessage.to,
 			toType: rawMessage.toType,
 			hasContent: rawMessage.hasContent,
+			contentMetadataKeys: Object.keys(rawMessage.contentMetadata ?? {}).sort(),
 		},
 	};
 	messageLogStore.record(record);
@@ -390,8 +457,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 		scopeMid: string,
 		senderName?: string,
 	) {
-		this.mentionMids = message.getMentions()
-			.flatMap((mention) => mention.all ? [] : [mention.mid]);
+		this.mentionMids = squareMentionMids(message);
 		this.replyToMessageId = message.getReplyTarget()?.id;
 		this.destination = {
 			kind: "square" as const,
@@ -775,16 +841,17 @@ async function listenRawSquareEvents(
 		onError: (error) => handlePollingError("square", error, onFatal),
 	}) as AsyncIterable<RawSquareEvent>) {
 		if (signal.aborted) break;
-		const rawMessage = event.type === "NOTIFICATION_MESSAGE"
-			? event.payload?.notificationMessage?.squareMessage
-			: event.type === "RECEIVE_MESSAGE"
-				? event.payload?.receiveMessage?.squareMessage
-				: undefined;
-		if (!rawMessage) continue;
-		void handleSquareMessage(client, new SquareMessage({
-			client,
-			raw: rawMessage as never,
-		})).catch((error) => handlePollingError("square", error, onFatal));
+		const postModerationEvent = postModerationEventFromSquareEvent(client, event);
+		if (postModerationEvent) {
+			void handleOpenChatPostModeration(postModerationEvent)
+				.catch((error) => handlePollingError("square", error, onFatal));
+		}
+		for (const rawMessage of squareMessagesFromEvent(event)) {
+			void handleSquareMessage(client, new SquareMessage({
+				client,
+				raw: rawMessage as never,
+			})).catch((error) => handlePollingError("square", error, onFatal));
+		}
 	}
 }
 

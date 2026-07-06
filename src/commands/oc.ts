@@ -152,9 +152,11 @@ async function sendModerationStatus(command: Parameters<LineCommand["execute"]>[
 		return;
 	}
 	const settings = ocModerationSettingsStore.snapshot(message.destination.scopeMid);
+	const lockedCount = settings.urlOffenders.filter((offender) => offender.deleteAllMessages).length;
 	await message.send([
 		"OC自動削除設定",
 		`line.me URL削除: ${enabledText(settings.linkDeleteEnabled)}`,
+		`URL再犯の発言削除対象: ${lockedCount}人`,
 		`画像/動画連投削除: ${enabledText(settings.mediaBurstDeleteEnabled)}`,
 	].join("\n"));
 }
