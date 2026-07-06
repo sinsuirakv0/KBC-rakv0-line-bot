@@ -17,18 +17,35 @@ export interface OcModerationSetting {
 	squareMid: string;
 	linkDeleteEnabled: boolean;
 	mediaBurstDeleteEnabled: boolean;
+	leftSoonMonitoringEnabled: boolean;
+	dangerWordAutoKickEnabled: boolean;
+	joinCohortWatchEnabled: boolean;
+	modRoomChatMid?: string;
+	modRoomSetAt?: string;
+	modRoomSetBy?: string;
 	urlOffenders: OcUrlOffender[];
 	updatedAt: string;
 	updatedBy?: string;
 }
 
+export interface OcSetupSession {
+	messageId: string;
+	squareMid: string;
+	squareChatMid: string;
+	createdAt: string;
+	createdBy: string;
+	expiresAt: string;
+}
+
 interface OcModerationSettingsFile {
 	version: 1;
 	settings: OcModerationSetting[];
+	setupSessions: OcSetupSession[];
 }
 
-const EMPTY_SETTINGS: OcModerationSettingsFile = { version: 1, settings: [] };
+const EMPTY_SETTINGS: OcModerationSettingsFile = { version: 1, settings: [], setupSessions: [] };
 const SAVE_DELAY_MS = 5_000;
+const SETUP_SESSION_TTL_MS = 30 * 60_000;
 
 function nowIso(): string {
 	return new Date().toISOString();
@@ -39,6 +56,12 @@ function emptySetting(squareMid: string): OcModerationSetting {
 		squareMid,
 		linkDeleteEnabled: false,
 		mediaBurstDeleteEnabled: false,
+		leftSoonMonitoringEnabled: false,
+		dangerWordAutoKickEnabled: false,
+		joinCohortWatchEnabled: false,
+		modRoomChatMid: undefined,
+		modRoomSetAt: undefined,
+		modRoomSetBy: undefined,
 		urlOffenders: [],
 		updatedAt: "",
 	};
@@ -66,6 +89,33 @@ function parseUrlOffenders(value: unknown): OcUrlOffender[] {
 	return [...byUserMid.values()];
 }
 
+function parseSetupSessions(value: unknown): OcSetupSession[] {
+	if (!Array.isArray(value)) return [];
+	const now = Date.now();
+	const byMessageId = new Map<string, OcSetupSession>();
+	for (const session of value) {
+		const item = session as Partial<OcSetupSession>;
+		if (
+			typeof item.messageId !== "string" ||
+			typeof item.squareMid !== "string" ||
+			typeof item.squareChatMid !== "string" ||
+			typeof item.createdAt !== "string" ||
+			typeof item.createdBy !== "string" ||
+			typeof item.expiresAt !== "string"
+		) continue;
+		if (new Date(item.expiresAt).getTime() <= now) continue;
+		byMessageId.set(item.messageId, {
+			messageId: item.messageId,
+			squareMid: item.squareMid,
+			squareChatMid: item.squareChatMid,
+			createdAt: item.createdAt,
+			createdBy: item.createdBy,
+			expiresAt: item.expiresAt,
+		});
+	}
+	return [...byMessageId.values()];
+}
+
 function parseSettings(value: unknown): OcModerationSettingsFile {
 	if (!value || typeof value !== "object") return structuredClone(EMPTY_SETTINGS);
 	const raw = value as Partial<OcModerationSettingsFile>;
@@ -78,6 +128,12 @@ function parseSettings(value: unknown): OcModerationSettingsFile {
 			squareMid: item.squareMid,
 			linkDeleteEnabled: item.linkDeleteEnabled === true,
 			mediaBurstDeleteEnabled: item.mediaBurstDeleteEnabled === true,
+			leftSoonMonitoringEnabled: item.leftSoonMonitoringEnabled === true,
+			dangerWordAutoKickEnabled: item.dangerWordAutoKickEnabled === true,
+			joinCohortWatchEnabled: item.joinCohortWatchEnabled === true,
+			modRoomChatMid: typeof item.modRoomChatMid === "string" ? item.modRoomChatMid : undefined,
+			modRoomSetAt: typeof item.modRoomSetAt === "string" ? item.modRoomSetAt : undefined,
+			modRoomSetBy: typeof item.modRoomSetBy === "string" ? item.modRoomSetBy : undefined,
 			urlOffenders: parseUrlOffenders(item.urlOffenders),
 			updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : nowIso(),
 			updatedBy: typeof item.updatedBy === "string" ? item.updatedBy : undefined,
@@ -86,6 +142,7 @@ function parseSettings(value: unknown): OcModerationSettingsFile {
 	return {
 		version: 1,
 		settings: [...bySquareMid.values()],
+		setupSessions: parseSetupSessions(raw.setupSessions),
 	};
 }
 
@@ -135,6 +192,79 @@ class OcModerationSettingsStore {
 
 	setMediaBurstDelete(squareMid: string, enabled: boolean, updatedBy: string): "enabled" | "disabled" | "unchanged" {
 		return this.setFlag(squareMid, "mediaBurstDeleteEnabled", enabled, updatedBy);
+	}
+
+	setLeftSoonMonitoring(squareMid: string, enabled: boolean, updatedBy: string): "enabled" | "disabled" | "unchanged" {
+		return this.setFlag(squareMid, "leftSoonMonitoringEnabled", enabled, updatedBy);
+	}
+
+	setDangerWordAutoKick(squareMid: string, enabled: boolean, updatedBy: string): "enabled" | "disabled" | "unchanged" {
+		return this.setFlag(squareMid, "dangerWordAutoKickEnabled", enabled, updatedBy);
+	}
+
+	setJoinCohortWatch(squareMid: string, enabled: boolean, updatedBy: string): "enabled" | "disabled" | "unchanged" {
+		return this.setFlag(squareMid, "joinCohortWatchEnabled", enabled, updatedBy);
+	}
+
+	setModRoom(squareMid: string, squareChatMid: string, updatedBy: string): "set" | "unchanged" {
+		const setting = this.ensureSetting(squareMid, updatedBy);
+		if (setting.modRoomChatMid === squareChatMid) return "unchanged";
+		const updatedAt = nowIso();
+		setting.modRoomChatMid = squareChatMid;
+		setting.modRoomSetAt = updatedAt;
+		setting.modRoomSetBy = updatedBy;
+		setting.updatedAt = updatedAt;
+		setting.updatedBy = updatedBy;
+		this.scheduleSave();
+		return "set";
+	}
+
+	clearModRoom(squareMid: string, updatedBy: string): "cleared" | "unchanged" {
+		const setting = this.data.settings.find((item) => item.squareMid === squareMid);
+		if (!setting?.modRoomChatMid) return "unchanged";
+		setting.modRoomChatMid = undefined;
+		setting.modRoomSetAt = undefined;
+		setting.modRoomSetBy = undefined;
+		setting.updatedAt = nowIso();
+		setting.updatedBy = updatedBy;
+		this.scheduleSave();
+		return "cleared";
+	}
+
+	recordSetupSession(
+		session: Omit<OcSetupSession, "createdAt" | "expiresAt"> & { ttlMs?: number },
+	): OcSetupSession {
+		this.cleanupExpiredSetupSessions();
+		const createdAt = nowIso();
+		const expiresAt = new Date(Date.now() + (session.ttlMs ?? SETUP_SESSION_TTL_MS)).toISOString();
+		const next: OcSetupSession = {
+			messageId: session.messageId,
+			squareMid: session.squareMid,
+			squareChatMid: session.squareChatMid,
+			createdAt,
+			createdBy: session.createdBy,
+			expiresAt,
+		};
+		this.data.setupSessions = [
+			...this.data.setupSessions.filter((item) => item.messageId !== next.messageId),
+			next,
+		].slice(-100);
+		this.scheduleSave();
+		return { ...next };
+	}
+
+	findSetupSession(messageId: string, squareMid?: string): OcSetupSession | undefined {
+		this.cleanupExpiredSetupSessions();
+		const session = this.data.setupSessions.find((item) =>
+			item.messageId === messageId && (!squareMid || item.squareMid === squareMid)
+		);
+		return session ? { ...session } : undefined;
+	}
+
+	clearSetupSession(messageId: string): void {
+		const before = this.data.setupSessions.length;
+		this.data.setupSessions = this.data.setupSessions.filter((item) => item.messageId !== messageId);
+		if (this.data.setupSessions.length !== before) this.scheduleSave();
 	}
 
 	isLinkDeletionLocked(squareMid: string, userMid: string): boolean {
@@ -219,7 +349,12 @@ class OcModerationSettingsStore {
 
 	private setFlag(
 		squareMid: string,
-		key: "linkDeleteEnabled" | "mediaBurstDeleteEnabled",
+		key:
+			| "linkDeleteEnabled"
+			| "mediaBurstDeleteEnabled"
+			| "leftSoonMonitoringEnabled"
+			| "dangerWordAutoKickEnabled"
+			| "joinCohortWatchEnabled",
 		enabled: boolean,
 		updatedBy: string,
 	): "enabled" | "disabled" | "unchanged" {
@@ -251,6 +386,15 @@ class OcModerationSettingsStore {
 			this.data.settings.push(setting);
 		}
 		return setting;
+	}
+
+	private cleanupExpiredSetupSessions(): void {
+		const now = Date.now();
+		const before = this.data.setupSessions.length;
+		this.data.setupSessions = this.data.setupSessions.filter((session) =>
+			new Date(session.expiresAt).getTime() > now
+		);
+		if (this.data.setupSessions.length !== before) this.scheduleSave();
 	}
 
 	private scheduleSave(): void {

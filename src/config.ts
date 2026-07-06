@@ -98,6 +98,16 @@ export const appConfig = {
 	),
 	ocModerationSettingsGithubPath:
 		process.env.OC_MODERATION_SETTINGS_GITHUB_PATH || "moderation/oc-moderation-settings.json",
+	ocMemberActivityFile: path.resolve(
+		process.env.OC_MEMBER_ACTIVITY_FILE || "./storage/oc-member-activity.json",
+	),
+	ocMemberActivityGithubPath:
+		process.env.OC_MEMBER_ACTIVITY_GITHUB_PATH || "moderation/oc-member-activity.json",
+	ocModerationCasesFile: path.resolve(
+		process.env.OC_MODERATION_CASES_FILE || "./storage/oc-moderation-cases.json",
+	),
+	ocModerationCasesGithubPath:
+		process.env.OC_MODERATION_CASES_GITHUB_PATH || "moderation/oc-moderation-cases.json",
 	ocIdentitySnapshotsFile: path.resolve(
 		process.env.OC_IDENTITY_SNAPSHOTS_FILE || "./storage/oc-identity-snapshots.json",
 	),

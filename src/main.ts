@@ -1,6 +1,7 @@
 ﻿import { SquareMessage, type Client } from "@evex/linejs";
 import { appConfig } from "./config.js";
 import { handleLineCommand } from "./commands/index.js";
+import { handleOcSetupReply } from "./commands/oc.js";
 import type { OutgoingImage, OutgoingMention, ReplyableLineMessage } from "./commands/shared.js";
 import { handleSearchPageReply } from "./commands/searchPages.js";
 import { handleLogTargetSelectionReply } from "./commands/log.js";
@@ -17,10 +18,17 @@ import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
 import { ocIdentitySnapshotsStore } from "./moderation/ocIdentitySnapshots.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
+import { ocMemberActivityStore } from "./moderation/ocMemberActivity.js";
+import { ocModerationCasesStore } from "./moderation/ocModerationCases.js";
 import {
+	handleOpenChatMemberJoin,
+	handleOpenChatMemberLeave,
+	handleOpenChatModerationCaseReply,
 	handleOpenChatNoteStatusModeration,
 	handleOpenChatModeration,
 	handleOpenChatPostModeration,
+	type OpenChatMemberJoinEvent,
+	type OpenChatMemberLeaveEvent,
 	type OpenChatNoteStatusModerationEvent,
 	type OpenChatPostModerationEvent,
 } from "./moderation/ocModeration.js";
@@ -91,6 +99,12 @@ interface RawSquareEvent {
 			squareMid?: string;
 			noteStatus?: unknown;
 		};
+		notifiedCreateSquareMember?: unknown;
+		notifiedCreateSquareChatMember?: unknown;
+		notifiedJoinSquareChat?: unknown;
+		notifiedLeaveSquareChat?: unknown;
+		notifiedUpdateSquareMember?: unknown;
+		notifiedUpdateSquareChatMember?: unknown;
 	} & Record<string, unknown>;
 }
 
@@ -295,6 +309,193 @@ function noteStatusModerationEventFromSquareEvent(
 	};
 }
 
+function rawObject(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? value as Record<string, unknown>
+		: undefined;
+}
+
+function rawString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function rawNumber(value: unknown): number | undefined {
+	const numeric = typeof value === "bigint" ? Number(value) : Number(value);
+	return Number.isFinite(numeric) && numeric > 0 ? numeric : undefined;
+}
+
+function rawMember(value: unknown): {
+	memberMid?: string;
+	squareMid?: string;
+	displayName?: string;
+	membershipState?: string | number;
+} {
+	const raw = rawObject(value);
+	return {
+		memberMid: rawString(raw?.squareMemberMid),
+		squareMid: rawString(raw?.squareMid),
+		displayName: rawString(raw?.displayName),
+		membershipState: raw?.membershipState as string | number | undefined,
+	};
+}
+
+function rawChat(value: unknown): { squareChatMid?: string; squareMid?: string } {
+	const raw = rawObject(value);
+	return {
+		squareChatMid: rawString(raw?.squareChatMid),
+		squareMid: rawString(raw?.squareMid),
+	};
+}
+
+function rawChatMember(value: unknown): {
+	memberMid?: string;
+	squareChatMid?: string;
+	membershipState?: string | number;
+} {
+	const raw = rawObject(value);
+	return {
+		memberMid: rawString(raw?.squareMemberMid),
+		squareChatMid: rawString(raw?.squareChatMid),
+		membershipState: raw?.membershipState as string | number | undefined,
+	};
+}
+
+function isJoinedState(value: string | number | undefined): boolean {
+	return value === 1 || value === "JOINED";
+}
+
+function isLeftState(value: string | number | undefined): boolean {
+	return value === 4 || value === "LEFT";
+}
+
+async function memberActivityEventsFromSquareEvent(
+	client: Client,
+	event: RawSquareEvent,
+): Promise<{ joins: OpenChatMemberJoinEvent[]; leaves: OpenChatMemberLeaveEvent[] }> {
+	const payload = event.payload;
+	const joins: OpenChatMemberJoinEvent[] = [];
+	const leaves: OpenChatMemberLeaveEvent[] = [];
+	if (!payload) return { joins, leaves };
+
+	if (isSquareEventType(event, "NOTIFIED_CREATE_SQUARE_MEMBER", 15)) {
+		const raw = rawObject(payload.notifiedCreateSquareMember);
+		const member = rawMember(raw?.squareMember);
+		if (member.squareMid && member.memberMid) {
+			joins.push({
+				client,
+				squareMid: member.squareMid,
+				memberMid: member.memberMid,
+				displayName: member.displayName,
+				source: "square-member",
+			});
+		}
+	}
+
+	if (isSquareEventType(event, "NOTIFIED_CREATE_SQUARE_CHAT_MEMBER", 16)) {
+		const raw = rawObject(payload.notifiedCreateSquareChatMember);
+		const chat = rawChat(raw?.chat);
+		const chatMember = rawChatMember(raw?.chatMember);
+		const peer = rawMember(raw?.peerSquareMember);
+		const squareMid = chat.squareMid ?? peer.squareMid;
+		const squareChatMid = chat.squareChatMid ?? chatMember.squareChatMid;
+		const memberMid = chatMember.memberMid ?? peer.memberMid;
+		if (squareMid && squareChatMid && memberMid) {
+			joins.push({
+				client,
+				squareMid,
+				squareChatMid,
+				memberMid,
+				displayName: peer.displayName,
+				joinedAt: rawNumber(raw?.joinedAt),
+				source: "chat-member",
+			});
+		}
+	}
+
+	if (isSquareEventType(event, "NOTIFIED_JOIN_SQUARE_CHAT", 2)) {
+		const raw = rawObject(payload.notifiedJoinSquareChat);
+		const member = rawMember(raw?.joinedMember);
+		const squareChatMid = rawString(raw?.squareChatMid);
+		if (member.squareMid && squareChatMid && member.memberMid) {
+			joins.push({
+				client,
+				squareMid: member.squareMid,
+				squareChatMid,
+				memberMid: member.memberMid,
+				displayName: member.displayName,
+				source: "chat-member",
+			});
+		}
+	}
+
+	if (isSquareEventType(event, "NOTIFIED_LEAVE_SQUARE_CHAT", 4)) {
+		const raw = rawObject(payload.notifiedLeaveSquareChat);
+		const member = rawMember(raw?.squareMember);
+		const squareChatMid = rawString(raw?.squareChatMid);
+		const memberMid = rawString(raw?.squareMemberMid) ?? member.memberMid;
+		const squareMid = member.squareMid ?? (squareChatMid && memberMid
+			? await resolveSquareScope(client, squareChatMid, memberMid)
+			: undefined);
+		if (squareMid && squareChatMid && memberMid) {
+			leaves.push({
+				client,
+				squareMid,
+				squareChatMid,
+				memberMid,
+				displayName: member.displayName,
+				source: "chat-member",
+			});
+		}
+	}
+
+	if (isSquareEventType(event, "NOTIFIED_UPDATE_SQUARE_CHAT_MEMBER", 14)) {
+		const raw = rawObject(payload.notifiedUpdateSquareChatMember);
+		const chatMember = rawChatMember(raw?.squareChatMember);
+		const squareChatMid = rawString(raw?.squareChatMid) ?? chatMember.squareChatMid;
+		const memberMid = chatMember.memberMid;
+		const squareMid = squareChatMid && memberMid
+			? await resolveSquareScope(client, squareChatMid, memberMid)
+			: undefined;
+		if (squareMid && squareChatMid && memberMid && isJoinedState(chatMember.membershipState)) {
+			joins.push({
+				client,
+				squareMid,
+				squareChatMid,
+				memberMid,
+				source: "chat-member",
+			});
+		}
+		if (squareMid && squareChatMid && memberMid && isLeftState(chatMember.membershipState)) {
+			leaves.push({
+				client,
+				squareMid,
+				squareChatMid,
+				memberMid,
+				source: "chat-member",
+			});
+		}
+	}
+
+	if (isSquareEventType(event, "NOTIFIED_UPDATE_SQUARE_MEMBER", 11)) {
+		const raw = rawObject(payload.notifiedUpdateSquareMember);
+		const member = rawMember(raw?.squareMember);
+		const squareMid = rawString(raw?.squareMid) ?? member.squareMid;
+		const memberMid = rawString(raw?.squareMemberMid) ?? member.memberMid;
+		if (squareMid && memberMid && isLeftState(member.membershipState)) {
+			leaves.push({
+				client,
+				squareMid,
+				memberMid,
+				displayName: member.displayName,
+				clearAllChats: false,
+				source: "square-member",
+			});
+		}
+	}
+
+	return { joins, leaves };
+}
+
 function squareMentionMids(message: SquareMessage): string[] {
 	try {
 		return message.getMentions()
@@ -333,6 +534,8 @@ async function handleSquareMessage(client: Client, message: SquareMessage): Prom
 	if (typeof message.text !== "string") return;
 	if (shouldIgnoreStoppedText(message.text, target)) return;
 	if (!message.text.startsWith(appConfig.commandPrefix)) {
+		if (await handleOcSetupReply(message.text, target)) return;
+		if (await handleOpenChatModerationCaseReply(message.text, target)) return;
 		if (await handleLogTargetSelectionReply(message.text, target)) return;
 		await handleSearchPageReply(message.text, target);
 		return;
@@ -866,6 +1069,15 @@ async function listenRawSquareEvents(
 		onError: (error) => handlePollingError("square", error, onFatal),
 	}) as AsyncIterable<RawSquareEvent>) {
 		if (signal.aborted) break;
+		const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
+		for (const joinEvent of memberEvents.joins) {
+			void handleOpenChatMemberJoin(joinEvent)
+				.catch((error) => handlePollingError("square", error, onFatal));
+		}
+		for (const leaveEvent of memberEvents.leaves) {
+			void handleOpenChatMemberLeave(leaveEvent)
+				.catch((error) => handlePollingError("square", error, onFatal));
+		}
 		const postModerationEvent = postModerationEventFromSquareEvent(client, event);
 		if (postModerationEvent) {
 			void handleOpenChatPostModeration(postModerationEvent)
@@ -1009,6 +1221,8 @@ async function main(): Promise<void> {
 		permissionStore.initialize(),
 		ocIdentitySnapshotsStore.initialize(),
 		ocKickHistoryStore.initialize(),
+		ocMemberActivityStore.initialize(),
+		ocModerationCasesStore.initialize(),
 		ocModerationSettingsStore.initialize(),
 		memberNameHistoryStore.initialize(),
 		messageLogStore.initialize(),
@@ -1039,6 +1253,8 @@ async function main(): Promise<void> {
 	await permissionStore.flush().catch(() => {});
 	await ocIdentitySnapshotsStore.flush().catch(() => {});
 	await ocKickHistoryStore.flush().catch(() => {});
+	await ocMemberActivityStore.flush().catch(() => {});
+	await ocModerationCasesStore.flush().catch(() => {});
 	await ocModerationSettingsStore.flush().catch(() => {});
 	await memberNameHistoryStore.flush().catch(() => {});
 	await messageLogStore.flush().catch(() => {});

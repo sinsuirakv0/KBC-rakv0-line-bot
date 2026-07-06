@@ -1,6 +1,14 @@
 import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
-import { permissionStore, type PermissionTarget } from "../permissions/store.js";
+import type { ReplyableLineMessage } from "../commands/shared.js";
+import { ocKickHistoryStore } from "./ocKickHistory.js";
+import { ocMemberActivityStore, type OcLeaveDecisionInfo, type OcMemberActivity } from "./ocMemberActivity.js";
+import {
+	ocModerationCasesStore,
+	type OcModerationCaseStatus,
+	type OcModerationCaseType,
+} from "./ocModerationCases.js";
+import { permissionStore, targetFromDestination, type PermissionTarget } from "../permissions/store.js";
 import { ocModerationSettingsStore } from "./ocModerationSettings.js";
 
 type SquareRole = string | number | undefined;
@@ -28,6 +36,27 @@ export interface OpenChatPostModerationEvent {
 export interface OpenChatNoteStatusModerationEvent {
 	client: Client;
 	squareMid: string;
+}
+
+export interface OpenChatMemberJoinEvent {
+	client: Client;
+	squareMid: string;
+	squareChatMid?: string;
+	memberMid: string;
+	displayName?: string;
+	joinedAt?: number;
+	source: "square-member" | "chat-member";
+}
+
+export interface OpenChatMemberLeaveEvent {
+	client: Client;
+	squareMid: string;
+	squareChatMid?: string;
+	memberMid: string;
+	displayName?: string;
+	leftAt?: number;
+	clearAllChats?: boolean;
+	source: "square-member" | "chat-member";
 }
 
 interface SquareMemberSummary {
@@ -68,6 +97,14 @@ const MEDIA_BURST_DELETE_NOTICE = [
 ].join("\n");
 const MEDIA_BURST_WINDOW_MS = positiveNumber(appConfig.ocMediaBurstWindowMs, 60_000, 1_000);
 const MEDIA_BURST_LIMIT = positiveNumber(appConfig.ocMediaBurstLimit, 5, 1);
+const DANGER_WORD_WINDOW_MS = 2 * 60_000;
+const LEFT_SOON_NO_MESSAGE_AUTO_BAN_MS = 60_000;
+const LEFT_SOON_WITH_MESSAGE_AUTO_BAN_MS = 30_000;
+const LEFT_SOON_NO_MESSAGE_REVIEW_MS = 5 * 60_000;
+const LEFT_SOON_WITH_MESSAGE_REVIEW_MS = 2 * 60_000;
+const COHORT_JOIN_WINDOW_MS = 2 * 60_000;
+const COHORT_MIN_MEMBERS = 3;
+const COHORT_WATCH_MS = 30 * 60_000;
 const ROLE_CACHE_MS = 5 * 60_000;
 const POST_NOTIFICATION_SKIP_TYPES = new Set<string>([
 	"3",
@@ -97,6 +134,7 @@ const handledPostIds = new Map<string, number>();
 const noteScanRequests = new Map<string, Promise<boolean>>();
 const noteScanLastStartedAt = new Map<string, number>();
 const loggedMediaTypes = new Set<string>();
+const loggedCohorts = new Set<string>();
 
 function positiveNumber(value: number, fallback: number, minimum: number): number {
 	if (!Number.isFinite(value)) return fallback;
@@ -109,6 +147,16 @@ function roleRank(role: SquareRole): number {
 
 function isSquareMemberMid(mid: string): boolean {
 	return mid.startsWith("p");
+}
+
+function isSquareBotStopped(squareChatMid: string | undefined): boolean {
+	const target = {
+		kind: "square" as const,
+		chatMid: squareChatMid ?? "__unknown_square_chat__",
+		chatType: "SQUARE" as const,
+	};
+	const status = permissionStore.botStopStatus(target);
+	return status.allStopped || (squareChatMid !== undefined && status.targetStopped);
 }
 
 function isImageOrVideo(contentType: string | number | undefined): boolean {
@@ -131,6 +179,41 @@ function stringValue(value: unknown): string | undefined {
 
 function finiteTimestamp(value: number | undefined): number {
 	return Number.isFinite(value) && value !== undefined && value > 0 ? value : Date.now();
+}
+
+function isoFromTimestamp(value: number | undefined): string {
+	return new Date(finiteTimestamp(value)).toISOString();
+}
+
+function formatDuration(ms: number | undefined): string {
+	if (ms === undefined || !Number.isFinite(ms) || ms < 0) return "不明";
+	const seconds = Math.round(ms / 1_000);
+	if (seconds < 60) return `${seconds}秒`;
+	const minutes = Math.floor(seconds / 60);
+	const rest = seconds % 60;
+	return rest === 0 ? `${minutes}分` : `${minutes}分${rest}秒`;
+}
+
+function displayNameText(name: string | undefined): string {
+	return cleanDisplayName(name) ?? "(名前なし)";
+}
+
+function compactError(error: unknown): string {
+	if (!error || typeof error !== "object") return String(error);
+	const raw = error as { name?: string; message?: string; code?: string | number; status?: string | number; reason?: string };
+	return raw.message || raw.reason || raw.name || String(raw.code ?? raw.status ?? "不明なエラー");
+}
+
+function dangerWord(text: string | undefined): string | undefined {
+	if (!text) return undefined;
+	const normalized = text.normalize("NFKC");
+	const match = normalized.match(/チート|代行/u);
+	return match?.[0];
+}
+
+function containsUrlLike(text: string | undefined): boolean {
+	if (!text) return false;
+	return /https?:\/\/|www\.|line\.me|discord\.gg|openchat|オプチャ|招待/u.test(text.normalize("NFKC"));
 }
 
 function mediaBurstKey(message: OpenChatModerationMessage): string {
@@ -593,6 +676,110 @@ async function sendMentionNotice(message: OpenChatModerationMessage, notice: str
 	}
 }
 
+function squareSendMessageId(value: unknown): string | undefined {
+	const result = value as {
+		createdSquareMessage?: { message?: { id?: string } };
+		squareMessage?: { message?: { id?: string } };
+		message?: { id?: string };
+		id?: string;
+	};
+	return result.createdSquareMessage?.message?.id ??
+		result.squareMessage?.message?.id ??
+		result.message?.id ??
+		result.id;
+}
+
+async function sendModRoomLog(
+	client: Client,
+	squareMid: string,
+	text: string,
+	caseInfo?: {
+		type: OcModerationCaseType;
+		status: OcModerationCaseStatus;
+		targetMid?: string;
+		targetName?: string;
+		reason?: string;
+		payload?: Record<string, unknown>;
+	},
+): Promise<void> {
+	const settings = ocModerationSettingsStore.snapshot(squareMid);
+	if (!settings.modRoomChatMid) {
+		console.warn("[oc-moderation] mod room not configured", { squareMid, text });
+		return;
+	}
+	let caseId: string | undefined;
+	if (caseInfo) {
+		caseId = ocModerationCasesStore.record({
+			type: caseInfo.type,
+			status: caseInfo.status,
+			squareMid,
+			modRoomChatMid: settings.modRoomChatMid,
+			targetMid: caseInfo.targetMid,
+			targetName: caseInfo.targetName,
+			reason: caseInfo.reason,
+			payload: caseInfo.payload,
+		}).id;
+	}
+	try {
+		const sent = await client.base.square.sendMessage({
+			squareChatMid: settings.modRoomChatMid,
+			text,
+		});
+		const messageId = squareSendMessageId(sent);
+		if (caseId && messageId) {
+			ocModerationCasesStore.attachMessage(caseId, settings.modRoomChatMid, messageId);
+			await ocModerationCasesStore.flush();
+		}
+	} catch (error) {
+		console.warn("[oc-moderation] mod room log send failed", {
+			squareMid,
+			modRoomChatMid: settings.modRoomChatMid,
+			error,
+		});
+	}
+}
+
+async function banFromSquare(
+	client: Client,
+	squareMid: string,
+	targetMid: string,
+	targetName: string | undefined,
+	reason: string,
+	actorMid = "bot:auto",
+): Promise<{ ok: boolean; error?: string }> {
+	try {
+		const response = await client.base.square.deleteOtherFromSquare(targetMid);
+		const kickedName = cleanDisplayName(response.squareMember.displayName) ?? targetName ?? targetMid;
+		ocKickHistoryStore.record({
+			squareMid,
+			chatMid: squareMid,
+			targetMid,
+			targetName: kickedName,
+			actorMid,
+			actorName: "bot",
+			reason,
+			result: "success",
+		});
+		await ocKickHistoryStore.flush();
+		return { ok: true };
+	} catch (error) {
+		const summary = compactError(error);
+		ocKickHistoryStore.record({
+			squareMid,
+			chatMid: squareMid,
+			targetMid,
+			targetName: targetName ?? targetMid,
+			actorMid,
+			actorName: "bot",
+			reason,
+			result: "failed",
+			error: summary,
+		});
+		await ocKickHistoryStore.flush();
+		return { ok: false, error: summary };
+	}
+}
+
 async function deleteAndNotify(message: OpenChatModerationMessage, notice: string, shouldWarn: boolean): Promise<void> {
 	await deleteSquareMessage(message, "moderation");
 	if (shouldWarn) await sendMentionNotice(message, notice);
@@ -628,14 +815,339 @@ function logMediaModerationCandidate(message: OpenChatModerationMessage): void {
 	});
 }
 
+function firstJoinElapsedMs(activity: OcMemberActivity, at: number): number | undefined {
+	if (!activity.firstJoinAt || activity.totalJoinCount !== 1) return undefined;
+	const joinedAt = new Date(activity.firstJoinAt).getTime();
+	if (!Number.isFinite(joinedAt) || at < joinedAt) return undefined;
+	return at - joinedAt;
+}
+
+function memberLine(name: string | undefined, mid: string): string {
+	return `${displayNameText(name)} (${mid})`;
+}
+
+async function sendDangerWordMainNotice(
+	message: OpenChatModerationMessage,
+	word: string,
+	banSucceeded: boolean,
+): Promise<void> {
+	const text = banSucceeded
+		? [
+			"スパムフィルターにより自動的に強制退会しました。",
+			"",
+			`対象者は参加直後に「${word}」を含むメッセージを送信したため、`,
+			"宣伝・不正行為勧誘の可能性が高いと判定しました。",
+			"",
+			"誤検知の可能性もありますが、今回は安全のため自動処分しています。",
+			"必要であれば副官がログを確認してください。",
+		].join("\n")
+		: [
+			"スパムフィルターが参加直後の危険語を検出しました。",
+			"",
+			`対象者は参加直後に「${word}」を含むメッセージを送信しました。`,
+			"メッセージ削除は試行しましたが、強制退会に失敗しました。",
+			"副官はログを確認してください。",
+		].join("\n");
+	try {
+		await message.client.base.square.sendMessage({
+			squareChatMid: message.squareChatMid,
+			text,
+		});
+	} catch (error) {
+		console.warn("[oc-moderation] danger word main notice failed", error);
+	}
+}
+
+async function handleDangerWordAutoKick(
+	message: OpenChatModerationMessage,
+	activity: OcMemberActivity,
+): Promise<boolean> {
+	const word = dangerWord(message.text);
+	if (!word) return false;
+	const elapsedMs = firstJoinElapsedMs(activity, finiteTimestamp(message.createdAt));
+	if (elapsedMs === undefined || elapsedMs > DANGER_WORD_WINDOW_MS) return false;
+
+	const targetName = activity.displayName ?? (await getSquareMemberSummary(message.client, message.senderMid).catch(() => undefined))?.displayName;
+	await deleteSquareMessage(message, "danger-word");
+	const banResult = await banFromSquare(
+		message.client,
+		message.squareMid,
+		message.senderMid,
+		targetName,
+		`初参加直後の危険語: ${word}`,
+	);
+	await sendDangerWordMainNotice(message, word, banResult.ok);
+
+	await sendModRoomLog(
+		message.client,
+		message.squareMid,
+		[
+			"【自動処分】初参加直後の危険語",
+			"",
+			`対象: ${memberLine(targetName, message.senderMid)}`,
+			`参加から: ${formatDuration(elapsedMs)}`,
+			`検出語: ${word}`,
+			`本文: ${message.text?.replace(/\s+/g, " ").trim().slice(0, 300) ?? "(本文なし)"}`,
+			`処分: ${banResult.ok ? "メッセージ削除 + 強制退会 + 再参加禁止" : "メッセージ削除 + 強制退会失敗"}`,
+			banResult.error ? `エラー: ${banResult.error}` : "",
+			"",
+			"理由:",
+			"参加直後に危険語を含むメッセージを送信したため、",
+			"宣伝・不正行為勧誘の可能性が高いと判定しました。",
+			"",
+			"誤検知の場合は、このログに「解除」と返信してください。",
+		].filter(Boolean).join("\n"),
+		{
+			type: "danger_word_auto_kick",
+			status: banResult.ok ? "auto_banned" : "ban_failed",
+			targetMid: message.senderMid,
+			targetName,
+			reason: `danger-word:${word}`,
+			payload: {
+				word,
+				text: message.text,
+				elapsedMs,
+				error: banResult.error,
+			},
+		},
+	);
+	return true;
+}
+
+async function handleCohortSuspiciousMessage(
+	message: OpenChatModerationMessage,
+	activity: OcMemberActivity,
+): Promise<void> {
+	const watch = ocMemberActivityStore.cohortWatch(message.squareMid, message.senderMid);
+	if (!watch) return;
+	const word = dangerWord(message.text);
+	const reason = word ? `危険語:${word}` : containsUrlLike(message.text) ? "URL/誘導文らしき内容" : undefined;
+	if (!reason) return;
+	if (!ocMemberActivityStore.rememberCohortReason(message.squareMid, message.senderMid, reason)) return;
+	await sendModRoomLog(
+		message.client,
+		message.squareMid,
+		[
+			"【監視ログ】一斉参加グループ内の不審行動",
+			"",
+			`対象: ${memberLine(activity.displayName, message.senderMid)}`,
+			`検出内容: ${reason}`,
+			`本文: ${message.text?.replace(/\s+/g, " ").trim().slice(0, 300) ?? "(本文なし)"}`,
+			"処分: 未実行",
+			"",
+			"一斉参加グループ内で不審な行動を検出しました。",
+			"必要に応じて副官が確認してください。",
+		].join("\n"),
+		{
+			type: "cohort_suspicious",
+			status: "open",
+			targetMid: message.senderMid,
+			targetName: activity.displayName,
+			reason,
+			payload: {
+				cohortId: watch.cohortId,
+				text: message.text,
+			},
+		},
+	);
+}
+
+async function maybeStartJoinCohortWatch(event: OpenChatMemberJoinEvent): Promise<void> {
+	const settings = ocModerationSettingsStore.snapshot(event.squareMid);
+	if (!settings.joinCohortWatchEnabled) return;
+	const now = finiteTimestamp(event.joinedAt);
+	const recent = ocMemberActivityStore.recentFirstJoins(event.squareMid, now - COHORT_JOIN_WINDOW_MS);
+	if (recent.length < COHORT_MIN_MEMBERS) return;
+	const bucket = Math.floor(now / COHORT_JOIN_WINDOW_MS);
+	const cohortKey = `${event.squareMid}:${bucket}`;
+	if (loggedCohorts.has(cohortKey)) return;
+	loggedCohorts.add(cohortKey);
+	const cohortId = `${bucket.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+	const watchUntil = new Date(now + COHORT_WATCH_MS).toISOString();
+	ocMemberActivityStore.markCohort(event.squareMid, recent.map((item) => item.memberMid), cohortId, watchUntil);
+	await ocMemberActivityStore.flush();
+	await sendModRoomLog(
+		event.client,
+		event.squareMid,
+		[
+			"【監視開始】短時間の一斉参加",
+			"",
+			`期間: ${formatDuration(COHORT_JOIN_WINDOW_MS)}`,
+			`人数: ${recent.length}人`,
+			"対象:",
+			...recent.map((activity) => `- ${memberLine(activity.displayName, activity.memberMid)}`),
+			"",
+			"対応:",
+			"このグループは一定時間、URL・危険語・連投・短時間退会を強めに監視します。",
+			"この通知だけでは処分しません。",
+		].join("\n"),
+		{
+			type: "cohort_watch",
+			status: "open",
+			reason: "short-time-join-cohort",
+			payload: {
+				cohortId,
+				memberMids: recent.map((activity) => activity.memberMid),
+				watchUntil,
+			},
+		},
+	);
+}
+
+function leftSoonMode(info: OcLeaveDecisionInfo): "auto" | "review" | "log" | "none" {
+	if (!info.isFirstJoin || info.stayMs === undefined) return "none";
+	if (info.remainingChatMids.length > 0) return "log";
+	if (info.messageCount === 0) {
+		if (info.stayMs <= LEFT_SOON_NO_MESSAGE_AUTO_BAN_MS) return "auto";
+		if (info.stayMs <= LEFT_SOON_NO_MESSAGE_REVIEW_MS) return "review";
+		return "none";
+	}
+	if (info.stayMs <= LEFT_SOON_WITH_MESSAGE_AUTO_BAN_MS) return "auto";
+	if (info.stayMs <= LEFT_SOON_WITH_MESSAGE_REVIEW_MS) return "review";
+	return "none";
+}
+
+async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcLeaveDecisionInfo): Promise<void> {
+	const settings = ocModerationSettingsStore.snapshot(event.squareMid);
+	if (!settings.leftSoonMonitoringEnabled) return;
+	const mode = leftSoonMode(info);
+	if (mode === "none") return;
+
+	const targetName = info.activity.displayName ?? event.displayName;
+	if (mode === "log") {
+		await sendModRoomLog(
+			event.client,
+			event.squareMid,
+			[
+				"【監視ログ】初参加・短時間退会",
+				"",
+				`対象: ${memberLine(targetName, event.memberMid)}`,
+				`滞在: ${formatDuration(info.stayMs)}`,
+				`発言数: ${info.messageCount}`,
+				"サブトーク残存: あり",
+				"処分: 未実行",
+				"",
+				"サブトークに残っているため、自動再参加禁止は行いませんでした。",
+			].join("\n"),
+			{
+				type: "left_soon_log",
+				status: "open",
+				targetMid: event.memberMid,
+				targetName,
+				reason: "left-soon-but-chat-remains",
+				payload: {
+					stayMs: info.stayMs,
+					messageCount: info.messageCount,
+					remainingChatMids: info.remainingChatMids,
+				},
+			},
+		);
+		return;
+	}
+
+	if (mode === "review") {
+		await sendModRoomLog(
+			event.client,
+			event.squareMid,
+			[
+				"【確認待ち】初参加・短時間退会",
+				"",
+				`対象: ${memberLine(targetName, event.memberMid)}`,
+				`滞在: ${formatDuration(info.stayMs)}`,
+				`発言数: ${info.messageCount}`,
+				"サブトーク残存: なし",
+				"処分: 未実行",
+				"",
+				"このログに「再参加禁止」と返信すると、対象を再参加禁止にします。",
+				"誤入室と思われる場合は「無視」と返信してください。",
+			].join("\n"),
+			{
+				type: "left_soon_pending_ban",
+				status: "pending_ban",
+				targetMid: event.memberMid,
+				targetName,
+				reason: "left-soon-review",
+				payload: {
+					stayMs: info.stayMs,
+					messageCount: info.messageCount,
+				},
+			},
+		);
+		return;
+	}
+
+	const banResult = await banFromSquare(
+		event.client,
+		event.squareMid,
+		event.memberMid,
+		targetName,
+		"初参加・即抜け",
+	);
+	await sendModRoomLog(
+		event.client,
+		event.squareMid,
+		[
+			"【自動処分】初参加・即抜け",
+			"",
+			`対象: ${memberLine(targetName, event.memberMid)}`,
+			`滞在: ${formatDuration(info.stayMs)}`,
+			`発言数: ${info.messageCount}`,
+			"サブトーク残存: なし",
+			`処分: ${banResult.ok ? "再参加禁止" : "再参加禁止失敗"}`,
+			banResult.error ? `エラー: ${banResult.error}` : "",
+			"",
+			"理由:",
+			"初参加後、短時間で退会し、サブトークにも残っていなかったため、",
+			"即抜け荒らし対策として自動的に再参加禁止にしました。",
+			"",
+			"誤入室だった可能性がある場合は、このログに「解除」と返信してください。",
+		].filter(Boolean).join("\n"),
+		{
+			type: "left_soon_auto_ban",
+			status: banResult.ok ? "auto_banned" : "ban_failed",
+			targetMid: event.memberMid,
+			targetName,
+			reason: "left-soon-auto-ban",
+			payload: {
+				stayMs: info.stayMs,
+				messageCount: info.messageCount,
+				error: banResult.error,
+			},
+		},
+	);
+}
+
 export async function handleOpenChatModeration(message: OpenChatModerationMessage): Promise<boolean> {
 	if (wasHandled(message)) return true;
 	const settings = ocModerationSettingsStore.snapshot(message.squareMid);
-	if (!settings.linkDeleteEnabled && !settings.mediaBurstDeleteEnabled) return false;
+	if (
+		!settings.linkDeleteEnabled &&
+		!settings.mediaBurstDeleteEnabled &&
+		!settings.dangerWordAutoKickEnabled &&
+		!settings.joinCohortWatchEnabled
+	) return false;
 
 	// LINE OCのAuto-replyなど、Square member MIDではない送信元は対象外。
 	if (!isSquareMemberMid(message.senderMid)) return false;
 	if (await isPrivilegedSender(message)) return false;
+
+	let senderName: string | undefined;
+	try {
+		senderName = (await getSquareMemberSummary(message.client, message.senderMid)).displayName;
+	} catch {
+		senderName = undefined;
+	}
+	const activity = ocMemberActivityStore.recordMessage({
+		squareMid: message.squareMid,
+		squareChatMid: message.squareChatMid,
+		memberMid: message.senderMid,
+		displayName: senderName,
+		text: message.text,
+		at: message.createdAt,
+	});
+
+	if (settings.joinCohortWatchEnabled) await handleCohortSuspiciousMessage(message, activity);
+	if (settings.dangerWordAutoKickEnabled && await handleDangerWordAutoKick(message, activity)) return true;
 
 	if (settings.linkDeleteEnabled && containsLineMeUrl(message.text)) {
 		const result = ocModerationSettingsStore.recordLinkViolation(
@@ -716,4 +1228,145 @@ export async function handleOpenChatNoteStatusModeration(
 		});
 	noteScanRequests.set(event.squareMid, request);
 	return await request;
+}
+
+export async function handleOpenChatMemberJoin(event: OpenChatMemberJoinEvent): Promise<void> {
+	if (!isSquareMemberMid(event.memberMid)) return;
+	if (isSquareBotStopped(event.squareChatMid)) return;
+	if (event.source === "square-member") {
+		ocMemberActivityStore.recordSquareJoin({
+			squareMid: event.squareMid,
+			squareChatMid: event.squareChatMid,
+			memberMid: event.memberMid,
+			displayName: event.displayName,
+			at: event.joinedAt,
+		});
+		await maybeStartJoinCohortWatch(event);
+		return;
+	}
+	ocMemberActivityStore.recordChatJoin({
+		squareMid: event.squareMid,
+		squareChatMid: event.squareChatMid,
+		memberMid: event.memberMid,
+		displayName: event.displayName,
+		at: event.joinedAt,
+	});
+}
+
+export async function handleOpenChatMemberLeave(event: OpenChatMemberLeaveEvent): Promise<void> {
+	if (!isSquareMemberMid(event.memberMid)) return;
+	if (isSquareBotStopped(event.squareChatMid)) return;
+	if (event.source === "chat-member") {
+		ocMemberActivityStore.recordChatLeave({
+			squareMid: event.squareMid,
+			squareChatMid: event.squareChatMid,
+			memberMid: event.memberMid,
+			displayName: event.displayName,
+			at: event.leftAt,
+			clearAllChats: false,
+		});
+		return;
+	}
+	const info = ocMemberActivityStore.recordSquareLeave({
+		squareMid: event.squareMid,
+		squareChatMid: event.squareChatMid,
+		memberMid: event.memberMid,
+		displayName: event.displayName,
+		at: event.leftAt,
+		clearAllChats: event.clearAllChats,
+	});
+	await handleLeftSoonDecision(event, info);
+}
+
+async function canHandleModerationCaseReply(message: ReplyableLineMessage): Promise<boolean> {
+	const currentTarget = targetFromDestination(message.destination);
+	if (currentTarget && permissionStore.hasAtLeast(currentTarget, message.destination.senderMid, "admin")) return true;
+	if (message.destination.kind !== "square") return false;
+	try {
+		const member = await message.client.base.square.getSquareMember({
+			squareMemberMid: message.destination.senderMid,
+		});
+		return roleRank(member.squareMember.role) >= roleRank("CO_ADMIN");
+	} catch (error) {
+		console.warn(`[oc-moderation] failed to resolve case reply actor role for ${message.destination.senderMid}`, error);
+		return false;
+	}
+}
+
+function moderationCaseReplyAction(text: string): "ban" | "ignore" | "unban" | undefined {
+	const normalized = text.normalize("NFKC").toLowerCase().trim();
+	if (/^(?:再参加禁止|ban|処分|キック)$/.test(normalized)) return "ban";
+	if (/^(?:無視|ignore|対応不要|不要)$/.test(normalized)) return "ignore";
+	if (/^(?:解除|unban|再参加禁止解除)$/.test(normalized)) return "unban";
+	return undefined;
+}
+
+export async function handleOpenChatModerationCaseReply(
+	messageText: string,
+	message: ReplyableLineMessage,
+): Promise<boolean> {
+	if (message.destination.kind !== "square" || !message.replyToMessageId) return false;
+	const moderationCase = ocModerationCasesStore.findByModRoomMessage(
+		message.replyToMessageId,
+		message.destination.scopeMid,
+	);
+	if (!moderationCase || moderationCase.modRoomChatMid !== message.destination.chatMid) return false;
+	if (!await canHandleModerationCaseReply(message)) {
+		await message.send("実行権限がありません。BOT管理者、またはこのOCの管理者/副官のみ実行できます。");
+		return true;
+	}
+
+	const action = moderationCaseReplyAction(messageText);
+	if (!action) {
+		await message.send("操作は「再参加禁止」「解除」「無視」のいずれかで返信してください。");
+		return true;
+	}
+
+	if (action === "ignore") {
+		ocModerationCasesStore.update(moderationCase.id, {
+			status: "ignored",
+			updatedBy: message.destination.senderMid,
+		});
+		await ocModerationCasesStore.flush();
+		await message.send("このケースを無視として処理しました。");
+		return true;
+	}
+
+	if (action === "unban") {
+		ocModerationCasesStore.update(moderationCase.id, {
+			status: "unban_requested",
+			updatedBy: message.destination.senderMid,
+		});
+		await ocModerationCasesStore.flush();
+		await message.send([
+			"解除要求を記録しました。",
+			"再参加禁止解除APIはまだ未検証のため、自動解除は実行していません。",
+			"必要であればLINE公式クライアント側で手動解除してください。",
+		].join("\n"));
+		return true;
+	}
+
+	if (!moderationCase.targetMid) {
+		await message.send("対象MIDが記録されていないため、再参加禁止を実行できません。");
+		return true;
+	}
+
+	const result = await banFromSquare(
+		message.client,
+		moderationCase.squareMid,
+		moderationCase.targetMid,
+		moderationCase.targetName,
+		"副官部屋リプライによる再参加禁止",
+		message.destination.senderMid,
+	);
+	ocModerationCasesStore.update(moderationCase.id, {
+		status: result.ok ? "ban_succeeded" : "ban_failed",
+		updatedBy: message.destination.senderMid,
+		error: result.error,
+	});
+	await ocModerationCasesStore.flush();
+	await message.send(result.ok
+		? `再参加禁止を実行しました。\n対象: ${memberLine(moderationCase.targetName, moderationCase.targetMid)}`
+		: `再参加禁止に失敗しました。\n対象: ${memberLine(moderationCase.targetName, moderationCase.targetMid)}\nエラー: ${result.error}`);
+	return true;
 }

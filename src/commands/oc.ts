@@ -10,7 +10,7 @@ import {
 	targetFromDestination,
 } from "../permissions/store.js";
 import { argValue } from "./permissionArgs.js";
-import type { LineCommand } from "./shared.js";
+import type { LineCommand, ReplyableLineMessage } from "./shared.js";
 
 type SquareRole = string | number | undefined;
 type IdentitySnapshotInput = Parameters<typeof ocIdentitySnapshotsStore.record>[0];
@@ -28,18 +28,31 @@ function helpText(): string {
 	return [
 		"!oc",
 		"",
-		"!oc lineurl",
-		"  line.meを含むURLの削除を有効化",
-		"!oc lineurl del",
-		"  line.meを含むURLの削除を解除",
-		"!oc media",
-		"  同一MIDの画像/動画連投削除を有効化",
-		"!oc media del",
-		"  同一MIDの画像/動画連投削除を解除",
 		"!oc status",
 		"  OC自動削除設定を表示",
 		"!oc authority",
 		"  このOCでのbot権限を表示",
+		"",
+		"管理者向けコマンドは !oc adminhelp",
+	].join("\n");
+}
+
+function adminHelpText(): string {
+	return [
+		"OC管理コマンド",
+		"",
+		"!oc setup",
+		"  セットアップメニューを表示",
+		"!oc modroom set",
+		"  このトークを副官部屋に設定",
+		"!oc modroom del",
+		"  副官部屋設定を解除",
+		"!oc modroom test",
+		"  副官部屋への送信をテスト",
+		"!oc lineurl / !oc lineurl del",
+		"  line.meを含むURL削除のON/OFF",
+		"!oc media / !oc media del",
+		"  画像/動画連投削除のON/OFF",
 		"!oc identity [@ユーザー|userID:<p...>]",
 		"  OC内の識別材料を取得し、過去スナップショットと照合",
 		"!oc identity list",
@@ -235,6 +248,20 @@ function isDeleteArgs(args: string[]): boolean {
 	});
 }
 
+function setupStatusLines(squareMid: string): string[] {
+	const settings = ocModerationSettingsStore.snapshot(squareMid);
+	const lockedCount = settings.urlOffenders.filter((offender) => offender.deleteAllMessages).length;
+	return [
+		`line.me URL削除: ${enabledText(settings.linkDeleteEnabled)}`,
+		`URL再犯の発言削除対象: ${lockedCount}人`,
+		`画像/動画連投削除: ${enabledText(settings.mediaBurstDeleteEnabled)}`,
+		`初参加・即抜け監視: ${enabledText(settings.leftSoonMonitoringEnabled)}`,
+		`初参加・危険語処分: ${enabledText(settings.dangerWordAutoKickEnabled)}`,
+		`短時間一斉参加監視: ${enabledText(settings.joinCohortWatchEnabled)}`,
+		`副官部屋: ${settings.modRoomChatMid ? `設定済み (${shortId(settings.modRoomChatMid)})` : "未設定"}`,
+	];
+}
+
 async function canManageOpenChatSettings(command: Parameters<LineCommand["execute"]>[0]): Promise<boolean> {
 	const { message } = command;
 	const currentTarget = targetFromDestination(message.destination);
@@ -251,19 +278,34 @@ async function canManageOpenChatSettings(command: Parameters<LineCommand["execut
 	}
 }
 
+async function canRunOpenChatSetupMessage(message: ReplyableLineMessage): Promise<boolean> {
+	const currentTarget = targetFromDestination(message.destination);
+	if (currentTarget && permissionStore.hasAtLeast(currentTarget, message.destination.senderMid, "admin")) return true;
+	if (message.destination.kind !== "square") return false;
+	try {
+		const member = await message.client.base.square.getSquareMember({
+			squareMemberMid: message.destination.senderMid,
+		});
+		return roleRank(member.squareMember.role) >= roleRank("CO_ADMIN");
+	} catch (error) {
+		console.warn(`[oc] failed to resolve setup actor role for ${message.destination.senderMid}`, error);
+		return false;
+	}
+}
+
+async function canRunOpenChatSetup(command: Parameters<LineCommand["execute"]>[0]): Promise<boolean> {
+	return canRunOpenChatSetupMessage(command.message);
+}
+
 async function sendModerationStatus(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
 	const { message } = command;
 	if (message.destination.kind !== "square") {
 		await message.send("このコマンドはOpenChatで実行してください。");
 		return;
 	}
-	const settings = ocModerationSettingsStore.snapshot(message.destination.scopeMid);
-	const lockedCount = settings.urlOffenders.filter((offender) => offender.deleteAllMessages).length;
 	await message.send([
 		"OC自動削除設定",
-		`line.me URL削除: ${enabledText(settings.linkDeleteEnabled)}`,
-		`URL再犯の発言削除対象: ${lockedCount}人`,
-		`画像/動画連投削除: ${enabledText(settings.mediaBurstDeleteEnabled)}`,
+		...setupStatusLines(message.destination.scopeMid),
 	].join("\n"));
 }
 
@@ -455,6 +497,250 @@ async function executeIdentityTest(command: Parameters<LineCommand["execute"]>[0
 	].join("\n"));
 }
 
+function setupMenuText(squareMid: string): string {
+	return [
+		"OC管理セットアップ",
+		"",
+		"有効にしたい機能の番号を、このメッセージにリプライしてください。",
+		"複数指定できます。例: 1 2 3",
+		"解除は off 1 2 のように送信してください。",
+		"",
+		"1. line.me URL削除",
+		"2. 画像/動画連投削除",
+		"3. このトークを副官部屋に設定",
+		"4. 初参加・即抜け監視",
+		"5. 初参加・危険語処分",
+		"6. 短時間一斉参加監視",
+		"7. 実装済み項目をまとめてON",
+		"8. 自動処理系をOFF（副官部屋は維持）",
+		"9. 現在の設定を確認",
+		"",
+		"現在:",
+		...setupStatusLines(squareMid),
+	].join("\n");
+}
+
+function setupPermissionDeniedText(): string {
+	return "実行権限がありません。BOT管理者、またはこのOCの管理者/副官のみ実行できます。";
+}
+
+function flagChangeText(label: string, result: "enabled" | "disabled" | "unchanged", enabled: boolean): string {
+	if (result === "unchanged") return `${label}: 変更なし（${enabledText(enabled)}）`;
+	return `${label}: ${enabled ? "有効化" : "解除"}`;
+}
+
+function parseSetupSelection(text: string): { numbers: number[]; disable: boolean } {
+	const normalized = text.normalize("NFKC").toLowerCase();
+	const disable = /(?:^|\s)(?:off|del|disable|解除|無効|オフ)(?:\s|$)/.test(normalized);
+	const numbers = new Set<number>();
+	for (const match of normalized.matchAll(/\d+/g)) {
+		const value = Number(match[0]);
+		if (Number.isInteger(value)) numbers.add(value);
+	}
+	if (/\bstatus\b|設定確認|確認/.test(normalized)) numbers.add(9);
+	if (/\ball\b|全部|すべて/.test(normalized)) numbers.add(7);
+	return { numbers: [...numbers], disable };
+}
+
+async function applySetupSelection(
+	message: ReplyableLineMessage,
+	numbers: number[],
+	disable: boolean,
+): Promise<string> {
+	const squareMid = message.destination.scopeMid;
+	const actorMid = message.destination.senderMid;
+	const lines: string[] = ["OC管理セットアップ結果"];
+	const applied = new Set<number>();
+
+	const applyLinkDelete = (enabled: boolean): void => {
+		const result = ocModerationSettingsStore.setLinkDelete(squareMid, enabled, actorMid);
+		lines.push(flagChangeText("line.me URL削除", result, enabled));
+	};
+	const applyMediaDelete = (enabled: boolean): void => {
+		const result = ocModerationSettingsStore.setMediaBurstDelete(squareMid, enabled, actorMid);
+		lines.push(flagChangeText("画像/動画連投削除", result, enabled));
+	};
+	const applyModRoom = (enabled: boolean): void => {
+		if (enabled) {
+			const result = ocModerationSettingsStore.setModRoom(squareMid, message.destination.chatMid, actorMid);
+			lines.push(result === "unchanged"
+				? "副官部屋: 変更なし（このトークに設定済み）"
+				: "副官部屋: このトークに設定");
+			return;
+		}
+		const result = ocModerationSettingsStore.clearModRoom(squareMid, actorMid);
+		lines.push(result === "unchanged" ? "副官部屋: 変更なし（未設定）" : "副官部屋: 解除");
+	};
+	const applyLeftSoon = (enabled: boolean): void => {
+		const result = ocModerationSettingsStore.setLeftSoonMonitoring(squareMid, enabled, actorMid);
+		lines.push(flagChangeText("初参加・即抜け監視", result, enabled));
+	};
+	const applyDangerWord = (enabled: boolean): void => {
+		const result = ocModerationSettingsStore.setDangerWordAutoKick(squareMid, enabled, actorMid);
+		lines.push(flagChangeText("初参加・危険語処分", result, enabled));
+	};
+	const applyJoinCohort = (enabled: boolean): void => {
+		const result = ocModerationSettingsStore.setJoinCohortWatch(squareMid, enabled, actorMid);
+		lines.push(flagChangeText("短時間一斉参加監視", result, enabled));
+	};
+
+	for (const rawNumber of numbers) {
+		const number = rawNumber === 8 ? 8 : rawNumber;
+		if (applied.has(number)) continue;
+		applied.add(number);
+		if (number === 1) applyLinkDelete(!disable);
+		else if (number === 2) applyMediaDelete(!disable);
+		else if (number === 3) applyModRoom(!disable);
+		else if (number === 4) applyLeftSoon(!disable);
+		else if (number === 5) applyDangerWord(!disable);
+		else if (number === 6) applyJoinCohort(!disable);
+		else if (number === 7) {
+			if (disable) {
+				applyLinkDelete(false);
+				applyMediaDelete(false);
+				applyLeftSoon(false);
+				applyDangerWord(false);
+				applyJoinCohort(false);
+			} else {
+				applyLinkDelete(true);
+				applyMediaDelete(true);
+				applyModRoom(true);
+				applyLeftSoon(true);
+				applyDangerWord(true);
+				applyJoinCohort(true);
+			}
+		} else if (number === 8) {
+			applyLinkDelete(false);
+			applyMediaDelete(false);
+			applyLeftSoon(false);
+			applyDangerWord(false);
+			applyJoinCohort(false);
+		} else if (number === 9) {
+			lines.push("", "現在:", ...setupStatusLines(squareMid));
+		} else {
+			lines.push(`${number}: 対応していない番号です。`);
+		}
+	}
+
+	await ocModerationSettingsStore.flush();
+	if (!applied.has(9)) lines.push("", "現在:", ...setupStatusLines(squareMid));
+	return lines.join("\n");
+}
+
+async function executeSetup(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message, args } = command;
+	if (message.destination.kind !== "square") {
+		await message.send("このコマンドはOpenChatで実行してください。");
+		return;
+	}
+	if (!await canRunOpenChatSetup(command)) {
+		await message.send(setupPermissionDeniedText());
+		return;
+	}
+
+	const subAction = args[1]?.toLowerCase();
+	if (subAction === "status") {
+		await message.send(["OC管理セットアップ状況", ...setupStatusLines(message.destination.scopeMid)].join("\n"));
+		return;
+	}
+
+	const sentId = await message.send(setupMenuText(message.destination.scopeMid));
+	if (sentId) {
+		ocModerationSettingsStore.recordSetupSession({
+			messageId: sentId,
+			squareMid: message.destination.scopeMid,
+			squareChatMid: message.destination.chatMid,
+			createdBy: message.destination.senderMid,
+		});
+		await ocModerationSettingsStore.flush();
+	}
+}
+
+async function executeModRoom(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message, args } = command;
+	if (message.destination.kind !== "square") {
+		await message.send("このコマンドはOpenChatで実行してください。");
+		return;
+	}
+	if (!await canRunOpenChatSetup(command)) {
+		await message.send(setupPermissionDeniedText());
+		return;
+	}
+
+	const subAction = args[1]?.toLowerCase();
+	if (subAction === "set") {
+		const result = ocModerationSettingsStore.setModRoom(
+			message.destination.scopeMid,
+			message.destination.chatMid,
+			message.destination.senderMid,
+		);
+		await ocModerationSettingsStore.flush();
+		await message.send(result === "unchanged"
+			? "このトークはすでに副官部屋として設定済みです。"
+			: "このトークを副官部屋として設定しました。");
+		return;
+	}
+	if (subAction === "del" || subAction === "off" || subAction === "解除") {
+		const result = ocModerationSettingsStore.clearModRoom(message.destination.scopeMid, message.destination.senderMid);
+		await ocModerationSettingsStore.flush();
+		await message.send(result === "unchanged" ? "副官部屋は未設定です。" : "副官部屋設定を解除しました。");
+		return;
+	}
+	if (subAction === "test") {
+		const settings = ocModerationSettingsStore.snapshot(message.destination.scopeMid);
+		if (!settings.modRoomChatMid) {
+			await message.send("副官部屋が未設定です。副官部屋で !oc modroom set を実行してください。");
+			return;
+		}
+		try {
+			await message.client.base.square.sendMessage({
+				squareChatMid: settings.modRoomChatMid,
+				text: [
+					"【副官部屋テスト】",
+					"OC管理ログの送信先として設定されています。",
+					`実行者: ${message.destination.senderName ?? message.destination.senderMid}`,
+				].join("\n"),
+			});
+			await message.send("副官部屋へテストログを送信しました。");
+		} catch (error) {
+			await message.send(`副官部屋への送信に失敗しました: ${compactError(error)}`);
+		}
+		return;
+	}
+
+	await message.send([
+		"副官部屋設定",
+		...setupStatusLines(message.destination.scopeMid).filter((line) => line.startsWith("副官部屋:")),
+		"",
+		"使い方:",
+		"!oc modroom set",
+		"!oc modroom del",
+		"!oc modroom test",
+	].join("\n"));
+}
+
+export async function handleOcSetupReply(messageText: string, message: ReplyableLineMessage): Promise<boolean> {
+	if (message.destination.kind !== "square" || !message.replyToMessageId) return false;
+	const session = ocModerationSettingsStore.findSetupSession(
+		message.replyToMessageId,
+		message.destination.scopeMid,
+	);
+	if (!session || session.squareChatMid !== message.destination.chatMid) return false;
+
+	if (!await canRunOpenChatSetupMessage(message)) {
+		await message.send(setupPermissionDeniedText());
+		return true;
+	}
+
+	const selection = parseSetupSelection(messageText);
+	if (selection.numbers.length === 0) {
+		await message.send("番号を指定してください。例: 1 2 3 / off 1 2 / 9");
+		return true;
+	}
+	await message.send(await applySetupSelection(message, selection.numbers, selection.disable));
+	return true;
+}
+
 async function kickHistory(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
 	const { message } = command;
 	if (message.destination.kind !== "square") {
@@ -556,12 +842,28 @@ export const ocCommand: LineCommand = {
 			await command.message.send(helpText());
 			return;
 		}
+		if (action === "adminhelp" || action === "secret" || action === "managehelp") {
+			if (!await canRunOpenChatSetup(command)) {
+				await command.message.send(setupPermissionDeniedText());
+				return;
+			}
+			await command.message.send(adminHelpText());
+			return;
+		}
 		if (action === "authority") {
 			await command.message.send(await authorityText(command));
 			return;
 		}
 		if (action === "status") {
 			await sendModerationStatus(command);
+			return;
+		}
+		if (action === "setup") {
+			await executeSetup(command);
+			return;
+		}
+		if (action === "modroom") {
+			await executeModRoom(command);
 			return;
 		}
 		if (action === "lineurl" || action === "link" || action === "linkurl" || action === "adlink") {
@@ -584,6 +886,6 @@ export const ocCommand: LineCommand = {
 			await command.message.send("!oc kick を使用してください。confirmは不要です。");
 			return;
 		}
-		await command.message.send("使い方: !oc [authority|identity|kick|lineurl|media|status]\n詳しくは !oc help");
+		await command.message.send("使い方: !oc [authority|status]\n詳しくは !oc help");
 	},
 };
