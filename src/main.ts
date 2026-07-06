@@ -15,10 +15,13 @@ import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineSto
 import { pushSubscriptionStore } from "./subscriptions/store.js";
 import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
+import { ocIdentitySnapshotsStore } from "./moderation/ocIdentitySnapshots.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
 import {
+	handleOpenChatNoteStatusModeration,
 	handleOpenChatModeration,
 	handleOpenChatPostModeration,
+	type OpenChatNoteStatusModerationEvent,
 	type OpenChatPostModerationEvent,
 } from "./moderation/ocModeration.js";
 import { ocModerationSettingsStore } from "./moderation/ocModerationSettings.js";
@@ -63,7 +66,7 @@ interface ParsedTalkText {
 }
 
 interface RawSquareEvent {
-	type: string;
+	type: string | number;
 	payload?: {
 		notificationMessage?: {
 			squareMessage: unknown;
@@ -83,6 +86,10 @@ interface RawSquareEvent {
 			notificationPostType?: string | number;
 			text?: string;
 			actionUri?: string;
+		};
+		notifiedUpdateSquareNoteStatus?: {
+			squareMid?: string;
+			noteStatus?: unknown;
 		};
 	} & Record<string, unknown>;
 }
@@ -232,21 +239,25 @@ function shouldIgnoreStoppedText(messageText: string, message: ReplyableLineMess
 	return permissionStore.isBotStopped(target) && !isBotStartCommand(messageText);
 }
 
+function isSquareEventType(event: RawSquareEvent, name: string, value: number): boolean {
+	return event.type === name || event.type === value;
+}
+
 function squareMessagesFromEvent(event: RawSquareEvent): unknown[] {
 	const payload = event.payload;
 	if (!payload) return [];
 	const messages: unknown[] = [];
-	if (event.type === "NOTIFICATION_MESSAGE" && payload.notificationMessage?.squareMessage) {
+	if (isSquareEventType(event, "NOTIFICATION_MESSAGE", 29) && payload.notificationMessage?.squareMessage) {
 		messages.push(payload.notificationMessage.squareMessage);
 	}
-	if (event.type === "RECEIVE_MESSAGE" && payload.receiveMessage?.squareMessage) {
+	if (isSquareEventType(event, "RECEIVE_MESSAGE", 0) && payload.receiveMessage?.squareMessage) {
 		messages.push(payload.receiveMessage.squareMessage);
 	}
-	if (event.type === "SEND_MESSAGE" && payload.sendMessage?.squareMessage) {
+	if (isSquareEventType(event, "SEND_MESSAGE", 1) && payload.sendMessage?.squareMessage) {
 		messages.push(payload.sendMessage.squareMessage);
 	}
 	if (
-		event.type === "MUTATE_MESSAGE" &&
+		isSquareEventType(event, "MUTATE_MESSAGE", 41) &&
 		payload.mutateMessage?.squareMessage &&
 		!payload.mutateMessage.threadMid
 	) {
@@ -260,13 +271,27 @@ function postModerationEventFromSquareEvent(
 	event: RawSquareEvent,
 ): OpenChatPostModerationEvent | undefined {
 	const post = event.payload?.notificationPost;
-	if (event.type !== "NOTIFICATION_POST" || !post?.squareMid) return undefined;
+	if (!isSquareEventType(event, "NOTIFICATION_POST", 40) || !post?.squareMid) return undefined;
 	return {
 		client,
 		squareMid: post.squareMid,
 		notificationPostType: post.notificationPostType,
 		text: post.text,
 		actionUri: post.actionUri,
+	};
+}
+
+function noteStatusModerationEventFromSquareEvent(
+	client: Client,
+	event: RawSquareEvent,
+): OpenChatNoteStatusModerationEvent | undefined {
+	const noteStatus = event.payload?.notifiedUpdateSquareNoteStatus;
+	if (!isSquareEventType(event, "NOTIFIED_UPDATE_SQUARE_NOTE_STATUS", 36) || !noteStatus?.squareMid) {
+		return undefined;
+	}
+	return {
+		client,
+		squareMid: noteStatus.squareMid,
 	};
 }
 
@@ -846,6 +871,11 @@ async function listenRawSquareEvents(
 			void handleOpenChatPostModeration(postModerationEvent)
 				.catch((error) => handlePollingError("square", error, onFatal));
 		}
+		const noteStatusModerationEvent = noteStatusModerationEventFromSquareEvent(client, event);
+		if (noteStatusModerationEvent) {
+			void handleOpenChatNoteStatusModeration(noteStatusModerationEvent)
+				.catch((error) => handlePollingError("square", error, onFatal));
+		}
 		for (const rawMessage of squareMessagesFromEvent(event)) {
 			void handleSquareMessage(client, new SquareMessage({
 				client,
@@ -977,6 +1007,7 @@ async function main(): Promise<void> {
 		rankingStore.initialize(),
 		runtimeStore.initialize(),
 		permissionStore.initialize(),
+		ocIdentitySnapshotsStore.initialize(),
 		ocKickHistoryStore.initialize(),
 		ocModerationSettingsStore.initialize(),
 		memberNameHistoryStore.initialize(),
@@ -1006,6 +1037,7 @@ async function main(): Promise<void> {
 	await rankingStore.flush().catch(() => {});
 	await runtimeStore.flush().catch(() => {});
 	await permissionStore.flush().catch(() => {});
+	await ocIdentitySnapshotsStore.flush().catch(() => {});
 	await ocKickHistoryStore.flush().catch(() => {});
 	await ocModerationSettingsStore.flush().catch(() => {});
 	await memberNameHistoryStore.flush().catch(() => {});

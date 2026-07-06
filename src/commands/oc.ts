@@ -1,3 +1,7 @@
+import {
+	ocIdentitySnapshotsStore,
+	type OcIdentityMatch,
+} from "../moderation/ocIdentitySnapshots.js";
 import { ocKickHistoryStore } from "../moderation/ocKickHistory.js";
 import { ocModerationSettingsStore } from "../moderation/ocModerationSettings.js";
 import {
@@ -9,6 +13,7 @@ import { argValue } from "./permissionArgs.js";
 import type { LineCommand } from "./shared.js";
 
 type SquareRole = string | number | undefined;
+type IdentitySnapshotInput = Parameters<typeof ocIdentitySnapshotsStore.record>[0];
 
 const ROLE_ORDER = new Map<string, number>([
 	["ADMIN", 3],
@@ -35,6 +40,10 @@ function helpText(): string {
 		"  OC自動削除設定を表示",
 		"!oc authority",
 		"  このOCでのbot権限を表示",
+		"!oc identity [@ユーザー|userID:<p...>]",
+		"  OC内の識別材料を取得し、過去スナップショットと照合",
+		"!oc identity list",
+		"  OC内の識別材料スナップショット履歴を表示",
 		"!oc kick @ユーザー 理由",
 		"  指定したメンバーを強制退会",
 		"!oc kick @A @B 理由",
@@ -116,6 +125,103 @@ function collectKickTargets(args: string[], mentions: string[]): { mids: string[
 		mids: [...mids],
 		reason: reasonParts.join(" ").trim(),
 	};
+}
+
+function collectIdentityTarget(args: string[], mentions: string[], senderMid: string): string {
+	const mentioned = mentions.find((mid) => mid.startsWith("p"));
+	if (mentioned) return mentioned;
+
+	for (let index = 1; index < args.length; index++) {
+		const arg = args[index];
+		const lower = arg.toLowerCase();
+		const keyed = argValue([arg], "userID") || argValue([arg], "userId") || argValue([arg], "userid");
+		if (keyed && isUserIdToken(keyed)) return keyed;
+		if ((lower === "userid:" || lower === "userid") && isUserIdToken(args[index + 1] ?? "")) {
+			return args[index + 1];
+		}
+		if (isUserIdToken(arg)) return arg;
+		if (lower === "me" || lower === "self" || arg === "自分") return senderMid;
+	}
+	return senderMid;
+}
+
+function valueString(value: unknown): string | undefined {
+	if (value === undefined || value === null) return undefined;
+	const text = String(value).trim();
+	return text || undefined;
+}
+
+function positiveInt64String(value: unknown): string | undefined {
+	const text = valueString(value);
+	if (!text) return undefined;
+	const numeric = typeof value === "bigint"
+		? Number(value)
+		: typeof value === "number"
+			? value
+			: Number(text);
+	return Number.isFinite(numeric) && numeric > 0 ? text : undefined;
+}
+
+function valueStringArray(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return value.flatMap((item) => {
+		const text = valueString(item);
+		return text ? [text] : [];
+	});
+}
+
+function isoFromInt64(value: unknown): string | undefined {
+	const numeric = typeof value === "bigint"
+		? Number(value)
+		: typeof value === "number"
+			? value
+			: typeof value === "string"
+				? Number(value)
+				: Number.NaN;
+	if (!Number.isFinite(numeric) || numeric <= 0) return undefined;
+	const millis = numeric < 10_000_000_000 ? numeric * 1_000 : numeric;
+	const date = new Date(millis);
+	if (Number.isNaN(date.getTime())) return undefined;
+	return date.toISOString();
+}
+
+function formatInt64Time(value: unknown): string {
+	const raw = valueString(value);
+	const iso = isoFromInt64(value);
+	if (!iso) return raw ?? "(なし)";
+	return `${formatJst(iso)} (${raw ?? String(value)})`;
+}
+
+function truncateText(value: string | undefined, maxLength: number): string {
+	if (!value) return "(なし)";
+	const normalized = value.replace(/\s+/g, " ").trim();
+	if (normalized.length <= maxLength) return normalized;
+	return `${normalized.slice(0, Math.max(1, maxLength - 1))}…`;
+}
+
+function shortId(value: string | undefined): string {
+	if (!value) return "(なし)";
+	if (value.length <= 24) return value;
+	return `${value.slice(0, 12)}...${value.slice(-6)}`;
+}
+
+function socialUrlsText(urls: string[]): string {
+	if (urls.length === 0) return "(なし)";
+	return urls.slice(0, 3).map((url) => truncateText(url, 60)).join(", ");
+}
+
+function identityMatchLines(matches: OcIdentityMatch[]): string[] {
+	if (matches.length === 0) return ["過去候補: なし"];
+	return [
+		"過去候補:",
+		...matches.map((match, index) => {
+			const snapshot = match.snapshot;
+			return [
+				`${index + 1}. score=${match.score} ${formatJst(snapshot.at)} ${truncateText(snapshot.displayName, 20)}`,
+				`   mid=${shortId(snapshot.targetMid)} reasons=${match.reasons.join(", ")}`,
+			].join("\n");
+		}),
+	];
 }
 
 function enabledText(value: boolean): string {
@@ -225,6 +331,128 @@ async function authorityText(command: Parameters<LineCommand["execute"]>[0]): Pr
 		"",
 		`強制退会見込み: ${canRoleExecute(myRole, authority.removeSquareMember) ? "実行可能そう" : "権限不足の可能性あり"}`,
 	].join("\n");
+}
+
+async function sendIdentitySnapshotList(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message } = command;
+	const entries = ocIdentitySnapshotsStore.recent(message.destination.scopeMid, 10);
+	if (entries.length === 0) {
+		await message.send("このOCの識別材料スナップショットはまだありません。");
+		return;
+	}
+	await message.send([
+		"OC識別材料スナップショット履歴",
+		...entries.map((entry, index) => [
+			`${index + 1}. ${formatJst(entry.at)} ${truncateText(entry.displayName, 20)}`,
+			`mid=${shortId(entry.targetMid)} oneOnOne=${shortId(entry.oneOnOneChatMid)} icon=${shortId(entry.profileImageObsHash)}`,
+		].join("\n")),
+	].join("\n\n"));
+}
+
+async function executeIdentityTest(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message, args } = command;
+	if (message.destination.kind !== "square") {
+		await message.send("このコマンドはOpenChatで実行してください。");
+		return;
+	}
+	if (!await canManageOpenChatSettings(command)) {
+		await message.send("実行権限がありません。BOT管理者・モデレーター、またはこのOCの管理者・副官のみ実行できます。");
+		return;
+	}
+
+	const subAction = args[1]?.toLowerCase();
+	if (subAction === "list" || subAction === "his" || subAction === "history") {
+		await sendIdentitySnapshotList(command);
+		return;
+	}
+
+	const targetMid = collectIdentityTarget(args, message.mentionMids, message.destination.senderMid);
+	let memberResponse;
+	try {
+		memberResponse = await message.client.base.square.getSquareMember({ squareMemberMid: targetMid });
+	} catch (error) {
+		await message.send(`識別材料を取得できませんでした。\n対象: ${targetMid}\nエラー: ${compactError(error)}`);
+		return;
+	}
+
+	const member = memberResponse.squareMember;
+	const memberSquareMid = valueString(member.squareMid);
+	if (memberSquareMid && memberSquareMid !== message.destination.scopeMid) {
+		await message.send([
+			"対象はこのOCのメンバーではない可能性があります。",
+			`対象squareMid: ${memberSquareMid}`,
+			`このOC: ${message.destination.scopeMid}`,
+		].join("\n"));
+		return;
+	}
+
+	let chatMembershipState: string | undefined;
+	let chatMemberRevision: string | undefined;
+	let chatMemberError: string | undefined;
+	try {
+		const chatMemberResponse = await message.client.base.square.getSquareChatMember({
+			request: {
+				squareMemberMid: member.squareMemberMid || targetMid,
+				squareChatMid: message.destination.chatMid,
+			},
+		});
+		chatMembershipState = valueString(chatMemberResponse.squareChatMember.membershipState);
+		chatMemberRevision = valueString(chatMemberResponse.squareChatMember.revision);
+	} catch (error) {
+		chatMemberError = compactError(error);
+	}
+
+	const snapshotInput: IdentitySnapshotInput = {
+		squareMid: message.destination.scopeMid,
+		squareChatMid: message.destination.chatMid,
+		targetMid: member.squareMemberMid || targetMid,
+		displayName: valueString(member.displayName),
+		role: valueString(member.role),
+		membershipState: valueString(member.membershipState),
+		profileImageObsHash: valueString(member.profileImageObsHash),
+		ableToReceiveMessage: member.ableToReceiveMessage,
+		joinMessage: valueString(member.joinMessage),
+		memberCreatedAt: positiveInt64String(member.createdAt),
+		memberRevision: valueString(member.revision),
+		selfIntroduction: valueString(member.selfIntroduction),
+		socialMediaAccountUrls: valueStringArray(member.socialMediaAccountUrls),
+		oneOnOneChatMid: valueString(memberResponse.oneOnOneChatMid),
+		relationState: valueString(memberResponse.relation?.state),
+		relationRevision: valueString(memberResponse.relation?.revision),
+		contentsAttribute: valueString(memberResponse.contentsAttribute),
+		chatMembershipState,
+		chatMemberRevision,
+		chatMemberError,
+		actorMid: message.destination.senderMid,
+		actorName: valueString(message.destination.senderName),
+	};
+	const matches = ocIdentitySnapshotsStore.findCandidates(snapshotInput, 8);
+	const saved = ocIdentitySnapshotsStore.record(snapshotInput);
+	await ocIdentitySnapshotsStore.flush();
+
+	const chatMemberText = saved.chatMembershipState
+		? `${saved.chatMembershipState} rev=${saved.chatMemberRevision ?? "(なし)"}`
+		: saved.chatMemberError
+			? `取得失敗: ${saved.chatMemberError}`
+			: "(なし)";
+	await message.send([
+		"OC識別材料テスト",
+		`保存ID: ${saved.id}`,
+		`対象: ${saved.displayName ?? "(名前なし)"} (${saved.targetMid})`,
+		`role: ${saved.role ?? "(なし)"}`,
+		`membershipState: ${saved.membershipState ?? "(なし)"}`,
+		`createdAt: ${formatInt64Time(member.createdAt)}`,
+		`oneOnOneChatMid: ${saved.oneOnOneChatMid ?? "(空)"}`,
+		`profileImageObsHash: ${saved.profileImageObsHash ?? "(空)"}`,
+		`relation: ${saved.relationState ?? "(なし)"} rev=${saved.relationRevision ?? "(なし)"}`,
+		`contentsAttribute: ${saved.contentsAttribute ?? "(なし)"}`,
+		`chatMember: ${chatMemberText}`,
+		`ableToReceiveMessage: ${saved.ableToReceiveMessage === undefined ? "(なし)" : String(saved.ableToReceiveMessage)}`,
+		`selfIntroduction: ${truncateText(saved.selfIntroduction, 80)}`,
+		`socialUrls: ${socialUrlsText(saved.socialMediaAccountUrls)}`,
+		"",
+		...identityMatchLines(matches),
+	].join("\n"));
 }
 
 async function kickHistory(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
@@ -344,6 +572,10 @@ export const ocCommand: LineCommand = {
 			await executeModerationSetting(command, "media");
 			return;
 		}
+		if (action === "identity" || action === "idtest" || action === "fingerprint" || action === "fp") {
+			await executeIdentityTest(command);
+			return;
+		}
 		if (action === "kick") {
 			await executeKick(command);
 			return;
@@ -352,6 +584,6 @@ export const ocCommand: LineCommand = {
 			await command.message.send("!oc kick を使用してください。confirmは不要です。");
 			return;
 		}
-		await command.message.send("使い方: !oc [authority|kick|lineurl|media|status]\n詳しくは !oc help");
+		await command.message.send("使い方: !oc [authority|identity|kick|lineurl|media|status]\n詳しくは !oc help");
 	},
 };

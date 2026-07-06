@@ -25,9 +25,36 @@ export interface OpenChatPostModerationEvent {
 	actionUri?: string;
 }
 
+export interface OpenChatNoteStatusModerationEvent {
+	client: Client;
+	squareMid: string;
+}
+
 interface SquareMemberSummary {
 	role: SquareRole;
 	displayName?: string;
+}
+
+interface SquareMessageRef {
+	squareChatMid: string;
+	messageId: string;
+}
+
+interface MediaHistoryItem extends SquareMessageRef {
+	timestamp: number;
+	groupId?: string;
+}
+
+interface MediaBurstDecision {
+	shouldDelete: boolean;
+	shouldWarn: boolean;
+	reason: "group-total" | "window";
+	targets: MediaHistoryItem[];
+}
+
+interface NotePostCandidate {
+	postId: string;
+	text: string;
 }
 
 const LINE_ME_URL_PATTERN = /(?:https?:\/\/|www\.)?\bline\.me(?:[/?#:]|\b)|https?:\/\/\S*line\.me\S*/i;
@@ -63,9 +90,12 @@ const ROLE_ORDER = new Map<string, number>([
 ]);
 
 const memberCache = new Map<string, { summary: SquareMemberSummary; expiresAt: number }>();
-const mediaBurstHistory = new Map<string, number[]>();
+const mediaBurstHistory = new Map<string, MediaHistoryItem[]>();
+const mediaGroupWarnings = new Map<string, number>();
 const handledMessageIds = new Map<string, number>();
 const handledPostIds = new Map<string, number>();
+const noteScanRequests = new Map<string, Promise<boolean>>();
+const noteScanLastStartedAt = new Map<string, number>();
 const loggedMediaTypes = new Set<string>();
 
 function positiveNumber(value: number, fallback: number, minimum: number): number {
@@ -107,17 +137,17 @@ function mediaBurstKey(message: OpenChatModerationMessage): string {
 	return `${message.squareMid}:${message.senderMid}`;
 }
 
-function messageKey(message: OpenChatModerationMessage): string {
-	return `${message.squareChatMid}:${message.messageId}`;
+function messageRefKey(ref: SquareMessageRef): string {
+	return `${ref.squareChatMid}:${ref.messageId}`;
 }
 
 function wasHandled(message: OpenChatModerationMessage): boolean {
-	return handledMessageIds.has(messageKey(message));
+	return handledMessageIds.has(messageRefKey(message));
 }
 
-function rememberHandled(message: OpenChatModerationMessage): void {
+function rememberHandled(ref: SquareMessageRef): void {
 	const now = Date.now();
-	handledMessageIds.set(messageKey(message), now);
+	handledMessageIds.set(messageRefKey(ref), now);
 	if (handledMessageIds.size < 5_000) return;
 	const minimum = now - 10 * 60_000;
 	for (const [key, handledAt] of handledMessageIds) {
@@ -143,22 +173,94 @@ function rememberHandledPost(squareMid: string, postId: string): void {
 	}
 }
 
-function shouldDeleteMediaBurst(message: OpenChatModerationMessage): boolean {
+function numericMetadata(metadata: Record<string, string> | undefined, key: string): number | undefined {
+	const raw = metadata?.[key];
+	if (raw === undefined) return undefined;
+	const value = Number(raw);
+	return Number.isFinite(value) ? value : undefined;
+}
+
+function mediaGroupId(message: OpenChatModerationMessage): string | undefined {
+	const value = message.contentMetadata?.GID;
+	return value && value.trim() ? value : undefined;
+}
+
+function mediaGroupTotal(message: OpenChatModerationMessage): number | undefined {
+	return numericMetadata(message.contentMetadata, "GTOTAL");
+}
+
+function mediaHistoryItem(message: OpenChatModerationMessage): MediaHistoryItem {
+	return {
+		squareChatMid: message.squareChatMid,
+		messageId: message.messageId,
+		timestamp: finiteTimestamp(message.createdAt),
+		groupId: mediaGroupId(message),
+	};
+}
+
+function mediaWarningKey(message: OpenChatModerationMessage, groupId: string): string {
+	return `${message.squareMid}:${message.senderMid}:${groupId}`;
+}
+
+function rememberMediaGroupWarning(message: OpenChatModerationMessage, groupId: string): boolean {
+	const key = mediaWarningKey(message, groupId);
+	const warned = mediaGroupWarnings.has(key);
+	mediaGroupWarnings.set(key, Date.now());
+	if (mediaGroupWarnings.size >= 1_000) {
+		const minimum = Date.now() - MEDIA_BURST_WINDOW_MS;
+		for (const [itemKey, warnedAt] of mediaGroupWarnings) {
+			if (warnedAt < minimum) mediaGroupWarnings.delete(itemKey);
+		}
+	}
+	return !warned;
+}
+
+function mediaBurstDecision(message: OpenChatModerationMessage): MediaBurstDecision {
 	const timestamp = finiteTimestamp(message.createdAt);
 	const minimum = timestamp - MEDIA_BURST_WINDOW_MS;
 	const key = mediaBurstKey(message);
-	const recent = (mediaBurstHistory.get(key) ?? []).filter((item) => item >= minimum);
-	recent.push(timestamp);
+	const current = mediaHistoryItem(message);
+	const recent = (mediaBurstHistory.get(key) ?? [])
+		.filter((item) => item.timestamp >= minimum);
+	if (!recent.some((item) => messageRefKey(item) === messageRefKey(current))) {
+		recent.push(current);
+	}
 	mediaBurstHistory.set(key, recent);
 	pruneMediaBurstHistory(timestamp);
-	return recent.length >= MEDIA_BURST_LIMIT;
+
+	const groupId = current.groupId;
+	const groupTotal = mediaGroupTotal(message);
+	if (groupId && groupTotal !== undefined && groupTotal >= MEDIA_BURST_LIMIT) {
+		return {
+			shouldDelete: true,
+			shouldWarn: rememberMediaGroupWarning(message, groupId),
+			reason: "group-total",
+			targets: recent.filter((item) => item.groupId === groupId),
+		};
+	}
+
+	if (recent.length >= MEDIA_BURST_LIMIT) {
+		return {
+			shouldDelete: true,
+			shouldWarn: true,
+			reason: "window",
+			targets: recent,
+		};
+	}
+
+	return {
+		shouldDelete: false,
+		shouldWarn: false,
+		reason: "window",
+		targets: [],
+	};
 }
 
 function pruneMediaBurstHistory(now: number): void {
 	if (mediaBurstHistory.size < 1_000) return;
 	const minimum = now - MEDIA_BURST_WINDOW_MS;
-	for (const [key, timestamps] of mediaBurstHistory) {
-		const recent = timestamps.filter((timestamp) => timestamp >= minimum);
+	for (const [key, items] of mediaBurstHistory) {
+		const recent = items.filter((item) => item.timestamp >= minimum);
 		if (recent.length === 0) mediaBurstHistory.delete(key);
 		else mediaBurstHistory.set(key, recent);
 	}
@@ -190,32 +292,117 @@ function isPostNotificationCandidate(type: string | number | undefined): boolean
 	return !POST_NOTIFICATION_SKIP_TYPES.has(String(type));
 }
 
-function collectPostTexts(value: unknown, depth = 0): string[] {
+function isCommentLikeOrReactionKey(key: string): boolean {
+	const lower = key.toLowerCase();
+	return lower.includes("comment") || lower.includes("like") || lower.includes("reaction");
+}
+
+function isPostTextKey(key: string | undefined): boolean {
+	if (!key) return false;
+	const lower = key.toLowerCase();
+	return lower === "text" ||
+		lower === "body" ||
+		lower === "content" ||
+		lower === "contents" ||
+		lower === "description" ||
+		lower === "title";
+}
+
+function collectPostTexts(value: unknown, depth = 0, keyHint?: string): string[] {
 	if (depth > 5 || value === null || value === undefined) return [];
-	if (typeof value === "string") return [value];
+	if (typeof value === "string") return isPostTextKey(keyHint) ? [value] : [];
 	if (typeof value !== "object") return [];
-	if (Array.isArray(value)) return value.flatMap((item) => collectPostTexts(item, depth + 1));
+	if (Array.isArray(value)) return value.flatMap((item) => collectPostTexts(item, depth + 1, keyHint));
 
 	const raw = value as Record<string, unknown>;
 	const lines: string[] = [];
 	for (const [key, item] of Object.entries(raw)) {
-		const lower = key.toLowerCase();
-		if (lower.includes("comment") || lower.includes("like") || lower.includes("reaction")) continue;
-		if (lower === "text" || lower === "body" || lower === "contents" || lower === "content" || lower === "post" || lower === "postinfo" || lower === "result") {
-			lines.push(...collectPostTexts(item, depth + 1));
-		}
+		if (isCommentLikeOrReactionKey(key)) continue;
+		lines.push(...collectPostTexts(item, depth + 1, key));
 	}
 	return lines;
 }
 
+function postIdFromObject(value: unknown, depth = 0): string | undefined {
+	if (depth > 5 || value === null || typeof value !== "object") return undefined;
+	if (Array.isArray(value)) {
+		for (const item of value) {
+			const found = postIdFromObject(item, depth + 1);
+			if (found) return found;
+		}
+		return undefined;
+	}
+	const raw = value as Record<string, unknown>;
+	for (const key of ["postId", "postID", "contentId", "contentID"]) {
+		const found = stringValue(raw[key]);
+		if (found) return found;
+	}
+	for (const [key, item] of Object.entries(raw)) {
+		if (isCommentLikeOrReactionKey(key)) continue;
+		const found = postIdFromObject(item, depth + 1);
+		if (found) return found;
+	}
+	return undefined;
+}
+
+function looksLikePostObject(value: Record<string, unknown>): boolean {
+	return value.postInfo !== undefined ||
+		value.contents !== undefined ||
+		value.content !== undefined ||
+		value.post !== undefined;
+}
+
+function collectPostCandidates(value: unknown, depth = 0): NotePostCandidate[] {
+	if (depth > 6 || value === null || value === undefined || typeof value !== "object") return [];
+	if (Array.isArray(value)) return value.flatMap((item) => collectPostCandidates(item, depth + 1));
+
+	const raw = value as Record<string, unknown>;
+	const candidates: NotePostCandidate[] = [];
+	const postId = postIdFromObject(raw);
+	const text = collectPostTexts(raw).join("\n").trim();
+	if (postId && text && looksLikePostObject(raw)) candidates.push({ postId, text });
+
+	for (const [key, item] of Object.entries(raw)) {
+		if (isCommentLikeOrReactionKey(key)) continue;
+		candidates.push(...collectPostCandidates(item, depth + 1));
+	}
+
+	const unique = new Map<string, NotePostCandidate>();
+	for (const candidate of candidates) {
+		if (!unique.has(candidate.postId) || candidate.text.length > (unique.get(candidate.postId)?.text.length ?? 0)) {
+			unique.set(candidate.postId, candidate);
+		}
+	}
+	return [...unique.values()];
+}
+
+async function squareNoteApi<T>(
+	client: Client,
+	path: string,
+	method: "GET" | "POST" = "GET",
+): Promise<{ code: number; message?: string; result: T | null }> {
+	return await client.voom.call<T>("SQUARE_NOTE", {
+		routing: "SQUARE_NOTE",
+		path,
+		method,
+	});
+}
+
 async function fetchPostText(event: OpenChatPostModerationEvent, postId: string): Promise<string | undefined> {
+	const params = new URLSearchParams({
+		homeId: event.squareMid,
+		postId,
+	});
 	try {
-		const response = await event.client.base.timeline.getPost({
-			homeId: event.squareMid,
-			postId,
-		});
+		const response = await squareNoteApi(event.client, `/api/v57/post/get.json?${params}`);
 		const texts = collectPostTexts(response.result);
 		const joined = texts.join("\n").trim();
+		console.log("[oc-moderation] square note get", {
+			squareMid: event.squareMid,
+			postId,
+			code: response.code,
+			textFound: joined.length > 0,
+		});
 		return joined || undefined;
 	} catch (error) {
 		console.warn("[oc-moderation] failed to fetch square note post", {
@@ -229,16 +416,22 @@ async function fetchPostText(event: OpenChatPostModerationEvent, postId: string)
 
 async function deleteSquareNotePost(event: OpenChatPostModerationEvent, postId: string): Promise<void> {
 	rememberHandledPost(event.squareMid, postId);
+	const params = new URLSearchParams({
+		homeId: event.squareMid,
+		postId,
+	});
 	try {
-		const response = await event.client.base.timeline.deletePost({
-			homeId: event.squareMid,
-			postId,
-		});
+		const response = await squareNoteApi(event.client, `/api/v57/post/delete.json?${params}`, "POST");
 		if (response.code !== 0) {
 			console.warn("[oc-moderation] square note delete returned non-zero", {
 				squareMid: event.squareMid,
 				postId,
 				response,
+			});
+		} else {
+			console.log("[oc-moderation] square note deleted", {
+				squareMid: event.squareMid,
+				postId,
 			});
 		}
 	} catch (error) {
@@ -248,6 +441,41 @@ async function deleteSquareNotePost(event: OpenChatPostModerationEvent, postId: 
 			error,
 		});
 	}
+}
+
+async function listSquareNotePostCandidates(event: OpenChatNoteStatusModerationEvent): Promise<NotePostCandidate[]> {
+	const params = new URLSearchParams({
+		homeId: event.squareMid,
+		sourceType: "TALKROOM",
+		likeLimit: "0",
+		commentLimit: "0",
+	});
+	const response = await squareNoteApi(event.client, `/api/v57/post/list.json?${params}`);
+	if (response.code !== 0) {
+		console.warn("[oc-moderation] square note list returned non-zero", {
+			squareMid: event.squareMid,
+			response,
+		});
+		return [];
+	}
+	const candidates = collectPostCandidates(response.result);
+	console.log("[oc-moderation] square note scan result", {
+		squareMid: event.squareMid,
+		candidateCount: candidates.length,
+	});
+	return candidates;
+}
+
+async function scanSquareNotePosts(event: OpenChatNoteStatusModerationEvent): Promise<boolean> {
+	const candidates = await listSquareNotePostCandidates(event);
+	let deleted = false;
+	for (const candidate of candidates) {
+		if (wasPostHandled(event.squareMid, candidate.postId)) continue;
+		if (!containsLineMeUrl(candidate.text)) continue;
+		await deleteSquareNotePost(event, candidate.postId);
+		deleted = true;
+	}
+	return deleted;
 }
 
 function cleanDisplayName(value: string | undefined): string | undefined {
@@ -283,24 +511,55 @@ async function isPrivilegedSender(message: OpenChatModerationMessage): Promise<b
 	}
 }
 
-async function deleteSquareMessage(message: OpenChatModerationMessage): Promise<void> {
-	rememberHandled(message);
+async function deleteSquareMessageRef(
+	client: Client,
+	ref: SquareMessageRef,
+	reason: string,
+): Promise<boolean> {
+	if (handledMessageIds.has(messageRefKey(ref))) return true;
+	rememberHandled(ref);
 	try {
-		await message.client.base.square.destroyMessage({
-			squareChatMid: message.squareChatMid,
-			messageId: message.messageId,
+		const result = await client.base.square.destroyMessage({
+			squareChatMid: ref.squareChatMid,
+			messageId: ref.messageId,
 		});
-		return;
+		console.log("[oc-moderation] message deleted", {
+			reason,
+			method: "destroyMessage",
+			squareChatMid: ref.squareChatMid,
+			messageId: ref.messageId,
+			result,
+		});
+		return true;
 	} catch (destroyError) {
 		try {
-			await message.client.base.square.unsendMessage({
-				squareChatMid: message.squareChatMid,
-				messageId: message.messageId,
+			const result = await client.base.square.unsendMessage({
+				squareChatMid: ref.squareChatMid,
+				messageId: ref.messageId,
 			});
+			console.log("[oc-moderation] message deleted", {
+				reason,
+				method: "unsendMessage",
+				squareChatMid: ref.squareChatMid,
+				messageId: ref.messageId,
+				result,
+			});
+			return true;
 		} catch (unsendError) {
-			console.warn("[oc-moderation] message deletion failed", { destroyError, unsendError });
+			console.warn("[oc-moderation] message deletion failed", {
+				reason,
+				squareChatMid: ref.squareChatMid,
+				messageId: ref.messageId,
+				destroyError,
+				unsendError,
+			});
+			return false;
 		}
 	}
+}
+
+async function deleteSquareMessage(message: OpenChatModerationMessage, reason: string): Promise<boolean> {
+	return await deleteSquareMessageRef(message.client, message, reason);
 }
 
 function mentionMetadata(start: number, end: number, mid: string): Record<string, string> {
@@ -335,8 +594,26 @@ async function sendMentionNotice(message: OpenChatModerationMessage, notice: str
 }
 
 async function deleteAndNotify(message: OpenChatModerationMessage, notice: string, shouldWarn: boolean): Promise<void> {
-	await deleteSquareMessage(message);
+	await deleteSquareMessage(message, "moderation");
 	if (shouldWarn) await sendMentionNotice(message, notice);
+}
+
+async function deleteMediaBurstMessages(
+	message: OpenChatModerationMessage,
+	decision: MediaBurstDecision,
+): Promise<void> {
+	const targetKeys = new Set(decision.targets.map((target) => messageRefKey(target)));
+	if (!targetKeys.has(messageRefKey(message))) decision.targets.push(mediaHistoryItem(message));
+	for (const target of decision.targets) {
+		await deleteSquareMessageRef(message.client, target, `media-${decision.reason}`);
+	}
+	if (decision.shouldWarn) await sendMentionNotice(message, MEDIA_BURST_DELETE_NOTICE);
+	console.log("[oc-moderation] media burst deleted", {
+		reason: decision.reason,
+		targetCount: decision.targets.length,
+		contentType: message.contentType,
+		metadata: message.contentMetadata,
+	});
 }
 
 function logMediaModerationCandidate(message: OpenChatModerationMessage): void {
@@ -371,18 +648,17 @@ export async function handleOpenChatModeration(message: OpenChatModerationMessag
 	}
 
 	if (settings.linkDeleteEnabled && ocModerationSettingsStore.isLinkDeletionLocked(message.squareMid, message.senderMid)) {
-		await deleteSquareMessage(message);
+		await deleteSquareMessage(message, "locked-url-offender");
 		return true;
 	}
 
 	if (settings.mediaBurstDeleteEnabled) logMediaModerationCandidate(message);
-	if (
-		settings.mediaBurstDeleteEnabled &&
-		isImageOrVideo(message.contentType) &&
-		shouldDeleteMediaBurst(message)
-	) {
-		await deleteAndNotify(message, MEDIA_BURST_DELETE_NOTICE, true);
-		return true;
+	if (settings.mediaBurstDeleteEnabled && isImageOrVideo(message.contentType)) {
+		const decision = mediaBurstDecision(message);
+		if (decision.shouldDelete) {
+			await deleteMediaBurstMessages(message, decision);
+			return true;
+		}
 	}
 
 	return false;
@@ -411,4 +687,33 @@ export async function handleOpenChatPostModeration(event: OpenChatPostModeration
 
 	await deleteSquareNotePost(event, postId);
 	return true;
+}
+
+export async function handleOpenChatNoteStatusModeration(
+	event: OpenChatNoteStatusModerationEvent,
+): Promise<boolean> {
+	const settings = ocModerationSettingsStore.snapshot(event.squareMid);
+	if (!settings.linkDeleteEnabled) return false;
+
+	const running = noteScanRequests.get(event.squareMid);
+	if (running) return await running;
+
+	const now = Date.now();
+	const lastStartedAt = noteScanLastStartedAt.get(event.squareMid) ?? 0;
+	if (now - lastStartedAt < 3_000) return false;
+	noteScanLastStartedAt.set(event.squareMid, now);
+
+	const request = scanSquareNotePosts(event)
+		.catch((error) => {
+			console.warn("[oc-moderation] square note scan failed", {
+				squareMid: event.squareMid,
+				error,
+			});
+			return false;
+		})
+		.finally(() => {
+			noteScanRequests.delete(event.squareMid);
+		});
+	noteScanRequests.set(event.squareMid, request);
+	return await request;
 }

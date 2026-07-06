@@ -98,6 +98,11 @@ export const appConfig = {
 	),
 	ocModerationSettingsGithubPath:
 		process.env.OC_MODERATION_SETTINGS_GITHUB_PATH || "moderation/oc-moderation-settings.json",
+	ocIdentitySnapshotsFile: path.resolve(
+		process.env.OC_IDENTITY_SNAPSHOTS_FILE || "./storage/oc-identity-snapshots.json",
+	),
+	ocIdentitySnapshotsGithubPath:
+		process.env.OC_IDENTITY_SNAPSHOTS_GITHUB_PATH || "moderation/oc-identity-snapshots.json",
 	ocMediaBurstWindowMs: Number(process.env.OC_MEDIA_BURST_WINDOW_MS || 60_000),
 	ocMediaBurstLimit: Number(process.env.OC_MEDIA_BURST_LIMIT || 5),
 	memberNameHistoryFile: path.resolve(process.env.MEMBER_NAME_HISTORY_FILE || "./storage/member-name-history.json"),
