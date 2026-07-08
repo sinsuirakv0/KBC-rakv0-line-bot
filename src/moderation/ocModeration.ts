@@ -72,6 +72,7 @@ interface SquareMessageRef {
 interface MediaHistoryItem extends SquareMessageRef {
 	timestamp: number;
 	groupId?: string;
+	groupSeq?: number;
 }
 
 interface MediaBurstDecision {
@@ -91,12 +92,8 @@ const LINK_DELETE_NOTICE = [
 	"このOCではトークでの宣伝が許可されていません。",
 	"ノートの宣伝用ノートにお願いします。",
 ].join("\n");
-const MEDIA_BURST_DELETE_NOTICE = [
-	"画像、動画の連投は許可されていません。",
-	"ラグ軽減のためにもスレッドへ送信してください。",
-].join("\n");
-const MEDIA_BURST_WINDOW_MS = positiveNumber(appConfig.ocMediaBurstWindowMs, 60_000, 1_000);
-const MEDIA_BURST_LIMIT = positiveNumber(appConfig.ocMediaBurstLimit, 5, 1);
+const MEDIA_BURST_WINDOW_MS = positiveNumber(appConfig.ocMediaBurstWindowMs, 30_000, 1_000);
+const MEDIA_BURST_LIMIT = positiveNumber(appConfig.ocMediaBurstLimit, 7, 1);
 const DANGER_WORD_WINDOW_MS = 2 * 60_000;
 const LEFT_SOON_NO_MESSAGE_AUTO_BAN_MS = 60_000;
 const LEFT_SOON_WITH_MESSAGE_AUTO_BAN_MS = 30_000;
@@ -129,6 +126,7 @@ const ROLE_ORDER = new Map<string, number>([
 const memberCache = new Map<string, { summary: SquareMemberSummary; expiresAt: number }>();
 const mediaBurstHistory = new Map<string, MediaHistoryItem[]>();
 const mediaGroupWarnings = new Map<string, number>();
+const mediaWindowWarnings = new Map<string, number>();
 const handledMessageIds = new Map<string, number>();
 const handledPostIds = new Map<string, number>();
 const noteScanRequests = new Map<string, Promise<boolean>>();
@@ -272,12 +270,17 @@ function mediaGroupTotal(message: OpenChatModerationMessage): number | undefined
 	return numericMetadata(message.contentMetadata, "GTOTAL");
 }
 
+function mediaGroupSeq(message: OpenChatModerationMessage): number | undefined {
+	return numericMetadata(message.contentMetadata, "GSEQ");
+}
+
 function mediaHistoryItem(message: OpenChatModerationMessage): MediaHistoryItem {
 	return {
 		squareChatMid: message.squareChatMid,
 		messageId: message.messageId,
 		timestamp: finiteTimestamp(message.createdAt),
 		groupId: mediaGroupId(message),
+		groupSeq: mediaGroupSeq(message),
 	};
 }
 
@@ -298,6 +301,33 @@ function rememberMediaGroupWarning(message: OpenChatModerationMessage, groupId: 
 	return !warned;
 }
 
+function rememberMediaWindowWarning(message: OpenChatModerationMessage): boolean {
+	const key = mediaBurstKey(message);
+	const warnedAt = mediaWindowWarnings.get(key);
+	const now = Date.now();
+	mediaWindowWarnings.set(key, now);
+	if (mediaWindowWarnings.size >= 1_000) {
+		const minimum = now - MEDIA_BURST_WINDOW_MS;
+		for (const [itemKey, warnedAtValue] of mediaWindowWarnings) {
+			if (warnedAtValue < minimum) mediaWindowWarnings.delete(itemKey);
+		}
+	}
+	return warnedAt === undefined || warnedAt < now - MEDIA_BURST_WINDOW_MS;
+}
+
+function mediaOverflowTargets(items: MediaHistoryItem[]): MediaHistoryItem[] {
+	return [...items]
+		.sort((a, b) => a.timestamp - b.timestamp)
+		.slice(Math.max(0, MEDIA_BURST_LIMIT - 1));
+}
+
+function mediaGroupOverflowTargets(items: MediaHistoryItem[]): MediaHistoryItem[] {
+	if (items.some((item) => item.groupSeq !== undefined)) {
+		return items.filter((item) => (item.groupSeq ?? 0) >= MEDIA_BURST_LIMIT);
+	}
+	return mediaOverflowTargets(items);
+}
+
 function mediaBurstDecision(message: OpenChatModerationMessage): MediaBurstDecision {
 	const timestamp = finiteTimestamp(message.createdAt);
 	const minimum = timestamp - MEDIA_BURST_WINDOW_MS;
@@ -314,20 +344,29 @@ function mediaBurstDecision(message: OpenChatModerationMessage): MediaBurstDecis
 	const groupId = current.groupId;
 	const groupTotal = mediaGroupTotal(message);
 	if (groupId && groupTotal !== undefined && groupTotal >= MEDIA_BURST_LIMIT) {
+		const targets = mediaGroupOverflowTargets(recent.filter((item) => item.groupId === groupId));
+		if (targets.length === 0) {
+			return {
+				shouldDelete: false,
+				shouldWarn: false,
+				reason: "group-total",
+				targets: [],
+			};
+		}
 		return {
 			shouldDelete: true,
 			shouldWarn: rememberMediaGroupWarning(message, groupId),
 			reason: "group-total",
-			targets: recent.filter((item) => item.groupId === groupId),
+			targets,
 		};
 	}
 
 	if (recent.length >= MEDIA_BURST_LIMIT) {
 		return {
 			shouldDelete: true,
-			shouldWarn: true,
+			shouldWarn: rememberMediaWindowWarning(message),
 			reason: "window",
-			targets: recent,
+			targets: mediaOverflowTargets(recent),
 		};
 	}
 
@@ -676,6 +715,24 @@ async function sendMentionNotice(message: OpenChatModerationMessage, notice: str
 	}
 }
 
+async function sendPlainNotice(message: OpenChatModerationMessage, notice: string): Promise<void> {
+	try {
+		await message.client.base.square.sendMessage({
+			squareChatMid: message.squareChatMid,
+			text: notice,
+		});
+	} catch (error) {
+		console.warn("[oc-moderation] notice send failed", error);
+	}
+}
+
+function mediaBurstDeleteNotice(): string {
+	return [
+		`${MEDIA_BURST_LIMIT}枚以上画像(動画)を連投した為、一部画像を削除しました。`,
+		`ラグ軽減の為、${MEDIA_BURST_LIMIT}枚以上送信する場合はスレッドにお願いします。`,
+	].join("\n");
+}
+
 function squareSendMessageId(value: unknown): string | undefined {
 	const result = value as {
 		createdSquareMessage?: { message?: { id?: string } };
@@ -789,12 +846,10 @@ async function deleteMediaBurstMessages(
 	message: OpenChatModerationMessage,
 	decision: MediaBurstDecision,
 ): Promise<void> {
-	const targetKeys = new Set(decision.targets.map((target) => messageRefKey(target)));
-	if (!targetKeys.has(messageRefKey(message))) decision.targets.push(mediaHistoryItem(message));
 	for (const target of decision.targets) {
 		await deleteSquareMessageRef(message.client, target, `media-${decision.reason}`);
 	}
-	if (decision.shouldWarn) await sendMentionNotice(message, MEDIA_BURST_DELETE_NOTICE);
+	if (decision.shouldWarn) await sendPlainNotice(message, mediaBurstDeleteNotice());
 	console.log("[oc-moderation] media burst deleted", {
 		reason: decision.reason,
 		targetCount: decision.targets.length,

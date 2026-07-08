@@ -113,8 +113,8 @@ export const appConfig = {
 	),
 	ocIdentitySnapshotsGithubPath:
 		process.env.OC_IDENTITY_SNAPSHOTS_GITHUB_PATH || "moderation/oc-identity-snapshots.json",
-	ocMediaBurstWindowMs: Number(process.env.OC_MEDIA_BURST_WINDOW_MS || 60_000),
-	ocMediaBurstLimit: Number(process.env.OC_MEDIA_BURST_LIMIT || 5),
+	ocMediaBurstWindowMs: Number(process.env.OC_MEDIA_BURST_WINDOW_MS || 30_000),
+	ocMediaBurstLimit: Number(process.env.OC_MEDIA_BURST_LIMIT || 7),
 	memberNameHistoryFile: path.resolve(process.env.MEMBER_NAME_HISTORY_FILE || "./storage/member-name-history.json"),
 	memberNameHistoryGithubPath: process.env.MEMBER_NAME_HISTORY_GITHUB_PATH || "logs/member-name-history.json",
 	memberNameScanIntervalMs: Number(process.env.MEMBER_NAME_SCAN_INTERVAL_MS || 30 * 60_000),
