@@ -1,8 +1,14 @@
 ﻿import { SquareMessage, type Client } from "@evex/linejs";
+import { LINEStruct } from "@evex/linejs/thrift";
 import { appConfig } from "./config.js";
 import { handleLineCommand } from "./commands/index.js";
 import { handleOcSetupReply } from "./commands/oc.js";
-import type { OutgoingImage, OutgoingMention, ReplyableLineMessage } from "./commands/shared.js";
+import {
+	THREAD_OUTPUT_NOTICE,
+	type OutgoingImage,
+	type OutgoingMention,
+	type ReplyableLineMessage,
+} from "./commands/shared.js";
 import { handleSearchPageReply } from "./commands/searchPages.js";
 import { handleLogTargetSelectionReply } from "./commands/log.js";
 import { handlePing } from "./handlers/ping.js";
@@ -736,6 +742,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	private threadMid?: string;
 	readonly isThreadSource: boolean;
 	private threadJoinAttempted = false;
+	private rootNoticeSent = false;
 
 	constructor(
 		readonly client: Client,
@@ -757,6 +764,10 @@ class SquareReplyTarget implements ReplyableLineMessage {
 			senderName,
 			encrypted: false,
 		};
+	}
+
+	threadNoticeSent(): boolean {
+		return this.rootNoticeSent;
 	}
 
 	async reply(text: string): Promise<string | undefined> {
@@ -876,7 +887,13 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	}
 
 	private async resolveThreadMid(debugLines?: string[]): Promise<string> {
-		if (!this.threadMid) {
+		if (!this.threadMid) this.threadMid = await this.createThreadRoot(debugLines);
+		await this.joinThread(this.threadMid, debugLines);
+		return this.threadMid;
+	}
+
+	private async createThreadRoot(debugLines?: string[]): Promise<string> {
+		if (this.isThreadSource) {
 			const messageId = (this.message.raw as RawSquareMessage).message?.id;
 			if (!messageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
 			debugLines?.push(`getSquareThreadMid request chatMid=${this.destination.chatMid} messageId=${messageId}`);
@@ -886,11 +903,56 @@ class SquareReplyTarget implements ReplyableLineMessage {
 					messageId,
 				},
 			});
-			this.threadMid = response.threadMid;
-			debugLines?.push(`getSquareThreadMid response threadMid=${this.threadMid}`);
+			debugLines?.push(`getSquareThreadMid response threadMid=${response.threadMid}`);
+			return response.threadMid;
 		}
-		await this.joinThread(this.threadMid, debugLines);
-		return this.threadMid;
+
+		const sourceMessageId = (this.message.raw as RawSquareMessage).message?.id;
+		debugLines?.push("create thread root by sendMessage(threadInfo.threadRoot=true)");
+		const sent = await this.client.base.request.request(
+			LINEStruct.SquareService_sendMessage_args({
+				request: {
+					reqSeq: await this.client.base.getReqseq("sq"),
+					squareChatMid: this.destination.chatMid,
+					squareMessage: {
+						squareMessageRevision: 4,
+						threadInfo: { threadRoot: true },
+						message: {
+							to: this.destination.chatMid,
+							toType: "SQUARE_CHAT",
+							text: THREAD_OUTPUT_NOTICE,
+							contentType: "NONE",
+							...(sourceMessageId
+								? {
+									relatedMessageId: sourceMessageId,
+									relatedMessageServiceCode: "SQUARE",
+									messageRelationType: "REPLY",
+								}
+								: {}),
+						},
+					},
+				},
+			}),
+			"sendMessage",
+			4,
+			true,
+			"/SQ1",
+		);
+		this.rootNoticeSent = true;
+		const threadMid = threadMidFromSquareSendResult(sent);
+		const rootMessageId = messageIdFromSquareSendResult(sent);
+		debugLines?.push(`thread root send=OK id=${rootMessageId ?? "(unknown)"} threadMid=${threadMid ?? "(none)"}`);
+		if (threadMid) return threadMid;
+		if (!rootMessageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
+		debugLines?.push(`getSquareThreadMid(root) request chatMid=${this.destination.chatMid} messageId=${rootMessageId}`);
+		const response = await this.client.base.square.getSquareThreadMid({
+			request: {
+				chatMid: this.destination.chatMid,
+				messageId: rootMessageId,
+			},
+		});
+		debugLines?.push(`getSquareThreadMid(root) response threadMid=${response.threadMid}`);
+		return response.threadMid;
 	}
 
 	private async joinThread(threadMid: string, debugLines?: string[]): Promise<void> {
@@ -1026,6 +1088,19 @@ function messageIdFromSquareSendResult(value: unknown): string | undefined {
 		result.squareMessage?.message?.id ??
 		result.message?.id ??
 		result.id;
+}
+
+function threadMidFromSquareSendResult(value: unknown): string | undefined {
+	const result = value as {
+		createdSquareMessage?: { threadInfo?: { chatThreadMid?: string } };
+		createdThreadMessage?: { threadInfo?: { chatThreadMid?: string } };
+		squareMessage?: { threadInfo?: { chatThreadMid?: string } };
+		threadInfo?: { chatThreadMid?: string };
+	};
+	return result.createdSquareMessage?.threadInfo?.chatThreadMid ??
+		result.createdThreadMessage?.threadInfo?.chatThreadMid ??
+		result.squareMessage?.threadInfo?.chatThreadMid ??
+		result.threadInfo?.chatThreadMid;
 }
 
 function talkMentionMids(raw: RawTalkMessage): string[] {

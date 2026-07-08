@@ -51,6 +51,7 @@ export interface ReplyableLineMessage {
 	send(text: string): Promise<string | undefined>;
 	sendThread?(text: string): Promise<string | undefined>;
 	isThreadSource?: boolean;
+	threadNoticeSent?(): boolean;
 	debugThread?(text?: string): Promise<string[]>;
 	sendMention?(text: string, mentions: OutgoingMention[]): Promise<string | undefined>;
 	sendImage(image: OutgoingImage): Promise<void>;
@@ -330,7 +331,9 @@ export async function sendLong(
 		try {
 			const sendThread = message.sendThread.bind(message);
 			await sendLongChunks(chunks, sendThread, sendThread);
-			if (options.threadNotice && !message.isThreadSource) await message.reply(options.threadNotice);
+			if (options.threadNotice && !message.isThreadSource && !message.threadNoticeSent?.()) {
+				await message.reply(options.threadNotice);
+			}
 			return;
 		} catch (error) {
 			console.warn("[line] thread output failed; falling back to chat output", error);

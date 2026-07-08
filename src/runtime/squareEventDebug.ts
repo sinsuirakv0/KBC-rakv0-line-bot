@@ -15,6 +15,7 @@ interface SquareEventDebugRecord {
 	type: string;
 	payloadKeys: string[];
 	messages: SquareEventDebugMessage[];
+	threadLines: string[];
 }
 
 const MAX_RECORDS = 80;
@@ -59,10 +60,40 @@ function messageSummary(source: string, value: unknown): SquareEventDebugMessage
 	};
 }
 
+function threadSummary(source: string, value: unknown): string | undefined {
+	const raw = rawObject(value);
+	if (!raw) return undefined;
+	const squareThread = rawObject(raw.squareThread);
+	const threadMember = rawObject(raw.threadMember);
+	const threadRootMessage = rawObject(raw.threadRootMessage);
+	const rootMessage = rawObject(threadRootMessage?.message);
+	const threadMid = rawString(raw.threadMid) ?? rawString(squareThread?.threadMid) ?? rawString(threadMember?.threadMid);
+	const chatMid = rawString(raw.chatMid) ?? rawString(squareThread?.chatMid) ?? rawString(threadMember?.chatMid);
+	const state = squareThread?.state === undefined ? undefined : String(squareThread.state);
+	const memberState = threadMember?.membershipState === undefined ? undefined : String(threadMember.membershipState);
+	const rootId = rawString(raw.threadRootMessageId) ?? rawString(rootMessage?.id) ?? rawString(squareThread?.messageId);
+	if (!threadMid && !chatMid && !state && !memberState && !rootId && !source.toLowerCase().includes("thread")) {
+		return undefined;
+	}
+	const parts = [
+		`source=${source}`,
+		`threadMid=${threadMid ?? "(none)"}`,
+		`chatMid=${chatMid ?? "(none)"}`,
+		`state=${state ?? "(none)"}`,
+		`memberState=${memberState ?? "(none)"}`,
+		`rootId=${rootId ?? "(none)"}`,
+	];
+	return parts.join(" ");
+}
+
 export function recordSquareEventDebug(event: unknown): void {
 	const payload = eventPayload(event);
 	const messages = Object.entries(payload).flatMap(([key, value]) => {
 		const summary = messageSummary(key, value);
+		return summary ? [summary] : [];
+	});
+	const threadLines = Object.entries(payload).flatMap(([key, value]) => {
+		const summary = threadSummary(key, value);
 		return summary ? [summary] : [];
 	});
 	records.push({
@@ -70,6 +101,7 @@ export function recordSquareEventDebug(event: unknown): void {
 		type: eventType(event),
 		payloadKeys: Object.keys(payload).filter((key) => payload[key] !== undefined),
 		messages,
+		threadLines,
 	});
 	while (records.length > MAX_RECORDS) records.shift();
 }
@@ -82,7 +114,6 @@ export function formatSquareEventDebugLog(limit = 12): string {
 		lines.push("");
 		lines.push(`${record.receivedAt} type=${record.type}`);
 		lines.push(`payload=${record.payloadKeys.join(",") || "(none)"}`);
-		if (record.messages.length === 0) continue;
 		for (const message of record.messages) {
 			lines.push(
 				[
@@ -98,6 +129,7 @@ export function formatSquareEventDebugLog(limit = 12): string {
 			);
 			if (message.text) lines.push(`text=${message.text}`);
 		}
+		for (const line of record.threadLines) lines.push(line);
 	}
 	return lines.join("\n");
 }
