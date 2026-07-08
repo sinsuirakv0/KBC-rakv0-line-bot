@@ -33,7 +33,7 @@ function rawString(value: unknown): string | undefined {
 
 function eventType(value: unknown): string {
 	const raw = rawObject(value);
-	return String(raw?.type ?? "(typeなし)");
+	return String(raw?.type ?? "(type none)");
 }
 
 function eventPayload(value: unknown): Record<string, unknown> {
@@ -53,7 +53,7 @@ function messageSummary(source: string, value: unknown): SquareEventDebugMessage
 		from: rawString(message.from),
 		to: rawString(message.to),
 		toType: message.toType === undefined ? undefined : String(message.toType),
-		text: text && text.length > 120 ? `${text.slice(0, 119)}…` : text,
+		text: text && text.length > 120 ? `${text.slice(0, 119)}...` : text,
 		payloadThreadMid: rawString(raw?.threadMid),
 		rawThreadMid: rawString(threadInfo?.chatThreadMid),
 		threadRootMessageId: rawString(raw?.threadRootMessageId),
