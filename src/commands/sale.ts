@@ -2,23 +2,31 @@
 import {
 	fetchCsvMap,
 	fetchJson,
-	formatDateFull,
 	formatDateShort,
-	formatTimeBlock,
 	isExactInteger,
 	parseDate,
 	sendError,
 	sendLong,
 } from "./shared.js";
+import {
+	cleanDetailLines,
+	compactLine,
+	formatEventPeriod,
+	formatEventPeriodShort,
+	formatEventStatus,
+	formatTimeBlockLines,
+	formatVersionRange,
+	joinBlocks,
+	type EventHeader,
+} from "./eventDisplay.js";
+import {
+	classifyEventId,
+	formatEventIdTags,
+	isMissionEventId,
+	missionLookupId,
+} from "../search/eventIdClassification.js";
 
-interface SaleHeader {
-	startDate: string;
-	startTime: string;
-	endDate: string;
-	endTime: string;
-	minVersion: string;
-	maxVersion: string;
-}
+interface SaleHeader extends EventHeader {}
 
 interface SaleEntry {
 	header: SaleHeader;
@@ -32,12 +40,18 @@ interface SaleJson {
 	data: SaleEntry[];
 }
 
-async function loadSale(): Promise<{ json: SaleJson; names: Map<number, string> }> {
-	const [json, names] = await Promise.all([
+interface SaleNameMaps {
+	sale: Map<number, string>;
+	mission: Map<number, string>;
+}
+
+async function loadSale(): Promise<{ json: SaleJson; names: SaleNameMaps }> {
+	const [json, saleNames, missionNames] = await Promise.all([
 		fetchJson<SaleJson>("data/sale.json"),
 		fetchCsvMap("data/sale_name.csv"),
+		fetchCsvMap("data/Mission_Name.csv"),
 	]);
-	return { json, names };
+	return { json, names: { sale: saleNames, mission: missionNames } };
 }
 
 function isPermanent(entry: SaleEntry): boolean {
@@ -50,7 +64,50 @@ function isActive(entry: SaleEntry, now: Date): boolean {
 	return now >= start && now < end;
 }
 
-function scheduleText(json: SaleJson, names: Map<number, string>): string {
+function splitMissionText(rawName: string): { name: string; popupText: string } {
+	const text = rawName.replace(/<br\s*\/?>/gi, "\n").trim();
+	const comma = text.search(/[,，]/);
+	if (comma === -1) return { name: text, popupText: "" };
+	return {
+		name: text.slice(0, comma).trim(),
+		popupText: text.slice(comma + 1).trim(),
+	};
+}
+
+function nameForId(id: number, names: SaleNameMaps): string {
+	if (!isMissionEventId(id)) return names.sale.get(id) ?? `ID:${id}`;
+	const raw = names.mission.get(missionLookupId(id)) ?? `ID:${id}`;
+	return splitMissionText(raw).name;
+}
+
+function popupTextForId(id: number, names: SaleNameMaps): string[] {
+	if (!isMissionEventId(id)) return [];
+	const raw = names.mission.get(missionLookupId(id));
+	if (!raw) return [];
+	return cleanDetailLines(splitMissionText(raw).popupText);
+}
+
+function orderedIds(entry: SaleEntry, selectedId?: number): number[] {
+	if (selectedId === undefined || !entry.stageIds.includes(selectedId)) return entry.stageIds;
+	return [selectedId, ...entry.stageIds.filter((id) => id !== selectedId)];
+}
+
+function targetLine(id: number, names: SaleNameMaps): string {
+	const classification = classifyEventId(id);
+	const code = classification.displayCode ? ` [${classification.displayCode}]` : "";
+	return `${id}${code} ${nameForId(id, names)}（${classification.kind} / ${classification.tagLabel}）`;
+}
+
+function targetSearchText(id: number, names: SaleNameMaps): string {
+	return [
+		String(id),
+		nameForId(id, names),
+		formatEventIdTags(id),
+		classifyEventId(id).jdbUrl ?? "",
+	].join(" ").toLowerCase();
+}
+
+function scheduleText(json: SaleJson, names: SaleNameMaps): string {
 	const now = new Date();
 	const entries = json.data
 		.filter((entry) => !isPermanent(entry) && parseDate(entry.header.endDate, entry.header.endTime) > now)
@@ -59,30 +116,71 @@ function scheduleText(json: SaleJson, names: Map<number, string>): string {
 			parseDate(b.header.startDate, b.header.startTime).getTime()
 		);
 
-	const lines = [`セールスケジュール 更新: ${json.updatedAt}`];
+	const lines = ["sale/missionスケジュール", `更新: ${json.updatedAt}`];
 	for (const entry of entries) {
 		const start = parseDate(entry.header.startDate, entry.header.startTime);
 		const end = parseDate(entry.header.endDate, entry.header.endTime);
+		lines.push("");
 		lines.push(`${isActive(entry, now) ? "開催中" : "予定"} ${formatDateShort(start)} ~ ${formatDateShort(end)}`);
 		for (const id of entry.stageIds) {
-			lines.push(`  ${id} ${names.get(id) ?? "不明"}`);
+			lines.push(`・${targetLine(id, names)}`);
 		}
-		lines.push("");
+		if (entry.timeBlocks.length > 0) {
+			lines.push(`  開催期間: ${compactLine(formatTimeBlockLines(entry.timeBlocks).join(" / "), 120)}`);
+		}
 	}
 	return lines.join("\n").trim();
 }
 
-function detailText(entry: SaleEntry, names: Map<number, string>): string {
-	const start = parseDate(entry.header.startDate, entry.header.startTime);
-	const end = isPermanent(entry) ? null : parseDate(entry.header.endDate, entry.header.endTime);
-	const lines = entry.stageIds.map((id) => `${id} ${names.get(id) ?? "不明"}`);
-	lines.push(`${formatDateFull(start)} ~ ${end ? formatDateFull(end) : "常設"}  ver.${entry.header.minVersion}~${entry.header.maxVersion}`);
-	if (entry.timeBlocks.length === 0) {
-		lines.push("・常時開催");
-	} else {
-		for (const block of entry.timeBlocks) lines.push(`・${formatTimeBlock(block)}`);
-	}
-	return lines.join("\n");
+function detailText(entry: SaleEntry, names: SaleNameMaps, selectedId?: number): string {
+	const ids = orderedIds(entry, selectedId);
+	const primaryId = selectedId ?? ids[0];
+	const primary = classifyEventId(primaryId);
+	const tagSummary = [...new Set(ids.flatMap((id) => {
+		const classification = classifyEventId(id);
+		return [
+			classification.kind,
+			classification.tagLabel,
+			classification.displayCode,
+		].filter(Boolean);
+	}))].join(" / ");
+	const popupLines = ids.flatMap((id) => popupTextForId(id, names));
+	const linkLines = [
+		primary.jdbUrl ? `JDB: ${primary.jdbUrl}` : "",
+		primary.dbUrl ? `DB: ${primary.dbUrl}` : "",
+		primary.stageProxyUrl ? `公式表示: ${primary.stageProxyUrl}` : "",
+	].filter(Boolean);
+
+	return joinBlocks([
+		[
+			`【${primary.kind}詳細】${formatEventStatus(entry.header)}`,
+			`期間: ${formatEventPeriod(entry.header)}`,
+			`ver: ${formatVersionRange(entry.header)}`,
+			`id: ${primaryId}${primary.displayCode ? ` [${primary.displayCode}]` : ""}`,
+			`タグ: ${tagSummary || "その他"}`,
+		],
+		[
+			"開催期間:",
+			...formatTimeBlockLines(entry.timeBlocks).map((line) => `・${line}`),
+		],
+		[
+			ids.length > 1 ? "対象ステージ:" : "対象ID:",
+			...ids.map((id) => `・${targetLine(id, names)}`),
+		],
+		popupLines.length > 0 ? ["ポップアップ:", ...popupLines] : [],
+		linkLines.length > 0 ? ["リンク:", ...linkLines] : [],
+		[`短縮期間: ${formatEventPeriodShort(entry.header)}`],
+	]);
+}
+
+function searchText(json: SaleJson, names: SaleNameMaps, query: string): string {
+	const ids = [...new Set(json.data.flatMap((entry) => entry.stageIds))].sort((a, b) => a - b);
+	const matched = ids.filter((id) => targetSearchText(id, names).includes(query.toLowerCase()));
+	if (matched.length === 0) return `「${query}」は見つかりませんでした`;
+	return [
+		`「${query}」検索結果 (${matched.length}件)`,
+		...matched.map((id) => targetLine(id, names)),
+	].join("\n");
 }
 
 export const saleCommand: LineCommand = {
@@ -93,11 +191,11 @@ export const saleCommand: LineCommand = {
 				"!sale",
 				"",
 				"!sale",
-				"  今後のセール/イベントスケジュールを一覧表示します。",
+				"  今後のsale/missionスケジュールを一覧表示します。",
 				"!sale <ID>",
-				"  指定したイベントIDの開催期間や開催時間を表示します。",
+				"  指定したIDの期間、分類、開催期間、対象ID、リンクを表示します。",
 				"!sale <検索語>",
-				"  イベント名で検索します。",
+				"  イベント名、ID、分類コード(A000など)で検索します。",
 				"!sale <ID> json",
 				"  元データをKBC独自のJSON形式で表示します。",
 				"!sale <ID> r",
@@ -134,21 +232,11 @@ export const saleCommand: LineCommand = {
 					);
 					return;
 				}
-				await sendLong(message, entries.map((entry) => detailText(entry, names)).join("\n\n"));
+				await sendLong(message, entries.map((entry) => detailText(entry, names, id)).join("\n\n"));
 				return;
 			}
 
-			const query = args.join(" ").toLowerCase();
-			const matched = [...names.entries()].filter(([, name]) => name.toLowerCase().includes(query));
-			if (matched.length === 0) {
-				await sendError(message, `「${args.join(" ")}」は見つかりませんでした`);
-				return;
-			}
-			await sendLong(
-				message,
-				[`「${args.join(" ")}」の検索結果 (${matched.length}件)`, ...matched.map(([id, name]) => `${id} ${name}`)]
-					.join("\n"),
-			);
+			await sendLong(message, searchText(json, names, args.join(" ")));
 		} catch (error) {
 			console.error("[sale] failed", error);
 			await sendError(message, "セールデータの取得または処理に失敗しました");

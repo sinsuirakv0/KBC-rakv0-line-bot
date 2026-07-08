@@ -1,24 +1,32 @@
 ﻿import type { LineCommand, TimeBlock } from "./shared.js";
 import {
-	fetchItemNameMap,
+	fetchCsvMap,
+	fetchItemNameData,
 	fetchJson,
-	formatDateFull,
+	fetchOptionalText,
 	formatDateShort,
-	formatTimeBlock,
 	isExactInteger,
 	parseDate,
+	parseTsvFirstColumnText,
 	sendError,
 	sendLong,
+	type ItemNameData,
 } from "./shared.js";
+import {
+	cleanDetailLines,
+	compactLine,
+	formatAmount,
+	formatEventPeriod,
+	formatEventPeriodShort,
+	formatEventStatus,
+	formatIdBand,
+	formatTimeBlockLines,
+	formatVersionRange,
+	joinBlocks,
+	type EventHeader,
+} from "./eventDisplay.js";
 
-interface ItemHeader {
-	startDate: string;
-	startTime: string;
-	endDate: string;
-	endTime: string;
-	minVersion: string;
-	maxVersion: string;
-}
+interface ItemHeader extends EventHeader {}
 
 interface Gift {
 	eventId: number;
@@ -42,16 +50,60 @@ interface ItemJson {
 	data: ItemEntry[];
 }
 
-async function loadItem(): Promise<{ json: ItemJson; names: Map<number, string> }> {
-	const [json, names] = await Promise.all([
+interface ItemLookup {
+	names: Map<number, string>;
+	details: Map<number, string>;
+	packs: Map<number, string>;
+}
+
+const GATYA_ITEM_GIFT_TYPES = new Set([301, 302]);
+
+async function loadItem(): Promise<{ json: ItemJson; lookup: ItemLookup }> {
+	const [json, itemNameData, packs] = await Promise.all([
 		fetchJson<ItemJson>("data/item.json"),
-		fetchItemNameMap("data/item_name.csv"),
+		fetchItemNameData("data/item_name.csv"),
+		fetchCsvMap("data/item_pack.csv"),
 	]);
-	return { json, names };
+	return {
+		json,
+		lookup: {
+			names: itemNameData.names,
+			details: itemNameData.details,
+			packs,
+		},
+	};
 }
 
 function isPermanent(entry: ItemEntry): boolean {
 	return entry.header.endDate === "20300101";
+}
+
+function isGatyaItem(entry: ItemEntry): boolean {
+	return GATYA_ITEM_GIFT_TYPES.has(entry.gift.giftType);
+}
+
+function giftTypeName(giftType: number, lookup: Pick<ItemNameData, "names">): string {
+	return lookup.names.get(giftType) ?? `giftType:${giftType}`;
+}
+
+function displayName(entry: ItemEntry, lookup: Pick<ItemNameData, "names">): string {
+	const title = cleanDetailLines(entry.gift.title).join(" ");
+	return title || giftTypeName(entry.gift.giftType, lookup);
+}
+
+function repeatLabel(repeatFlag: number): string {
+	return repeatFlag === 0 ? "1回限り" : "繰り返し";
+}
+
+function isDailyLoginTextGift(giftType: number): boolean {
+	return (giftType >= 900 && giftType <= 999) || (giftType >= 35_000 && giftType <= 35_999);
+}
+
+async function fetchDailyLoginText(giftType: number): Promise<string[]> {
+	if (!isDailyLoginTextGift(giftType)) return [];
+	const text = await fetchOptionalText(`data/DailyLoginEventText/DailyLoginEventText_${giftType}_ja.tsv`);
+	if (!text) return [];
+	return cleanDetailLines(parseTsvFirstColumnText(text));
 }
 
 function searchEntries(id: number, json: ItemJson): { entries: ItemEntry[]; fallback: boolean } {
@@ -63,48 +115,107 @@ function searchEntries(id: number, json: ItemJson): { entries: ItemEntry[]; fall
 	};
 }
 
-function detailText(entry: ItemEntry, names: Map<number, string>): string {
-	const start = parseDate(entry.header.startDate, entry.header.startTime);
-	const end = isPermanent(entry) ? null : parseDate(entry.header.endDate, entry.header.endTime);
+async function detailText(entry: ItemEntry, lookup: ItemLookup): Promise<string> {
 	const gift = entry.gift;
-	const name = names.get(gift.giftType) ?? "不明";
-	const amount = gift.giftAmount > 0 ? ` x${gift.giftAmount}` : "";
-	const lines = [
-		`giftType: ${gift.giftType}`,
-		`${formatDateFull(start)} ~ ${end ? formatDateFull(end) : "常設"}  ver.${entry.header.minVersion}~${entry.header.maxVersion}`,
-		`eventId: ${gift.eventId}`,
-		`${name}${amount}`,
-	];
-	if (gift.repeatFlag === 0) lines.push("1回限定");
-	const extras = [gift.title, gift.message?.replace(/<br>/gi, "\n"), gift.url].filter(Boolean);
-	if (extras.length) lines.push("", ...extras);
-	if (entry.timeBlocks.length) {
-		lines.push("");
-		for (const block of entry.timeBlocks) lines.push(`・${formatTimeBlock(block)}`);
-	}
-	return lines.join("\n");
+	const amount = formatAmount(gift.giftAmount);
+	const messageLines = cleanDetailLines(gift.message);
+	const detailLines = cleanDetailLines(lookup.details.get(gift.giftType));
+	const dailyLoginLines = await fetchDailyLoginText(gift.giftType);
+	const packUrl = lookup.packs.get(gift.giftType);
+	const tagParts = [
+		isPermanent(entry) ? "常設" : "期間限定",
+		entry.timeBlocks.length > 0 ? "時間帯指定あり" : "",
+		repeatLabel(gift.repeatFlag),
+		isGatyaItem(entry) ? "gatya扱い" : "",
+	].filter(Boolean);
+
+	return joinBlocks([
+		[
+			`【item詳細】${formatEventStatus(entry.header)}`,
+			`名称: ${displayName(entry, lookup)}`,
+			`期間: ${formatEventPeriod(entry.header)}`,
+			`ver: ${formatVersionRange(entry.header)}`,
+			`id: ${gift.giftType}`,
+			`イベントID: ${gift.eventId}（ID帯: ${formatIdBand(gift.eventId)}）`,
+			`タグ: ${tagParts.join(" / ") || "なし"}`,
+		],
+		[
+			"開催期間:",
+			...formatTimeBlockLines(entry.timeBlocks).map((line) => `・${line}`),
+		],
+		[
+			"メッセージ:",
+			...(messageLines.length > 0 ? messageLines : ["なし"]),
+			...(gift.url ? [`URL: ${gift.url}`] : []),
+		],
+		[
+			"ギフト:",
+			`id:${gift.giftType} ${giftTypeName(gift.giftType, lookup)}${amount}`,
+		],
+		detailLines.length > 0 || packUrl
+			? [
+				"ギフト詳細:",
+				...detailLines,
+				...(packUrl ? [`公式: ${packUrl}`] : []),
+			]
+			: [],
+		dailyLoginLines.length > 0
+			? ["ログイン文:", ...dailyLoginLines]
+			: [],
+		[`短縮期間: ${formatEventPeriodShort(entry.header)}`],
+	]);
 }
 
-function scheduleText(json: ItemJson, names: Map<number, string>): string {
+function scheduleText(json: ItemJson, lookup: ItemLookup): string {
 	const now = new Date();
 	const entries = json.data
-		.filter((entry) => !isPermanent(entry) && parseDate(entry.header.endDate, entry.header.endTime) > now)
+		.filter((entry) =>
+			!isGatyaItem(entry) &&
+			!isPermanent(entry) &&
+			parseDate(entry.header.endDate, entry.header.endTime) > now
+		)
 		.sort((a, b) =>
 			parseDate(a.header.startDate, a.header.startTime).getTime() -
 			parseDate(b.header.startDate, b.header.startTime).getTime()
 		);
-	const lines = [`アイテム配布スケジュール 更新: ${json.updatedAt}`];
+	const lines = ["itemスケジュール", `更新: ${json.updatedAt}`];
 	for (const entry of entries) {
 		const start = parseDate(entry.header.startDate, entry.header.startTime);
 		const end = parseDate(entry.header.endDate, entry.header.endTime);
 		const gift = entry.gift;
-		const amount = gift.giftAmount > 0 ? ` x${gift.giftAmount}` : "";
-		lines.push(`${start <= now ? "開催中" : "予定"} ${formatDateShort(start)} ~ ${formatDateShort(end)}`);
-		lines.push(`  ${gift.giftType} ${names.get(gift.giftType) ?? "不明"}${amount}`);
-		if (gift.title) lines.push(`  ${gift.title}`);
+		const name = giftTypeName(gift.giftType, lookup);
+		const title = cleanDetailLines(gift.title).join(" ");
 		lines.push("");
+		lines.push(`${start <= now ? "開催中" : "予定"} ${formatDateShort(start)} ~ ${formatDateShort(end)}`);
+		lines.push(`・${gift.giftType} ${name}${formatAmount(gift.giftAmount)} / eventId:${gift.eventId} (${formatIdBand(gift.eventId)})`);
+		if (title && title !== name) lines.push(`  ${compactLine(title)}`);
+		if (gift.repeatFlag === 0) lines.push("  1回限り");
 	}
 	return lines.join("\n").trim();
+}
+
+function searchText(json: ItemJson, lookup: ItemLookup, query: string): string {
+	const lower = query.toLowerCase();
+	const rows = new Map<number, string>();
+	for (const [id, name] of lookup.names.entries()) {
+		if (`${id} ${name}`.toLowerCase().includes(lower)) rows.set(id, `${id} ${name}`);
+	}
+	for (const entry of json.data) {
+		const gift = entry.gift;
+		const text = [
+			String(gift.giftType),
+			String(gift.eventId),
+			displayName(entry, lookup),
+			giftTypeName(gift.giftType, lookup),
+			gift.message,
+			gift.url,
+		].join(" ").toLowerCase();
+		if (text.includes(lower)) {
+			rows.set(gift.giftType, `${gift.giftType} ${giftTypeName(gift.giftType, lookup)} / eventId:${gift.eventId}`);
+		}
+	}
+	if (rows.size === 0) return `「${query}」は見つかりませんでした`;
+	return [`「${query}」検索結果 (${rows.size}件)`, ...rows.values()].join("\n");
 }
 
 export const itemCommand: LineCommand = {
@@ -117,9 +228,9 @@ export const itemCommand: LineCommand = {
 				"!item",
 				"  今後のアイテムスケジュールを一覧表示します。",
 				"!item <ID>",
-				"  giftTypeまたはeventIdで配布内容を表示します。giftTypeで見つからない場合はeventIdでも検索します。",
+				"  giftTypeまたはeventIdで配布内容、イベントID、ギフト詳細、メッセージを表示します。",
 				"!item <検索語>",
-				"  アイテム名で検索します。",
+				"  アイテム名、タイトル、eventIdで検索します。",
 				"!item <ID> json",
 				"  元データをKBC独自のJSON形式で表示します。",
 				"!item <ID> r",
@@ -129,9 +240,9 @@ export const itemCommand: LineCommand = {
 		}
 
 		try {
-			const { json, names } = await loadItem();
+			const { json, lookup } = await loadItem();
 			if (args.length === 0) {
-				await sendLong(message, scheduleText(json, names));
+				await sendLong(message, scheduleText(json, lookup));
 				return;
 			}
 
@@ -176,26 +287,15 @@ export const itemCommand: LineCommand = {
 					await sendError(message, `${id} は giftType/eventId のどちらでも見つかりませんでした`);
 					return;
 				}
+				const details = await Promise.all(entries.map((entry) => detailText(entry, lookup)));
 				await sendLong(
 					message,
-					`${fallback ? "giftTypeではなくeventIdで検索しました\n\n" : ""}${
-						entries.map((entry) => detailText(entry, names)).join("\n\n")
-					}`,
+					`${fallback ? "giftTypeではなくeventIdで検索しました\n\n" : ""}${details.join("\n\n")}`,
 				);
 				return;
 			}
 
-			const query = args.join(" ").toLowerCase();
-			const matched = [...names.entries()].filter(([, name]) => name.toLowerCase().includes(query));
-			if (matched.length === 0) {
-				await sendError(message, `「${args.join(" ")}」は見つかりませんでした`);
-				return;
-			}
-			await sendLong(
-				message,
-				[`「${args.join(" ")}」の検索結果 (${matched.length}件)`, ...matched.map(([id, name]) => `${id} ${name}`)]
-					.join("\n"),
-			);
+			await sendLong(message, searchText(json, lookup, args.join(" ")));
 		} catch (error) {
 			console.error("[item] failed", error);
 			await sendError(message, "アイテムデータの取得または処理に失敗しました");

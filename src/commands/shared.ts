@@ -191,6 +191,15 @@ export async function fetchText(path: string, ttlMs = 60_000): Promise<string> {
 	});
 }
 
+export async function fetchOptionalText(path: string, ttlMs = 60_000): Promise<string | null> {
+	const url = `${RAW_BASE_URL}/${path}`;
+	return cachedFetch(`optional-text:${url}`, ttlMs, async () => {
+		const response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+		if (!response.ok) return null;
+		return response.text();
+	});
+}
+
 export async function fetchJson<T>(path: string, ttlMs = 60_000): Promise<T> {
 	const url = `${RAW_BASE_URL}/${path}`;
 	return cachedFetch(`json:${url}`, ttlMs, async () => {
@@ -214,9 +223,15 @@ export async function fetchCsvMap(path: string): Promise<Map<number, string>> {
 	return map;
 }
 
-export async function fetchItemNameMap(path: string): Promise<Map<number, string>> {
+export interface ItemNameData {
+	names: Map<number, string>;
+	details: Map<number, string>;
+}
+
+export async function fetchItemNameData(path: string): Promise<ItemNameData> {
 	const text = await fetchText(path);
-	const map = new Map<number, string>();
+	const names = new Map<number, string>();
+	const details = new Map<number, string>();
 	for (const line of text.split(/\r?\n/)) {
 		const trimmed = line.trim();
 		if (!trimmed) continue;
@@ -227,9 +242,27 @@ export async function fetchItemNameMap(path: string): Promise<Map<number, string
 		const rest = trimmed.slice(comma + 1);
 		const secondComma = rest.indexOf(",");
 		const name = secondComma === -1 ? rest.trim() : rest.slice(0, secondComma).trim();
-		if (name) map.set(id, name);
+		const detail = secondComma === -1 ? "" : rest.slice(secondComma + 1).trim();
+		if (name) names.set(id, name);
+		if (detail) details.set(id, detail);
 	}
-	return map;
+	return { names, details };
+}
+
+export async function fetchItemNameMap(path: string): Promise<Map<number, string>> {
+	return (await fetchItemNameData(path)).names;
+}
+
+export function parseTsvFirstColumnText(text: string): string {
+	const lines: string[] = [];
+	for (const line of text.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		const firstCell = trimmed.split("\t")[0]?.trim() ?? "";
+		if (!firstCell || firstCell.startsWith("//")) continue;
+		lines.push(firstCell);
+	}
+	return lines.join("\n");
 }
 
 export function isExactInteger(value: string): boolean {
