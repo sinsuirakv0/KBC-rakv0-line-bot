@@ -16,6 +16,7 @@ interface SquareEventDebugRecord {
 	payloadKeys: string[];
 	messages: SquareEventDebugMessage[];
 	threadLines: string[];
+	handlerLines: string[];
 }
 
 const MAX_RECORDS = 80;
@@ -102,6 +103,19 @@ export function recordSquareEventDebug(event: unknown): void {
 		payloadKeys: Object.keys(payload).filter((key) => payload[key] !== undefined),
 		messages,
 		threadLines,
+		handlerLines: [],
+	});
+	while (records.length > MAX_RECORDS) records.shift();
+}
+
+export function recordSquareHandlerDebug(line: string): void {
+	records.push({
+		receivedAt: new Date().toISOString(),
+		type: "HANDLER_DEBUG",
+		payloadKeys: [],
+		messages: [],
+		threadLines: [],
+		handlerLines: [line],
 	});
 	while (records.length > MAX_RECORDS) records.shift();
 }
@@ -130,6 +144,7 @@ export function formatSquareEventDebugLog(limit = 12): string {
 			if (message.text) lines.push(`text=${message.text}`);
 		}
 		for (const line of record.threadLines) lines.push(line);
+		for (const line of record.handlerLines) lines.push(line);
 	}
 	return lines.join("\n");
 }

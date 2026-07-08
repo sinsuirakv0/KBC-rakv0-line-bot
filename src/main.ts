@@ -22,7 +22,7 @@ import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineSto
 import { pushSubscriptionStore } from "./subscriptions/store.js";
 import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
-import { recordSquareEventDebug } from "./runtime/squareEventDebug.js";
+import { recordSquareEventDebug, recordSquareHandlerDebug } from "./runtime/squareEventDebug.js";
 import { ocIdentitySnapshotsStore } from "./moderation/ocIdentitySnapshots.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
 import { ocMemberActivityStore } from "./moderation/ocMemberActivity.js";
@@ -154,6 +154,7 @@ let activeHandlers = 0;
 const senderNames = new Map<string, string>();
 const senderNameRequests = new Map<string, Promise<string | undefined>>();
 const squareScopeRequests = new Map<string, Promise<string>>();
+const squareSelfMemberRequests = new Map<string, Promise<string | undefined>>();
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -253,6 +254,9 @@ async function dispatchText(
 		}
 		if (await handleLineCommand(messageText, message)) return;
 	} catch (error) {
+		if (channel === "square") {
+			recordSquareHandlerDebug(`dispatch error text=${shortDebugText(messageText)} error=${compactError(error)}`);
+		}
 		console.error(`[${channel}:message] handler failed`, error);
 	} finally {
 		const elapsedMs = Date.now() - startedAt;
@@ -384,6 +388,11 @@ function compactError(error: unknown): string {
 	} catch {
 		return String(error);
 	}
+}
+
+function shortDebugText(value: string | undefined, maxLength = 80): string {
+	const text = (value ?? "(none)").replace(/\s+/g, " ").trim();
+	return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
 }
 
 function rawMember(value: unknown): {
@@ -573,8 +582,22 @@ async function handleSquareMessage(
 	threadMid?: string,
 	chatMidOverride?: string,
 ): Promise<void> {
-	if (await message.isMyMessage()) return;
 	const chatMid = chatMidOverride ?? message.to.id;
+	const rawMessage = (message.raw as RawSquareMessage).message;
+	const senderMid = rawMessage?.from ?? message.from.id;
+	if (threadMid || rawMessage?.text?.startsWith(appConfig.commandPrefix)) {
+		recordSquareHandlerDebug(
+			`square message received id=${rawMessage?.id ?? "(none)"} chatMid=${chatMid} threadMid=${threadMid ?? "(none)"} ` +
+				`rawTo=${rawMessage?.to ?? "(none)"} toType=${String(rawMessage?.toType ?? "(none)")} ` +
+				`from=${senderMid ?? "(none)"} text=${shortDebugText(rawMessage?.text)}`,
+		);
+	}
+	if (await isOwnSquareMessage(client, chatMid, senderMid)) {
+		if (threadMid || rawMessage?.text?.startsWith(appConfig.commandPrefix)) {
+			recordSquareHandlerDebug(`square message skipped self id=${rawMessage?.id ?? "(none)"} chatMid=${chatMid}`);
+		}
+		return;
+	}
 	const scopeMid = await resolveSquareScope(client, chatMid, message.from.id);
 	const target = new SquareReplyTarget(
 		client,
@@ -585,7 +608,6 @@ async function handleSquareMessage(
 		chatMid,
 	);
 	recordSquareMessage(message, target.destination);
-	const rawMessage = (message.raw as RawSquareMessage).message;
 	if (
 		rawMessage?.id &&
 		!permissionStore.isBotStopped(botStopTargetFromDestination(target.destination)) &&
@@ -601,8 +623,16 @@ async function handleSquareMessage(
 			createdAt: rawMessage.createdTime === undefined ? undefined : Number(rawMessage.createdTime),
 		})
 	) return;
-	if (typeof message.text !== "string") return;
-	if (shouldIgnoreStoppedText(message.text, target)) return;
+	if (typeof message.text !== "string") {
+		if (threadMid) recordSquareHandlerDebug(`square message skipped no text id=${rawMessage?.id ?? "(none)"}`);
+		return;
+	}
+	if (shouldIgnoreStoppedText(message.text, target)) {
+		if (threadMid || message.text.startsWith(appConfig.commandPrefix)) {
+			recordSquareHandlerDebug(`square command skipped bot stopped id=${rawMessage?.id ?? "(none)"}`);
+		}
+		return;
+	}
 	if (!message.text.startsWith(appConfig.commandPrefix)) {
 		if (await handleOcSetupReply(message.text, target)) return;
 		if (await handleOpenChatModerationCaseReply(message.text, target)) return;
@@ -610,6 +640,7 @@ async function handleSquareMessage(
 		await handleSearchPageReply(message.text, target);
 		return;
 	}
+	if (threadMid) recordSquareHandlerDebug(`square command dispatch id=${rawMessage?.id ?? "(none)"} text=${shortDebugText(message.text)}`);
 	await dispatchText("square", message.text, target);
 	void resolveSenderName(client, "square", message.from.id)
 		.then((name) => {
@@ -714,6 +745,27 @@ function resolveSquareScope(client: Client, squareChatMid: string, senderMid: st
 		squareScopeRequests.set(squareChatMid, request);
 	}
 	return request;
+}
+
+function resolveSquareSelfMemberMid(client: Client, squareChatMid: string): Promise<string | undefined> {
+	let request = squareSelfMemberRequests.get(squareChatMid);
+	if (!request) {
+		request = client.base.square.getSquareChat({ squareChatMid })
+			.then((response) => response.squareChatMember.squareMemberMid || undefined)
+			.catch((error) => {
+				squareSelfMemberRequests.delete(squareChatMid);
+				console.warn(`[square] failed to resolve self member for ${squareChatMid}`, error);
+				return undefined;
+			});
+		squareSelfMemberRequests.set(squareChatMid, request);
+	}
+	return request;
+}
+
+async function isOwnSquareMessage(client: Client, squareChatMid: string, senderMid?: string): Promise<boolean> {
+	if (!senderMid) return false;
+	const selfMid = await resolveSquareSelfMemberMid(client, squareChatMid);
+	return Boolean(selfMid && senderMid === selfMid);
 }
 
 function resolveSenderName(
