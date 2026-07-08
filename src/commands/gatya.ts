@@ -7,7 +7,7 @@ import {
 	isExactInteger,
 	parseDate,
 	sendError,
-	sendLong,
+	sendLongToThread,
 	type ItemNameData,
 } from "./shared.js";
 import {
@@ -441,7 +441,7 @@ export const gatyaCommand: LineCommand = {
 			}
 
 			if (rest.length === 0) {
-				await sendLong(message, scheduleText(data, mode));
+				await sendLongToThread(message, scheduleText(data, mode));
 				return;
 			}
 
@@ -453,7 +453,7 @@ export const gatyaCommand: LineCommand = {
 				const itemEntries = data.itemJson.data.filter((entry) =>
 					GATYA_ITEM_GIFT_TYPES.has(entry.gift.giftType) && entry.gift.giftType === id
 				);
-				await sendLong(
+				await sendLongToThread(
 					message,
 					JSON.stringify([
 						...blocks.map(({ raw: _raw, ...block }) => block),
@@ -473,7 +473,7 @@ export const gatyaCommand: LineCommand = {
 						.filter((entry) => GATYA_ITEM_GIFT_TYPES.has(entry.gift.giftType) && entry.gift.giftType === id)
 						.map((entry) => entry.raw || `(startDate: ${entry.header.startDate}) rawなし`),
 				].join("\n\n");
-				await sendLong(message, raws.replace(/\t/g, "    "));
+				await sendLongToThread(message, raws.replace(/\t/g, "    "));
 				return;
 			}
 
@@ -484,11 +484,11 @@ export const gatyaCommand: LineCommand = {
 					await sendError(message, `ID ${query} は gatya.json/item.json に見つかりませんでした`);
 					return;
 				}
-				await sendLong(message, details.join("\n\n"));
+				await sendLongToThread(message, details.join("\n\n"));
 				return;
 			}
 
-			await sendLong(message, searchText(data, mode, query));
+			await sendLongToThread(message, searchText(data, mode, query));
 		} catch (error) {
 			console.error("[gatya] failed", error);
 			await sendError(message, "ガチャデータの取得または処理に失敗しました");

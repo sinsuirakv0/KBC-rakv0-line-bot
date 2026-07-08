@@ -6,7 +6,7 @@ import {
 	isExactInteger,
 	parseDate,
 	sendError,
-	sendLong,
+	sendLongToThread,
 } from "./shared.js";
 import {
 	cleanDetailLines,
@@ -207,7 +207,7 @@ export const saleCommand: LineCommand = {
 		try {
 			const { json, names } = await loadSale();
 			if (args.length === 0) {
-				await sendLong(message, scheduleText(json, names));
+				await sendLongToThread(message, scheduleText(json, names));
 				return;
 			}
 
@@ -221,22 +221,22 @@ export const saleCommand: LineCommand = {
 					return;
 				}
 				if (modifier === "j" || modifier === "json") {
-					await sendLong(message, JSON.stringify(entries.map(({ raw: _raw, ...data }) => data), null, 2), "json");
+					await sendLongToThread(message, JSON.stringify(entries.map(({ raw: _raw, ...data }) => data), null, 2), "json");
 					return;
 				}
 				if (modifier === "r") {
-					await sendLong(
+					await sendLongToThread(
 						message,
 						entries.map((entry) => entry.raw || `(startDate: ${entry.header.startDate}) rawなし`).join("\n\n")
 							.replace(/\t/g, "    "),
 					);
 					return;
 				}
-				await sendLong(message, entries.map((entry) => detailText(entry, names, id)).join("\n\n"));
+				await sendLongToThread(message, entries.map((entry) => detailText(entry, names, id)).join("\n\n"));
 				return;
 			}
 
-			await sendLong(message, searchText(json, names, args.join(" ")));
+			await sendLongToThread(message, searchText(json, names, args.join(" ")));
 		} catch (error) {
 			console.error("[sale] failed", error);
 			await sendError(message, "セールデータの取得または処理に失敗しました");

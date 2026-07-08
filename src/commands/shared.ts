@@ -49,6 +49,7 @@ async function cachedFetch<T>(
 export interface ReplyableLineMessage {
 	reply(text: string): Promise<string | undefined>;
 	send(text: string): Promise<string | undefined>;
+	sendThread?(text: string): Promise<string | undefined>;
 	sendMention?(text: string, mentions: OutgoingMention[]): Promise<string | undefined>;
 	sendImage(image: OutgoingImage): Promise<void>;
 	deleteMessage?(messageId: string): Promise<void>;
@@ -92,6 +93,17 @@ export interface CommandProgress {
 	finish(): Promise<void>;
 	detach(): void;
 }
+
+export interface SendLongOptions {
+	preferThread?: boolean;
+	threadNotice?: string;
+}
+
+export const THREAD_OUTPUT_NOTICE = "出力が長いのでスレッドに送信しました。";
+export const THREAD_OUTPUT_OPTIONS: SendLongOptions = {
+	preferThread: true,
+	threadNotice: THREAD_OUTPUT_NOTICE,
+};
 
 export interface LineCommand {
 	name: string;
@@ -270,7 +282,9 @@ export function isExactInteger(value: string): boolean {
 	return String(parseInt(value, 10)) === value.trim();
 }
 
-export async function sendLong(message: ReplyableLineMessage, text: string, _lang = ""): Promise<void> {
+type TextSender = (text: string) => Promise<string | undefined>;
+
+function splitLongText(text: string): string[] {
 	const lines = text.split("\n");
 	const chunks: string[] = [];
 	let current = "";
@@ -286,12 +300,51 @@ export async function sendLong(message: ReplyableLineMessage, text: string, _lan
 		}
 	}
 	if (current) chunks.push(current);
+	return chunks;
+}
 
+async function sendLongChunks(
+	chunks: string[],
+	firstSender: TextSender,
+	nextSender: TextSender,
+): Promise<void> {
 	for (let i = 0; i < chunks.length; i++) {
 		const body = chunks[i];
-		if (i === 0) await message.reply(body);
-		else await message.send(body);
+		if (i === 0) await firstSender(body);
+		else await nextSender(body);
 	}
+}
+
+export async function sendLong(
+	message: ReplyableLineMessage,
+	text: string,
+	_lang = "",
+	options: SendLongOptions = {},
+): Promise<void> {
+	const chunks = splitLongText(text);
+	if (chunks.length === 0) return;
+
+	if (options.preferThread && message.sendThread) {
+		try {
+			const sendThread = message.sendThread.bind(message);
+			await sendLongChunks(chunks, sendThread, sendThread);
+			if (options.threadNotice) await message.reply(options.threadNotice);
+			return;
+		} catch (error) {
+			console.warn("[line] thread output failed; falling back to chat output", error);
+			await message.reply("スレッド送信に失敗したため、通常トークに送信します。");
+		}
+	}
+
+	await sendLongChunks(chunks, message.reply.bind(message), message.send.bind(message));
+}
+
+export async function sendLongToThread(
+	message: ReplyableLineMessage,
+	text: string,
+	_lang = "",
+): Promise<void> {
+	await sendLong(message, text, _lang, THREAD_OUTPUT_OPTIONS);
 }
 
 export async function sendError(message: ReplyableLineMessage, text: string): Promise<void> {

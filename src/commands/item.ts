@@ -9,7 +9,7 @@ import {
 	parseDate,
 	parseTsvFirstColumnText,
 	sendError,
-	sendLong,
+	sendLongToThread,
 	type ItemNameData,
 } from "./shared.js";
 import {
@@ -242,7 +242,7 @@ export const itemCommand: LineCommand = {
 		try {
 			const { json, lookup } = await loadItem();
 			if (args.length === 0) {
-				await sendLong(message, scheduleText(json, lookup));
+				await sendLongToThread(message, scheduleText(json, lookup));
 				return;
 			}
 
@@ -255,7 +255,7 @@ export const itemCommand: LineCommand = {
 					await sendError(message, `${id} は giftType/eventId のどちらでも見つかりませんでした`);
 					return;
 				}
-				await sendLong(
+				await sendLongToThread(
 					message,
 					`${fallback ? "giftTypeではなくeventIdで検索しました\n" : ""}${
 						JSON.stringify(entries.map(({ raw: _raw, ...data }) => data), null, 2)
@@ -271,7 +271,7 @@ export const itemCommand: LineCommand = {
 					await sendError(message, `${id} は giftType/eventId のどちらでも見つかりませんでした`);
 					return;
 				}
-				await sendLong(
+				await sendLongToThread(
 					message,
 					`${fallback ? "giftTypeではなくeventIdで検索しました\n\n" : ""}${
 						entries.map((entry) => entry.raw || `(startDate: ${entry.header.startDate}) rawなし`).join("\n\n")
@@ -288,14 +288,14 @@ export const itemCommand: LineCommand = {
 					return;
 				}
 				const details = await Promise.all(entries.map((entry) => detailText(entry, lookup)));
-				await sendLong(
+				await sendLongToThread(
 					message,
 					`${fallback ? "giftTypeではなくeventIdで検索しました\n\n" : ""}${details.join("\n\n")}`,
 				);
 				return;
 			}
 
-			await sendLong(message, searchText(json, lookup, args.join(" ")));
+			await sendLongToThread(message, searchText(json, lookup, args.join(" ")));
 		} catch (error) {
 			console.error("[item] failed", error);
 			await sendError(message, "アイテムデータの取得または処理に失敗しました");
