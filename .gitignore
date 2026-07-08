@@ -5,7 +5,7 @@ storage/*.json
 logs/
 npm-debug.log*
 
-docs/MESSAGE_LOG_STORAGE.md
-docs/BOT_PERFORMANCE_NOTES.md
-docs/LINEJS_OPENCHAT_RESEARCH.md
+# Local reports and investigation notes
+docs/*.md
+src/**/docs/*.md
 AGENTS.md
