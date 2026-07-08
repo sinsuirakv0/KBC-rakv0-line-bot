@@ -568,7 +568,7 @@ function probeHelpText(): string {
 		"",
 		"低リスク破壊系:",
 		"!oc probe destroy-bot confirm-destroy",
-		"  bot自身が送った検証メッセージをdestroyMessagesで削除",
+		"  bot自身が送った検証メッセージで削除APIを比較",
 		"",
 		"要注意:",
 		"!oc probe hide @ユーザー confirm-hide",
@@ -733,23 +733,63 @@ async function executeProbeMentionables(command: Parameters<LineCommand["execute
 async function executeProbeDestroyBot(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
 	const { message, args } = command;
 	if (!hasArg(args, "confirm-destroy")) {
-		await message.send("bot自身の検証メッセージを削除するテストです。実行する場合は `!oc probe destroy-bot confirm-destroy` と送ってください。");
+		await message.send("bot自身の検証メッセージで削除APIを比較します。実行する場合は `!oc probe destroy-bot confirm-destroy` と送ってください。");
 		return;
 	}
-	const targetMessageId = await message.send(`OC API probe destroy target ${probeId()}`);
-	if (!targetMessageId) {
-		await message.send("検証用メッセージIDを取得できなかったため、destroyMessagesテストを中止しました。");
+	const makeTarget = async (label: string): Promise<string> => {
+		const targetMessageId = await message.send(`OC API probe ${label} target ${probeId()}`);
+		if (!targetMessageId) throw new Error(`${label}: 検証用メッセージIDを取得できませんでした`);
+		return targetMessageId;
+	};
+	let bulkWithThreadId: string;
+	let bulkWithoutThreadId: string;
+	let destroyOneId: string;
+	let unsendOneId: string;
+	try {
+		bulkWithThreadId = await makeTarget("destroyMessages-thread");
+		bulkWithoutThreadId = await makeTarget("destroyMessages-no-thread");
+		destroyOneId = await makeTarget("destroyMessage");
+		unsendOneId = await makeTarget("unsendMessage");
+	} catch (error) {
+		await message.send(`検証用メッセージの作成に失敗したため中止しました: ${compactError(error)}`);
 		return;
 	}
 	await runProbeSteps(command, "destroy-bot", [
 		{
-			name: "destroyMessages(bot self message)",
+			name: "destroyMessages(threadMid empty)",
 			run: () => message.client.base.square.destroyMessages({
 				request: {
 					squareChatMid: message.destination.chatMid,
-					messageIds: [targetMessageId],
+					messageIds: [bulkWithThreadId],
 					threadMid: "",
 				},
+			}),
+		},
+		{
+			name: "destroyMessages(threadMid omitted)",
+			run: () => message.client.base.square.destroyMessages({
+				request: {
+					squareChatMid: message.destination.chatMid,
+					messageIds: [bulkWithoutThreadId],
+				} as {
+					squareChatMid: string;
+					messageIds: string[];
+					threadMid: string;
+				},
+			}),
+		},
+		{
+			name: "destroyMessage(single)",
+			run: () => message.client.base.square.destroyMessage({
+				squareChatMid: message.destination.chatMid,
+				messageId: destroyOneId,
+			}),
+		},
+		{
+			name: "unsendMessage(single)",
+			run: () => message.client.base.square.unsendMessage({
+				squareChatMid: message.destination.chatMid,
+				messageId: unsendOneId,
 			}),
 		},
 	]);
