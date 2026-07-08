@@ -1,3 +1,4 @@
+import { LINEStruct } from "@evex/linejs/thrift";
 import {
 	ocIdentitySnapshotsStore,
 	type OcIdentityMatch,
@@ -10,7 +11,7 @@ import {
 	targetFromDestination,
 } from "../permissions/store.js";
 import { argValue } from "./permissionArgs.js";
-import type { LineCommand, ReplyableLineMessage } from "./shared.js";
+import { sendLong, type LineCommand, type ReplyableLineMessage } from "./shared.js";
 
 type SquareRole = string | number | undefined;
 type IdentitySnapshotInput = Parameters<typeof ocIdentitySnapshotsStore.record>[0];
@@ -57,6 +58,8 @@ function adminHelpText(): string {
 		"  OC内の識別材料を取得し、過去スナップショットと照合",
 		"!oc identity list",
 		"  OC内の識別材料スナップショット履歴を表示",
+		"!oc probe",
+		"  仕様未確認のSquare APIを安全条件つきで検証",
 		"!oc kick @ユーザー 理由",
 		"  指定したメンバーを強制退会",
 		"!oc kick @A @B 理由",
@@ -89,6 +92,46 @@ function compactError(error: unknown): string {
 	if (!error || typeof error !== "object") return String(error);
 	const raw = error as { name?: string; message?: string; code?: string | number; status?: string | number; reason?: string };
 	return raw.message || raw.reason || raw.name || String(raw.code ?? raw.status ?? "不明なエラー");
+}
+
+function compactJson(value: unknown, maxLength = 700): string {
+	const seen = new WeakSet<object>();
+	const text = JSON.stringify(value, (_key, current) => {
+		if (typeof current === "bigint") return current.toString();
+		if (current && typeof current === "object") {
+			if (seen.has(current)) return "[Circular]";
+			seen.add(current);
+		}
+		return current;
+	}, 2) ?? String(value);
+	if (text.length <= maxLength) return text;
+	return `${text.slice(0, maxLength - 1)}…`;
+}
+
+function objectKeys(value: unknown): string[] {
+	if (!value || typeof value !== "object") return [];
+	return Object.keys(value as Record<string, unknown>);
+}
+
+function countArray(value: unknown): number | undefined {
+	return Array.isArray(value) ? value.length : undefined;
+}
+
+function summarizeProbeValue(value: unknown): string {
+	if (value === undefined) return "undefined";
+	if (value === null) return "null";
+	if (typeof value !== "object") return String(value);
+	const record = value as Record<string, unknown>;
+	const members = countArray(record.members);
+	if (members !== undefined) {
+		return `members=${members} total=${String(record.totalCount ?? "?")} continuation=${record.continuationToken ? "yes" : "no"}`;
+	}
+	const mentionables = countArray(record.mentionables);
+	if (mentionables !== undefined) {
+		return `mentionables=${mentionables} continuation=${record.continuationToken ? "yes" : "no"}`;
+	}
+	const keys = objectKeys(value);
+	return keys.length > 0 ? `keys=${keys.slice(0, 10).join(",")}` : compactJson(value, 240);
 }
 
 function formatJst(iso: string): string {
@@ -497,6 +540,301 @@ async function executeIdentityTest(command: Parameters<LineCommand["execute"]>[0
 	].join("\n"));
 }
 
+type ProbeStep = {
+	name: string;
+	run: () => Promise<unknown>;
+};
+
+type ProbeStepResult = {
+	name: string;
+	ok: boolean;
+	durationMs: number;
+	summary: string;
+	raw?: unknown;
+	error?: string;
+};
+
+function probeHelpText(): string {
+	return [
+		"OC API probe",
+		"",
+		"読み取り:",
+		"!oc probe read",
+		"  OC/トーク/ノート/権限/feature/emid/メンバー検索をまとめて検証",
+		"!oc probe members [名前]",
+		"  searchSquareChatMembersを検証",
+		"!oc probe mentionables [名前]",
+		"  linejs未ラップのsearchSquareChatMentionablesを検証",
+		"",
+		"低リスク破壊系:",
+		"!oc probe destroy-bot confirm-destroy",
+		"  bot自身が送った検証メッセージをdestroyMessagesで削除",
+		"",
+		"要注意:",
+		"!oc probe hide @ユーザー confirm-hide",
+		"  hideSquareMemberContentsを検証。管理者/副官は対象外",
+		"!oc probe unhide @ユーザー confirm-unhide",
+		"  unhideSquareMemberContentsを検証",
+		"",
+		"詳細な戻り値はbotログの [oc-probe] に出します。",
+	].join("\n");
+}
+
+function probeId(): string {
+	return `probe-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function hasArg(args: string[], expected: string): boolean {
+	return args.some((arg) => arg.toLowerCase() === expected.toLowerCase());
+}
+
+function collectExplicitProbeTarget(args: string[], mentions: string[]): string | undefined {
+	const mentioned = mentions.find((mid) => mid.startsWith("p"));
+	if (mentioned) return mentioned;
+	for (let index = 2; index < args.length; index++) {
+		const arg = args[index];
+		const lower = arg.toLowerCase();
+		const keyed = argValue([arg], "userID") || argValue([arg], "userId") || argValue([arg], "userid");
+		if (keyed && isUserIdToken(keyed)) return keyed;
+		if ((lower === "userid:" || lower === "userid") && isUserIdToken(args[index + 1] ?? "")) {
+			return args[index + 1];
+		}
+		if (isUserIdToken(arg)) return arg;
+	}
+	return undefined;
+}
+
+async function runProbeStep(step: ProbeStep): Promise<ProbeStepResult> {
+	const started = Date.now();
+	try {
+		const raw = await step.run();
+		return {
+			name: step.name,
+			ok: true,
+			durationMs: Date.now() - started,
+			summary: summarizeProbeValue(raw),
+			raw,
+		};
+	} catch (error) {
+		return {
+			name: step.name,
+			ok: false,
+			durationMs: Date.now() - started,
+			summary: compactError(error),
+			error: compactError(error),
+		};
+	}
+}
+
+async function runProbeSteps(
+	command: Parameters<LineCommand["execute"]>[0],
+	action: string,
+	steps: ProbeStep[],
+): Promise<void> {
+	const { message, args } = command;
+	const id = probeId();
+	const results: ProbeStepResult[] = [];
+	for (const step of steps) {
+		results.push(await runProbeStep(step));
+	}
+	console.log("[oc-probe]", compactJson({
+		id,
+		action,
+		args,
+		at: new Date().toISOString(),
+		actorMid: message.destination.senderMid,
+		actorName: message.destination.senderName,
+		squareMid: message.destination.scopeMid,
+		squareChatMid: message.destination.chatMid,
+		results,
+	}, 20_000));
+
+	await sendLong(message, [
+		`OC API probe: ${id}`,
+		`action: ${action}`,
+		"",
+		...results.map((result) =>
+			`${result.ok ? "OK" : "NG"} ${result.name} ${result.durationMs}ms\n${result.summary}`
+		),
+		"",
+		"詳細な戻り値はbotログの [oc-probe] を確認してください。",
+	].join("\n"));
+}
+
+async function searchSquareChatMentionablesRaw(
+	message: ReplyableLineMessage,
+	displayName: string,
+): Promise<unknown> {
+	return await message.client.base.request.request(
+		LINEStruct.SquareService_searchSquareChatMentionables_args({
+			request: {
+				squareChatMid: message.destination.chatMid,
+				searchOption: { displayName },
+				continuationToken: "",
+				limit: 20,
+			},
+		}),
+		"searchSquareChatMentionables",
+		message.client.base.square.protocolType,
+		true,
+		message.client.base.square.requestPath,
+	);
+}
+
+async function executeProbeRead(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message } = command;
+	const squareMid = message.destination.scopeMid;
+	const squareChatMid = message.destination.chatMid;
+	await runProbeSteps(command, "read", [
+		{ name: "getSquare", run: () => message.client.base.square.getSquare({ squareMid }) },
+		{ name: "getSquareChat", run: () => message.client.base.square.getSquareChat({ squareChatMid }) },
+		{ name: "getSquareAuthority", run: () => message.client.base.square.getSquareAuthority({ request: { squareMid } }) },
+		{ name: "getSquareChatStatus", run: () => message.client.base.square.getSquareChatStatus({ request: { squareChatMid } }) },
+		{ name: "getSquareChatFeatureSet", run: () => message.client.base.square.getSquareChatFeatureSet({ request: { squareChatMid } }) },
+		{ name: "getNoteStatus", run: () => message.client.base.square.getNoteStatus({ request: { squareMid } }) },
+		{ name: "getSquareEmid", run: () => message.client.base.square.getSquareEmid({ request: { squareMid } }) },
+		{ name: "getSquareChatEmid", run: () => message.client.base.square.getSquareChatEmid({ request: { squareChatMid } }) },
+		{ name: "getSquareInfoByChatMid", run: () => message.client.base.livetalk.getSquareInfoByChatMid({ request: { squareChatMid } }) },
+		{
+			name: "searchSquareChatMembers",
+			run: () => message.client.base.square.searchSquareChatMembers({
+				squareChatMid,
+				searchOption: { displayName: "", includingMe: true },
+				limit: 10,
+			}),
+		},
+		{ name: "searchSquareChatMentionables(raw)", run: () => searchSquareChatMentionablesRaw(message, "") },
+	]);
+}
+
+async function executeProbeMembers(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message, args } = command;
+	const query = args.slice(2).filter((arg) => !arg.toLowerCase().startsWith("userid")).join(" ").trim();
+	await runProbeSteps(command, "members", [
+		{
+			name: "searchSquareChatMembers",
+			run: () => message.client.base.square.searchSquareChatMembers({
+				squareChatMid: message.destination.chatMid,
+				searchOption: { displayName: query, includingMe: true },
+				limit: 20,
+			}),
+		},
+	]);
+}
+
+async function executeProbeMentionables(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message, args } = command;
+	const query = args.slice(2).join(" ").trim();
+	await runProbeSteps(command, "mentionables", [
+		{ name: "searchSquareChatMentionables(raw)", run: () => searchSquareChatMentionablesRaw(message, query) },
+	]);
+}
+
+async function executeProbeDestroyBot(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message, args } = command;
+	if (!hasArg(args, "confirm-destroy")) {
+		await message.send("bot自身の検証メッセージを削除するテストです。実行する場合は `!oc probe destroy-bot confirm-destroy` と送ってください。");
+		return;
+	}
+	const targetMessageId = await message.send(`OC API probe destroy target ${probeId()}`);
+	if (!targetMessageId) {
+		await message.send("検証用メッセージIDを取得できなかったため、destroyMessagesテストを中止しました。");
+		return;
+	}
+	await runProbeSteps(command, "destroy-bot", [
+		{
+			name: "destroyMessages(bot self message)",
+			run: () => message.client.base.square.destroyMessages({
+				request: {
+					squareChatMid: message.destination.chatMid,
+					messageIds: [targetMessageId],
+					threadMid: "",
+				},
+			}),
+		},
+	]);
+}
+
+async function executeProbeHide(command: Parameters<LineCommand["execute"]>[0], unhide: boolean): Promise<void> {
+	const { message, args } = command;
+	const confirm = unhide ? "confirm-unhide" : "confirm-hide";
+	if (!hasArg(args, confirm)) {
+		await message.send(`対象MIDを指定し、最後に ${confirm} を付けてください。例: !oc probe ${unhide ? "unhide" : "hide"} @ユーザー ${confirm}`);
+		return;
+	}
+	const targetMid = collectExplicitProbeTarget(args, message.mentionMids);
+	if (!targetMid) {
+		await message.send("対象ユーザーをメンションするか、userID:<p...> を指定してください。");
+		return;
+	}
+
+	let targetName = targetMid;
+	try {
+		const response = await message.client.base.square.getSquareMember({ squareMemberMid: targetMid });
+		targetName = response.squareMember.displayName || targetMid;
+		if (!unhide && roleRank(response.squareMember.role) >= roleRank("CO_ADMIN")) {
+			await message.send("安全のため、管理者/副官に対するhide検証は実行しません。検証用の一般メンバーで試してください。");
+			return;
+		}
+	} catch (error) {
+		await message.send(`対象メンバー情報を取得できませんでした: ${compactError(error)}`);
+		return;
+	}
+
+	await runProbeSteps(command, unhide ? "unhide" : "hide", [
+		{
+			name: `${unhide ? "unhideSquareMemberContents" : "hideSquareMemberContents"}(${targetName})`,
+			run: () => unhide
+				? message.client.base.square.unhideSquareMemberContents({ request: { squareMemberMid: targetMid } })
+				: message.client.base.square.hideSquareMemberContents({ request: { squareMemberMid: targetMid } }),
+		},
+	]);
+}
+
+async function executeProbe(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message, args } = command;
+	if (message.destination.kind !== "square") {
+		await message.send("このコマンドはOpenChatで実行してください。");
+		return;
+	}
+	if (!await canRunOpenChatSetup(command)) {
+		await message.send(setupPermissionDeniedText());
+		return;
+	}
+
+	const subAction = args[1]?.toLowerCase();
+	if (!subAction || subAction === "help") {
+		await message.send(probeHelpText());
+		return;
+	}
+	if (subAction === "read" || subAction === "status") {
+		await executeProbeRead(command);
+		return;
+	}
+	if (subAction === "members" || subAction === "chatmembers") {
+		await executeProbeMembers(command);
+		return;
+	}
+	if (subAction === "mentionables" || subAction === "mentions") {
+		await executeProbeMentionables(command);
+		return;
+	}
+	if (subAction === "destroy-bot" || subAction === "destroyself") {
+		await executeProbeDestroyBot(command);
+		return;
+	}
+	if (subAction === "hide") {
+		await executeProbeHide(command, false);
+		return;
+	}
+	if (subAction === "unhide") {
+		await executeProbeHide(command, true);
+		return;
+	}
+
+	await message.send(probeHelpText());
+}
+
 function setupMenuText(squareMid: string): string {
 	return [
 		"OC管理セットアップ",
@@ -876,6 +1214,10 @@ export const ocCommand: LineCommand = {
 		}
 		if (action === "identity" || action === "idtest" || action === "fingerprint" || action === "fp") {
 			await executeIdentityTest(command);
+			return;
+		}
+		if (action === "probe" || action === "apitest" || action === "sqtest") {
+			await executeProbe(command);
 			return;
 		}
 		if (action === "kick") {
