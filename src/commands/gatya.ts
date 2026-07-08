@@ -165,37 +165,23 @@ function itemName(giftType: number, itemNames: Pick<ItemNameData, "names">): str
 }
 
 function formatRate(value: number): string {
-	return `${(value / 100).toFixed(2)}%`;
+	const percent = value / 100;
+	return `${percent.toFixed(2).replace(/\.?0+$/, "")}%`;
 }
 
 function formatRates(rates: GachaRate): string[] {
 	return RATE_LABELS
 		.filter(([key]) => (rates[key] ?? 0) > 0)
-		.map(([key, label]) => `${label}: ${formatRate(rates[key] ?? 0)}`);
-}
-
-function shortRateSummary(rates: GachaRate): string {
-	const labels = [
-		["uberRare", "超激"] as const,
-		["legendRare", "伝説"] as const,
-		["featured", "目玉"] as const,
-	].filter(([key]) => (rates[key] ?? 0) > 0)
-		.map(([key, label]) => `${label}${formatRate(rates[key] ?? 0)}`);
-	return labels.join(" / ");
+		.map(([key, label]) => {
+			const rate = rates[key] ?? 0;
+			return `${label}: ${rate} (${formatRate(rate)})`;
+		});
 }
 
 function getJdbGatyaUrl(gachaType: number, id: number): string | null {
 	const rareCode = gachaType === 0 ? "N" : gachaType === 4 ? "E" : gachaType === 1 ? "R" : null;
 	if (!rareCode) return null;
 	return `https://jarjarblink.github.io/JDB/gatya.html?cc=ja&rare=${rareCode}&no=${id}`;
-}
-
-function getGachaInfoUrl(gachaType: number, id: number): string | null {
-	const idText = String(id).padStart(3, "0");
-	if (gachaType === 1) return `https://ponosgames.com/information/appli/battlecats/gacha/rare/R${idText}.html`;
-	if (gachaType === 4) return `https://ponosgames.com/information/appli/battlecats/gacha/event/E${idText}.html`;
-	if (gachaType === 0) return `https://ponosgames.com/information/appli/battlecats/gacha/normal/N${idText}.html`;
-	return null;
 }
 
 async function loadGatya(): Promise<GatyaData> {
@@ -228,19 +214,40 @@ function currentGatyaItemEntries(itemJson: ItemJson): GatyaItemEntry[] {
 	);
 }
 
+function appendScheduleFeatures(name: string, features: string[]): string {
+	let text = name;
+	for (const feature of features.filter(Boolean)) {
+		if (feature.startsWith("【")) {
+			text += feature;
+		} else if (feature.startsWith("＋")) {
+			text += `　${feature}`;
+		} else if (feature.startsWith("＜")) {
+			text += text.endsWith("＞") ? feature : ` ${feature}`;
+		} else {
+			text += ` ${feature}`;
+		}
+	}
+	return text;
+}
+
 function gachaRowText(block: GachaBlock, gacha: GachaEntry, csv: CsvSet): string {
+	const isRareGacha = block.header.gachaType !== 0 && block.header.gachaType !== 4;
 	const features = [
-		getGachaTypeLabel(block.header.gachaType),
+		isRareGacha ? "" : `＜${getGachaTypeLabel(block.header.gachaType)}＞`,
 		getGachaGuaranteedLabel(gacha.guaranteed, block.header.gachaType),
 		flagLabel(gacha.flags),
-		shortRateSummary(gacha.rates),
 	].filter(Boolean);
-	return `${gacha.id} ${gachaName(block, gacha, csv)}（${features.join(" / ")}）`;
+	return `${gacha.id} ${appendScheduleFeatures(gachaName(block, gacha, csv), features)}`;
 }
 
 function itemRowText(entry: GatyaItemEntry, itemNames: ItemNameData): string {
 	const gift = entry.gift;
-	return `${gift.giftType} ${itemName(gift.giftType, itemNames)}${formatAmount(gift.giftAmount)}（レア / gatya_item / eventId:${gift.eventId}）`;
+	return `${gift.giftType} ${
+		appendScheduleFeatures(`${itemName(gift.giftType, itemNames)}${formatAmount(gift.giftAmount)}`, [
+			"＜gatya_item＞",
+			`eventId:${gift.eventId}`,
+		])
+	}`;
 }
 
 function collectScheduleRows(data: GatyaData, mode: Mode | null): ScheduleRow[] {
@@ -282,17 +289,25 @@ function collectScheduleRows(data: GatyaData, mode: Mode | null): ScheduleRow[] 
 	return rows;
 }
 
+function formatScheduleStart(date: Date): string {
+	const text = formatDateShort(date);
+	const separator = text.lastIndexOf(" ");
+	if (separator === -1) return text;
+	const datePart = text.slice(0, separator);
+	const timePart = text.slice(separator + 1);
+	return timePart === "11:00" ? datePart : text;
+}
+
 function rowsText(title: string, rows: ScheduleRow[]): string {
 	const now = new Date();
 	const lines: string[] = [title];
-	let lastDate = "";
+	let lastStart = "";
 	for (const row of rows) {
-		const date = formatDateShort(row.start);
-		const dateKey = date.slice(0, 8);
-		if (dateKey !== lastDate) {
+		const startKey = String(row.start.getTime());
+		if (startKey !== lastStart) {
 			lines.push("");
-			lines.push(row.start <= now ? `開催中 ${date}` : `予定 ${date}`);
-			lastDate = dateKey;
+			lines.push(row.start <= now ? `開催中 ${formatScheduleStart(row.start)}` : `予定 ${formatScheduleStart(row.start)}`);
+			lastStart = startKey;
 		}
 		lines.push(`・${row.text}`);
 	}
@@ -300,7 +315,7 @@ function rowsText(title: string, rows: ScheduleRow[]): string {
 }
 
 function scheduleText(data: GatyaData, mode: Mode | null): string {
-	return rowsText(`gatyaスケジュール\n更新: ${data.json.updatedAt}`, collectScheduleRows(data, mode));
+	return rowsText("ガチャスケジュール", collectScheduleRows(data, mode));
 }
 
 function searchText(data: GatyaData, mode: Mode | null, query: string): string {
@@ -320,22 +335,20 @@ function gachaDetailText(block: GachaBlock, gacha: GachaEntry, csv: CsvSet): str
 	const messageLines = cleanDetailLines(gacha.message && gacha.message !== "0" ? gacha.message : "");
 	const linkLines = [
 		getJdbGatyaUrl(block.header.gachaType, gacha.id) ? `JDB: ${getJdbGatyaUrl(block.header.gachaType, gacha.id)}` : "",
-		getGachaInfoUrl(block.header.gachaType, gacha.id) ? `公式: ${getGachaInfoUrl(block.header.gachaType, gacha.id)}` : "",
 	].filter(Boolean);
 
 	return joinBlocks([
 		[
 			`【gatya詳細】${formatEventStatus(block.header)}`,
-			`名称: ${gachaName(block, gacha, csv)}`,
+			`・${gachaName(block, gacha, csv)}`,
 			`期間: ${formatEventPeriod(block.header)}`,
-			`ver: ${formatVersionRange(block.header)}`,
+			`ver:${block.header.minVersion}~${block.header.maxVersion}`,
 			`id: ${gacha.id}`,
 			`タグ: ${features.join(" / ") || "なし"}`,
 		],
 		[
 			"詳細:",
 			`バナー位置 ${block.header.gachaCount}`,
-			`消費: ${gacha.price}`,
 		],
 		[
 			"レート:",
@@ -343,7 +356,6 @@ function gachaDetailText(block: GachaBlock, gacha: GachaEntry, csv: CsvSet): str
 		],
 		messageLines.length > 0 ? ["【タイトル】", ...messageLines] : [],
 		linkLines.length > 0 ? ["リンク:", ...linkLines] : [],
-		[`短縮期間: ${formatEventPeriodShort(block.header)}`],
 	]);
 }
 

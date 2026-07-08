@@ -78,12 +78,15 @@ interface RawSquareEvent {
 	payload?: {
 		notificationMessage?: {
 			squareMessage: unknown;
+			threadMid?: string;
 		};
 		receiveMessage?: {
 			squareMessage: unknown;
+			threadMid?: string;
 		};
 		sendMessage?: {
 			squareMessage: unknown;
+			threadMid?: string;
 		};
 		mutateMessage?: {
 			squareMessage: unknown;
@@ -278,20 +281,31 @@ function squareMessagesFromEvent(event: RawSquareEvent): SquareEventMessage[] {
 	if (!payload) return [];
 	const messages: SquareEventMessage[] = [];
 	if (isSquareEventType(event, "NOTIFICATION_MESSAGE", 29) && payload.notificationMessage?.squareMessage) {
-		messages.push({ raw: payload.notificationMessage.squareMessage });
+		messages.push({
+			raw: payload.notificationMessage.squareMessage,
+			threadMid: payload.notificationMessage.threadMid ?? squareThreadMidFromRaw(payload.notificationMessage.squareMessage),
+		});
 	}
 	if (isSquareEventType(event, "RECEIVE_MESSAGE", 0) && payload.receiveMessage?.squareMessage) {
-		messages.push({ raw: payload.receiveMessage.squareMessage });
+		messages.push({
+			raw: payload.receiveMessage.squareMessage,
+			threadMid: payload.receiveMessage.threadMid ?? squareThreadMidFromRaw(payload.receiveMessage.squareMessage),
+		});
 	}
 	if (isSquareEventType(event, "SEND_MESSAGE", 1) && payload.sendMessage?.squareMessage) {
-		messages.push({ raw: payload.sendMessage.squareMessage });
+		messages.push({
+			raw: payload.sendMessage.squareMessage,
+			threadMid: payload.sendMessage.threadMid ?? squareThreadMidFromRaw(payload.sendMessage.squareMessage),
+		});
 	}
 	if (
 		isSquareEventType(event, "MUTATE_MESSAGE", 41) &&
-		payload.mutateMessage?.squareMessage &&
-		!payload.mutateMessage.threadMid
+		payload.mutateMessage?.squareMessage
 	) {
-		messages.push({ raw: payload.mutateMessage.squareMessage });
+		messages.push({
+			raw: payload.mutateMessage.squareMessage,
+			threadMid: payload.mutateMessage.threadMid ?? squareThreadMidFromRaw(payload.mutateMessage.squareMessage),
+		});
 	}
 	if (
 		isSquareEventType(event, "NOTIFICATION_THREAD_MESSAGE", 54) &&
@@ -299,10 +313,15 @@ function squareMessagesFromEvent(event: RawSquareEvent): SquareEventMessage[] {
 	) {
 		messages.push({
 			raw: payload.notificationThreadMessage.squareMessage,
-			threadMid: payload.notificationThreadMessage.threadMid,
+			threadMid: payload.notificationThreadMessage.threadMid ??
+				squareThreadMidFromRaw(payload.notificationThreadMessage.squareMessage),
 		});
 	}
 	return messages;
+}
+
+function squareThreadMidFromRaw(value: unknown): string | undefined {
+	return rawString(rawObject(rawObject(value)?.threadInfo)?.chatThreadMid);
 }
 
 function postModerationEventFromSquareEvent(
@@ -705,7 +724,8 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	readonly mentionMids: string[];
 	readonly replyToMessageId?: string;
 	private threadMid?: string;
-	private readonly isThreadSource: boolean;
+	readonly isThreadSource: boolean;
+	private threadJoinAttempted = false;
 
 	constructor(
 		readonly client: Client,
@@ -751,6 +771,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 				chatMid: this.destination.chatMid,
 				threadMid,
 				threadMessage: {
+					squareMessageRevision: 4,
 					message: {
 						to: this.destination.chatMid,
 						text,
@@ -764,6 +785,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	}
 
 	async sendMention(text: string, mentions: OutgoingMention[]): Promise<string | undefined> {
+		if (this.isThreadSource) return await this.sendThread(text);
 		const sent = await this.client.base.square.sendMessage({
 			squareChatMid: this.destination.chatMid,
 			text,
@@ -812,17 +834,34 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	}
 
 	private async resolveThreadMid(): Promise<string> {
-		if (this.threadMid) return this.threadMid;
-		const messageId = (this.message.raw as RawSquareMessage).message?.id;
-		if (!messageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
-		const response = await this.client.base.square.getSquareThreadMid({
-			request: {
-				chatMid: this.destination.chatMid,
-				messageId,
-			},
-		});
-		this.threadMid = response.threadMid;
-		return response.threadMid;
+		if (!this.threadMid) {
+			const messageId = (this.message.raw as RawSquareMessage).message?.id;
+			if (!messageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
+			const response = await this.client.base.square.getSquareThreadMid({
+				request: {
+					chatMid: this.destination.chatMid,
+					messageId,
+				},
+			});
+			this.threadMid = response.threadMid;
+		}
+		if (!this.isThreadSource) await this.joinThread(this.threadMid);
+		return this.threadMid;
+	}
+
+	private async joinThread(threadMid: string): Promise<void> {
+		if (this.threadJoinAttempted) return;
+		this.threadJoinAttempted = true;
+		try {
+			await this.client.base.square.joinSquareThread({
+				request: {
+					chatMid: this.destination.chatMid,
+					threadMid,
+				},
+			});
+		} catch (error) {
+			console.warn("[square] joinSquareThread failed; trying thread send anyway", error);
+		}
 	}
 }
 
