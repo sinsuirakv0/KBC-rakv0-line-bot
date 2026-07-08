@@ -51,6 +51,7 @@ export interface ReplyableLineMessage {
 	send(text: string): Promise<string | undefined>;
 	sendThread?(text: string): Promise<string | undefined>;
 	isThreadSource?: boolean;
+	debugThread?(text?: string): Promise<string[]>;
 	sendMention?(text: string, mentions: OutgoingMention[]): Promise<string | undefined>;
 	sendImage(image: OutgoingImage): Promise<void>;
 	deleteMessage?(messageId: string): Promise<void>;

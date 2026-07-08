@@ -1,5 +1,7 @@
 ﻿import type { LineCommand } from "./shared.js";
+import { sendLong } from "./shared.js";
 import { notifyScheduleUpdate } from "../notifications/eventUpdates.js";
+import { formatSquareEventDebugLog } from "../runtime/squareEventDebug.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
 
 const EVENT_REPO_TREE_API =
@@ -57,12 +59,37 @@ export const testCommand: LineCommand = {
 				"!test event-update",
 				"  最新のスケジュール更新履歴を使って、登録済みの通知先へテスト通知を送信します。",
 				"  このトークで使う前に !push skd を実行して通知先へ登録してください。",
+				"!test thread [本文]",
+				"  実行メッセージのスレッドへ送信できるか検証します。",
+				"!test thread-log [件数]",
+				"  直近のSquareイベント要約を表示します。",
 			].join("\n"));
 			return;
 		}
 
-		if (args[0]?.toLowerCase() !== "event-update") {
-			await message.reply("使い方: !test event-update");
+		const action = args[0]?.toLowerCase();
+		if (action === "thread") {
+			const text = args.slice(1).join(" ").trim() || `thread test ${new Date().toISOString()}`;
+			if (!message.sendThread) {
+				await message.reply("この送信先はスレッド送信に対応していません。");
+				return;
+			}
+			const lines = message.debugThread
+				? await message.debugThread(text)
+				: await message.sendThread(text).then((id) => [`sendThread=OK id=${id ?? "(unknown)"}`])
+					.catch((error) => [`sendThread=ERROR ${error instanceof Error ? error.message : String(error)}`]);
+			await sendLong(message, ["thread send debug", ...lines].join("\n"));
+			return;
+		}
+
+		if (action === "thread-log" || action === "square-log") {
+			const limit = Math.min(Math.max(Number(args[1] ?? 12) || 12, 1), 30);
+			await sendLong(message, formatSquareEventDebugLog(limit));
+			return;
+		}
+
+		if (action !== "event-update") {
+			await message.reply("使い方: !test event-update / !test thread / !test thread-log");
 			return;
 		}
 		if (!pushSubscriptionStore.has(message.destination)) {

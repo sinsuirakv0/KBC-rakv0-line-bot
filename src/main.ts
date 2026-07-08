@@ -16,6 +16,7 @@ import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineSto
 import { pushSubscriptionStore } from "./subscriptions/store.js";
 import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
+import { recordSquareEventDebug } from "./runtime/squareEventDebug.js";
 import { ocIdentitySnapshotsStore } from "./moderation/ocIdentitySnapshots.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
 import { ocMemberActivityStore } from "./moderation/ocMemberActivity.js";
@@ -366,6 +367,15 @@ function rawString(value: unknown): string | undefined {
 function rawNumber(value: unknown): number | undefined {
 	const numeric = typeof value === "bigint" ? Number(value) : Number(value);
 	return Number.isFinite(numeric) && numeric > 0 ? numeric : undefined;
+}
+
+function compactError(error: unknown): string {
+	if (error instanceof Error) return `${error.name}: ${error.message}`;
+	try {
+		return JSON.stringify(error);
+	} catch {
+		return String(error);
+	}
 }
 
 function rawMember(value: unknown): {
@@ -765,6 +775,38 @@ class SquareReplyTarget implements ReplyableLineMessage {
 
 	async sendThread(text: string): Promise<string | undefined> {
 		const threadMid = await this.resolveThreadMid();
+		return await this.sendThreadText(threadMid, text);
+	}
+
+	async debugThread(text = `thread debug ${new Date().toISOString()}`): Promise<string[]> {
+		const rawMessage = (this.message.raw as RawSquareMessage).message;
+		const lines = [
+			`kind=${this.destination.kind}`,
+			`chatMid=${this.destination.chatMid}`,
+			`sourceMessageId=${rawMessage?.id ?? "(none)"}`,
+			`sourceTo=${rawMessage?.to ?? "(none)"}`,
+			`sourceToType=${String(rawMessage?.toType ?? "(none)")}`,
+			`isThreadSource=${this.isThreadSource}`,
+			`initialThreadMid=${this.threadMid ?? "(none)"}`,
+		];
+		let threadMid: string;
+		try {
+			threadMid = await this.resolveThreadMid(lines);
+			lines.push(`resolvedThreadMid=${threadMid}`);
+		} catch (error) {
+			lines.push(`resolveThreadMid=ERROR ${compactError(error)}`);
+			return lines;
+		}
+		try {
+			const messageId = await this.sendThreadText(threadMid, text);
+			lines.push(`sendSquareThreadMessage=OK id=${messageId ?? "(unknown)"}`);
+		} catch (error) {
+			lines.push(`sendSquareThreadMessage=ERROR ${compactError(error)}`);
+		}
+		return lines;
+	}
+
+	private async sendThreadText(threadMid: string, text: string): Promise<string | undefined> {
 		const sent = await this.client.base.square.sendSquareThreadMessage({
 			request: {
 				reqSeq: await this.client.base.getReqseq("sq"),
@@ -833,10 +875,11 @@ class SquareReplyTarget implements ReplyableLineMessage {
 		}
 	}
 
-	private async resolveThreadMid(): Promise<string> {
+	private async resolveThreadMid(debugLines?: string[]): Promise<string> {
 		if (!this.threadMid) {
 			const messageId = (this.message.raw as RawSquareMessage).message?.id;
 			if (!messageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
+			debugLines?.push(`getSquareThreadMid request chatMid=${this.destination.chatMid} messageId=${messageId}`);
 			const response = await this.client.base.square.getSquareThreadMid({
 				request: {
 					chatMid: this.destination.chatMid,
@@ -844,22 +887,26 @@ class SquareReplyTarget implements ReplyableLineMessage {
 				},
 			});
 			this.threadMid = response.threadMid;
+			debugLines?.push(`getSquareThreadMid response threadMid=${this.threadMid}`);
 		}
-		if (!this.isThreadSource) await this.joinThread(this.threadMid);
+		await this.joinThread(this.threadMid, debugLines);
 		return this.threadMid;
 	}
 
-	private async joinThread(threadMid: string): Promise<void> {
+	private async joinThread(threadMid: string, debugLines?: string[]): Promise<void> {
 		if (this.threadJoinAttempted) return;
 		this.threadJoinAttempted = true;
 		try {
+			debugLines?.push(`joinSquareThread request chatMid=${this.destination.chatMid} threadMid=${threadMid}`);
 			await this.client.base.square.joinSquareThread({
 				request: {
 					chatMid: this.destination.chatMid,
 					threadMid,
 				},
 			});
+			debugLines?.push("joinSquareThread=OK");
 		} catch (error) {
+			debugLines?.push(`joinSquareThread=ERROR ${compactError(error)}`);
 			console.warn("[square] joinSquareThread failed; trying thread send anyway", error);
 		}
 	}
@@ -1180,6 +1227,7 @@ async function listenRawSquareEvents(
 		onError: (error) => handlePollingError("square", error, onFatal),
 	}) as AsyncIterable<RawSquareEvent>) {
 		if (signal.aborted) break;
+		recordSquareEventDebug(event);
 		const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
 		for (const joinEvent of memberEvents.joins) {
 			void handleOpenChatMemberJoin(joinEvent)
