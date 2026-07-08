@@ -315,7 +315,7 @@ function squareMessagesFromEvent(event: RawSquareEvent): SquareEventMessage[] {
 		});
 	}
 	if (
-		isSquareEventType(event, "NOTIFICATION_THREAD_MESSAGE", 54) &&
+		isSquareEventType(event, "NOTIFICATION_THREAD_MESSAGE", 52) &&
 		payload.notificationThreadMessage?.squareMessage
 	) {
 		messages.push({
@@ -791,15 +791,23 @@ class SquareReplyTarget implements ReplyableLineMessage {
 
 	async debugThread(text = `thread debug ${new Date().toISOString()}`): Promise<string[]> {
 		const rawMessage = (this.message.raw as RawSquareMessage).message;
+		const sourceMessageId = rawMessage?.id;
 		const lines = [
 			`kind=${this.destination.kind}`,
 			`chatMid=${this.destination.chatMid}`,
-			`sourceMessageId=${rawMessage?.id ?? "(none)"}`,
+			`sourceMessageId=${sourceMessageId ?? "(none)"}`,
 			`sourceTo=${rawMessage?.to ?? "(none)"}`,
 			`sourceToType=${String(rawMessage?.toType ?? "(none)")}`,
 			`isThreadSource=${this.isThreadSource}`,
 			`initialThreadMid=${this.threadMid ?? "(none)"}`,
 		];
+		if (sourceMessageId && !this.isThreadSource) {
+			const sourceThreadMid = await this.debugThreadMidFromMessage("source", sourceMessageId, lines);
+			if (sourceThreadMid) {
+				await this.debugSquareThread("source", sourceThreadMid, lines);
+				await this.debugThreadEvents("source", sourceThreadMid, lines);
+			}
+		}
 		let threadMid: string;
 		try {
 			threadMid = await this.resolveThreadMid(lines);
@@ -808,6 +816,8 @@ class SquareReplyTarget implements ReplyableLineMessage {
 			lines.push(`resolveThreadMid=ERROR ${compactError(error)}`);
 			return lines;
 		}
+		await this.debugSquareThread("resolved", threadMid, lines);
+		await this.debugThreadEvents("resolved", threadMid, lines);
 		try {
 			const messageId = await this.sendThreadText(threadMid, text);
 			lines.push(`sendSquareThreadMessage=OK id=${messageId ?? "(unknown)"}`);
@@ -824,7 +834,6 @@ class SquareReplyTarget implements ReplyableLineMessage {
 				chatMid: this.destination.chatMid,
 				threadMid,
 				threadMessage: {
-					squareMessageRevision: 4,
 					message: {
 						to: this.destination.chatMid,
 						text,
@@ -896,20 +905,26 @@ class SquareReplyTarget implements ReplyableLineMessage {
 		if (this.isThreadSource) {
 			const messageId = (this.message.raw as RawSquareMessage).message?.id;
 			if (!messageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
-			debugLines?.push(`getSquareThreadMid request chatMid=${this.destination.chatMid} messageId=${messageId}`);
-			const response = await this.client.base.square.getSquareThreadMid({
-				request: {
-					chatMid: this.destination.chatMid,
-					messageId,
-				},
-			});
-			debugLines?.push(`getSquareThreadMid response threadMid=${response.threadMid}`);
-			return response.threadMid;
+			const threadMid = await this.debugThreadMidFromMessage("thread-source", messageId, debugLines);
+			if (!threadMid) throw new Error("スレッドMIDを取得できませんでした");
+			return threadMid;
 		}
 
-		const sourceMessageId = (this.message.raw as RawSquareMessage).message?.id;
-		debugLines?.push("create thread root by sendMessage(threadInfo.threadRoot=true)");
-		const sent = await this.client.base.request.request(
+		debugLines?.push("create thread root by sendMessage(threadInfo.threadRoot=true, minimal payload)");
+		const sent = await this.sendThreadRootNotice();
+		this.rootNoticeSent = true;
+		const threadMid = threadMidFromSquareSendResult(sent);
+		const rootMessageId = messageIdFromSquareSendResult(sent);
+		debugLines?.push(`thread root send=OK id=${rootMessageId ?? "(unknown)"} threadMid=${threadMid ?? "(none)"}`);
+		if (threadMid) return threadMid;
+		if (!rootMessageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
+		const resolvedThreadMid = await this.debugThreadMidFromMessage("root", rootMessageId, debugLines);
+		if (!resolvedThreadMid) throw new Error("スレッドMIDを取得できませんでした");
+		return resolvedThreadMid;
+	}
+
+	private async sendThreadRootNotice(): Promise<unknown> {
+		return await this.client.base.request.request(
 			LINEStruct.SquareService_sendMessage_args({
 				request: {
 					reqSeq: await this.client.base.getReqseq("sq"),
@@ -919,16 +934,9 @@ class SquareReplyTarget implements ReplyableLineMessage {
 						threadInfo: { threadRoot: true },
 						message: {
 							to: this.destination.chatMid,
-							toType: "SQUARE_CHAT",
 							text: THREAD_OUTPUT_NOTICE,
-							contentType: "NONE",
-							...(sourceMessageId
-								? {
-									relatedMessageId: sourceMessageId,
-									relatedMessageServiceCode: "SQUARE",
-									messageRelationType: "REPLY",
-								}
-								: {}),
+							contentType: 0,
+							contentMetadata: {},
 						},
 					},
 				},
@@ -938,21 +946,67 @@ class SquareReplyTarget implements ReplyableLineMessage {
 			true,
 			"/SQ1",
 		);
-		this.rootNoticeSent = true;
-		const threadMid = threadMidFromSquareSendResult(sent);
-		const rootMessageId = messageIdFromSquareSendResult(sent);
-		debugLines?.push(`thread root send=OK id=${rootMessageId ?? "(unknown)"} threadMid=${threadMid ?? "(none)"}`);
-		if (threadMid) return threadMid;
-		if (!rootMessageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
-		debugLines?.push(`getSquareThreadMid(root) request chatMid=${this.destination.chatMid} messageId=${rootMessageId}`);
-		const response = await this.client.base.square.getSquareThreadMid({
-			request: {
-				chatMid: this.destination.chatMid,
-				messageId: rootMessageId,
-			},
-		});
-		debugLines?.push(`getSquareThreadMid(root) response threadMid=${response.threadMid}`);
-		return response.threadMid;
+	}
+
+	private async debugThreadMidFromMessage(
+		label: string,
+		messageId: string,
+		debugLines?: string[],
+	): Promise<string | undefined> {
+		debugLines?.push(`getSquareThreadMid(${label}) request chatMid=${this.destination.chatMid} messageId=${messageId}`);
+		try {
+			const response = await this.client.base.square.getSquareThreadMid({
+				request: {
+					chatMid: this.destination.chatMid,
+					messageId,
+				},
+			});
+			debugLines?.push(`getSquareThreadMid(${label}) response threadMid=${response.threadMid}`);
+			return response.threadMid;
+		} catch (error) {
+			debugLines?.push(`getSquareThreadMid(${label})=ERROR ${compactError(error)}`);
+			return undefined;
+		}
+	}
+
+	private async debugSquareThread(label: string, threadMid: string, debugLines: string[]): Promise<void> {
+		debugLines.push(`getSquareThread(${label}) request threadMid=${threadMid}`);
+		try {
+			const response = await this.client.base.square.getSquareThread({
+				request: {
+					threadMid,
+					includeRootMessage: true,
+				},
+			});
+			debugLines.push(`getSquareThread(${label}) response ${squareThreadSummary(response)}`);
+		} catch (error) {
+			debugLines.push(`getSquareThread(${label})=ERROR ${compactError(error)}`);
+		}
+	}
+
+	private async debugThreadEvents(label: string, threadMid: string, debugLines: string[]): Promise<void> {
+		debugLines.push(`fetchSquareChatEvents(${label}) request chatMid=${this.destination.chatMid} threadMid=${threadMid}`);
+		try {
+			const response = await this.client.base.square.fetchSquareChatEvents({
+				squareChatMid: this.destination.chatMid,
+				threadMid,
+				limit: 5,
+			});
+			const raw = rawObject(response);
+			const events = Array.isArray(raw?.events) ? raw.events : [];
+			debugLines.push(
+				`fetchSquareChatEvents(${label}) response events=${events.length} syncToken=${rawString(raw?.syncToken) ?? "(none)"}`,
+			);
+			for (const event of events.slice(-3)) {
+				const eventRaw = rawObject(event);
+				const payload = rawObject(eventRaw?.payload);
+				debugLines.push(
+					`event(${label}) type=${String(eventRaw?.type ?? "(none)")} payload=${Object.keys(payload ?? {}).join(",") || "(none)"}`,
+				);
+			}
+		} catch (error) {
+			debugLines.push(`fetchSquareChatEvents(${label})=ERROR ${compactError(error)}`);
+		}
 	}
 
 	private async joinThread(threadMid: string, debugLines?: string[]): Promise<void> {
@@ -1088,6 +1142,28 @@ function messageIdFromSquareSendResult(value: unknown): string | undefined {
 		result.squareMessage?.message?.id ??
 		result.message?.id ??
 		result.id;
+}
+
+function squareThreadSummary(value: unknown): string {
+	const raw = rawObject(value);
+	const thread = rawObject(raw?.squareThread) ?? rawObject(raw?.thread);
+	const rootSquareMessage = rawObject(raw?.threadRootMessage) ??
+		rawObject(raw?.rootMessage) ??
+		rawObject(raw?.squareMessage);
+	const rootMessage = rawObject(rootSquareMessage?.message) ?? rawObject(raw?.message);
+	const parts = [
+		`keys=${raw ? Object.keys(raw).join(",") || "(none)" : "(none)"}`,
+		`threadMid=${rawString(thread?.threadMid) ?? "(none)"}`,
+		`chatMid=${rawString(thread?.chatMid) ?? "(none)"}`,
+		`squareMid=${rawString(thread?.squareMid) ?? "(none)"}`,
+		`rootMessageId=${rawString(thread?.messageId) ?? rawString(rootMessage?.id) ?? "(none)"}`,
+		`state=${thread?.state === undefined ? "(none)" : String(thread.state)}`,
+		`expiresAt=${thread?.expiresAt === undefined ? "(none)" : String(thread.expiresAt)}`,
+		`readOnlyAt=${thread?.readOnlyAt === undefined ? "(none)" : String(thread.readOnlyAt)}`,
+	];
+	const rootText = rawString(rootMessage?.text);
+	if (rootText) parts.push(`rootText=${rootText.length > 40 ? `${rootText.slice(0, 39)}...` : rootText}`);
+	return parts.join(" ");
 }
 
 function threadMidFromSquareSendResult(value: unknown): string | undefined {
