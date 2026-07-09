@@ -2,29 +2,26 @@
 import {
 	fetchCsvMap,
 	fetchJson,
-	formatDateShort,
 	isExactInteger,
 	parseDate,
 	sendError,
 	sendLongToThread,
 } from "./shared.js";
 import {
-	cleanDetailLines,
-	compactLine,
 	formatEventPeriod,
 	formatEventPeriodShort,
 	formatEventStatus,
 	formatTimeBlockLines,
-	formatVersionRange,
 	joinBlocks,
 	type EventHeader,
 } from "./eventDisplay.js";
 import {
 	classifyEventId,
-	formatEventIdTags,
 	isMissionEventId,
 	missionLookupId,
 } from "../search/eventIdClassification.js";
+
+type SaleKind = "sale" | "mission";
 
 interface SaleHeader extends EventHeader {}
 
@@ -80,107 +77,151 @@ function nameForId(id: number, names: SaleNameMaps): string {
 	return splitMissionText(raw).name;
 }
 
-function popupTextForId(id: number, names: SaleNameMaps): string[] {
-	if (!isMissionEventId(id)) return [];
-	const raw = names.mission.get(missionLookupId(id));
-	if (!raw) return [];
-	return cleanDetailLines(splitMissionText(raw).popupText);
+function kindForId(id: number): SaleKind {
+	return isMissionEventId(id) ? "mission" : "sale";
 }
 
-function orderedIds(entry: SaleEntry, selectedId?: number): number[] {
-	if (selectedId === undefined || !entry.stageIds.includes(selectedId)) return entry.stageIds;
-	return [selectedId, ...entry.stageIds.filter((id) => id !== selectedId)];
+function idsByKind(entry: SaleEntry, kind: SaleKind): number[] {
+	return entry.stageIds.filter((id) => kindForId(id) === kind);
+}
+
+function scheduleLine(entry: SaleEntry, id: number, names: SaleNameMaps): string {
+	return `・${id} ${nameForId(id, names)} ${formatEventPeriodShort(entry.header)}`;
 }
 
 function targetLine(id: number, names: SaleNameMaps): string {
-	const classification = classifyEventId(id);
-	const code = classification.displayCode ? ` [${classification.displayCode}]` : "";
-	return `${id}${code} ${nameForId(id, names)}（${classification.kind} / ${classification.tagLabel}）`;
+	return `・${id} ${nameForId(id, names)}`;
 }
 
 function targetSearchText(id: number, names: SaleNameMaps): string {
+	const classification = classifyEventId(id);
 	return [
 		String(id),
 		nameForId(id, names),
-		formatEventIdTags(id),
-		classifyEventId(id).jdbUrl ?? "",
+		classification.displayCode ?? "",
+		classification.jdbUrl ?? "",
+		classification.stageProxyUrl ?? "",
 	].join(" ").toLowerCase();
 }
 
-function scheduleText(json: SaleJson, names: SaleNameMaps): string {
+interface SaleScheduleRow {
+	entry: SaleEntry;
+	id: number;
+	status: "開催中" | "予定";
+}
+
+function collectScheduleRows(json: SaleJson, kind: SaleKind): SaleScheduleRow[] {
 	const now = new Date();
-	const entries = json.data
+	return json.data
 		.filter((entry) => !isPermanent(entry) && parseDate(entry.header.endDate, entry.header.endTime) > now)
 		.sort((a, b) =>
 			parseDate(a.header.startDate, a.header.startTime).getTime() -
 			parseDate(b.header.startDate, b.header.startTime).getTime()
-		);
-
-	const lines = ["sale/missionスケジュール", `更新: ${json.updatedAt}`];
-	for (const entry of entries) {
-		const start = parseDate(entry.header.startDate, entry.header.startTime);
-		const end = parseDate(entry.header.endDate, entry.header.endTime);
-		lines.push("");
-		lines.push(`${isActive(entry, now) ? "開催中" : "予定"} ${formatDateShort(start)} ~ ${formatDateShort(end)}`);
-		for (const id of entry.stageIds) {
-			lines.push(`・${targetLine(id, names)}`);
-		}
-		if (entry.timeBlocks.length > 0) {
-			lines.push(`  開催期間: ${compactLine(formatTimeBlockLines(entry.timeBlocks).join(" / "), 120)}`);
-		}
-	}
-	return lines.join("\n").trim();
+		)
+		.flatMap((entry) => idsByKind(entry, kind).map((id) => ({
+			entry,
+			id,
+			status: isActive(entry, now) ? "開催中" as const : "予定" as const,
+		})));
 }
 
-function detailText(entry: SaleEntry, names: SaleNameMaps, selectedId?: number): string {
-	const ids = orderedIds(entry, selectedId);
-	const primaryId = selectedId ?? ids[0];
-	const primary = classifyEventId(primaryId);
-	const tagSummary = [...new Set(ids.flatMap((id) => {
-		const classification = classifyEventId(id);
-		return [
-			classification.kind,
-			classification.tagLabel,
-			classification.displayCode,
-		].filter(Boolean);
-	}))].join(" / ");
-	const popupLines = ids.flatMap((id) => popupTextForId(id, names));
-	const linkLines = [
-		primary.jdbUrl ? `JDB: ${primary.jdbUrl}` : "",
-		primary.dbUrl ? `DB: ${primary.dbUrl}` : "",
-		primary.stageProxyUrl ? `公式表示: ${primary.stageProxyUrl}` : "",
+function scheduleSection(title: string, rows: SaleScheduleRow[], names: SaleNameMaps): string[] {
+	if (rows.length === 0) return [];
+	const lines = [title];
+	for (const status of ["開催中", "予定"] as const) {
+		const statusRows = rows.filter((row) => row.status === status);
+		if (statusRows.length === 0) continue;
+		lines.push("");
+		lines.push(status);
+		lines.push(...statusRows.map((row) => scheduleLine(row.entry, row.id, names)));
+	}
+	return lines;
+}
+
+function scheduleText(json: SaleJson, names: SaleNameMaps): string {
+	const blocks = [
+		["saleスケジュール"],
+		scheduleSection("イベント", collectScheduleRows(json, "sale"), names),
+		scheduleSection("ミッション", collectScheduleRows(json, "mission"), names),
+	].filter((block) => block.length > 0);
+	return blocks.map((block) => block.join("\n")).join("\n\n").trim();
+}
+
+function linkLinesForId(id: number): string[] {
+	const classification = classifyEventId(id);
+	return [
+		classification.jdbUrl ? `JDB: ${classification.jdbUrl}` : "",
+		classification.stageProxyUrl ? `KBC: ${classification.stageProxyUrl}` : "",
 	].filter(Boolean);
+}
+
+function relatedTargetLines(entry: SaleEntry, names: SaleNameMaps, primaryId: number): string[] {
+	const kind = kindForId(primaryId);
+	return idsByKind(entry, kind)
+		.filter((id) => id !== primaryId)
+		.map((id) => targetLine(id, names));
+}
+
+function targetSectionTitle(kind: SaleKind): string {
+	return kind === "mission" ? "対象ミッション:" : "対象ステージ:";
+}
+
+function detailTitle(kind: SaleKind): string {
+	return kind === "mission" ? "【mission詳細】" : "【sale詳細】";
+}
+
+function versionText(header: SaleHeader): string {
+	return `${header.minVersion}~${header.maxVersion}`;
+}
+
+function detailText(entry: SaleEntry, names: SaleNameMaps, selectedId: number): string {
+	const kind = kindForId(selectedId);
+	const targets = relatedTargetLines(entry, names, selectedId);
+	const links = linkLinesForId(selectedId);
 
 	return joinBlocks([
 		[
-			`【${primary.kind}詳細】${formatEventStatus(entry.header)}`,
+			`${detailTitle(kind)}${formatEventStatus(entry.header)}`,
+			`・${nameForId(selectedId, names)}`,
 			`期間: ${formatEventPeriod(entry.header)}`,
-			`ver: ${formatVersionRange(entry.header)}`,
-			`id: ${primaryId}${primary.displayCode ? ` [${primary.displayCode}]` : ""}`,
-			`タグ: ${tagSummary || "その他"}`,
+			`ver:${versionText(entry.header)}`,
+			`id: ${selectedId}`,
 		],
 		[
 			"開催期間:",
 			...formatTimeBlockLines(entry.timeBlocks).map((line) => `・${line}`),
 		],
-		[
-			ids.length > 1 ? "対象ステージ:" : "対象ID:",
-			...ids.map((id) => `・${targetLine(id, names)}`),
-		],
-		popupLines.length > 0 ? ["ポップアップ:", ...popupLines] : [],
-		linkLines.length > 0 ? ["リンク:", ...linkLines] : [],
-		[`短縮期間: ${formatEventPeriodShort(entry.header)}`],
+		targets.length > 0 ? [targetSectionTitle(kind), ...targets] : [],
+		links.length > 0 ? ["リンク:", ...links] : [],
 	]);
 }
 
 function searchText(json: SaleJson, names: SaleNameMaps, query: string): string {
-	const ids = [...new Set(json.data.flatMap((entry) => entry.stageIds))].sort((a, b) => a - b);
-	const matched = ids.filter((id) => targetSearchText(id, names).includes(query.toLowerCase()));
-	if (matched.length === 0) return `「${query}」は見つかりませんでした`;
-	return [
-		`「${query}」検索結果 (${matched.length}件)`,
-		...matched.map((id) => targetLine(id, names)),
-	].join("\n");
+	const lower = query.toLowerCase();
+	const now = new Date();
+	const rows = json.data
+		.filter((entry) => !isPermanent(entry) && parseDate(entry.header.endDate, entry.header.endTime) > now)
+		.flatMap((entry) => entry.stageIds.map((id) => ({ entry, id, kind: kindForId(id) })))
+		.filter((row) => targetSearchText(row.id, names).includes(lower))
+		.sort((a, b) =>
+			parseDate(a.entry.header.startDate, a.entry.header.startTime).getTime() -
+			parseDate(b.entry.header.startDate, b.entry.header.startTime).getTime()
+		);
+	if (rows.length === 0) return `「${query}」は見つかりませんでした`;
+	const blocks = [
+		[`「${query}」検索結果 (${rows.length}件)`],
+		scheduleSection("イベント", rows.filter((row) => row.kind === "sale").map((row) => ({
+			entry: row.entry,
+			id: row.id,
+			status: isActive(row.entry, now) ? "開催中" as const : "予定" as const,
+		})), names),
+		scheduleSection("ミッション", rows.filter((row) => row.kind === "mission").map((row) => ({
+			entry: row.entry,
+			id: row.id,
+			status: isActive(row.entry, now) ? "開催中" as const : "予定" as const,
+		})), names),
+	].filter((block) => block.length > 0);
+	return blocks.map((block) => block.join("\n")).join("\n\n");
 }
 
 export const saleCommand: LineCommand = {
@@ -191,9 +232,9 @@ export const saleCommand: LineCommand = {
 				"!sale",
 				"",
 				"!sale",
-				"  今後のsale/missionスケジュールを一覧表示します。",
+				"  今後のイベントとミッションを分けて、ID・名前・期間だけ一覧表示します。",
 				"!sale <ID>",
-				"  指定したIDの期間、分類、開催期間、対象ID、リンクを表示します。",
+				"  指定したIDの期間、ver、開催期間、対象ステージ、リンクを表示します。",
 				"!sale <検索語>",
 				"  イベント名、ID、分類コード(A000など)で検索します。",
 				"!sale <ID> json",
