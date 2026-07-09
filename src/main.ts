@@ -801,6 +801,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	readonly replyToMessageId?: string;
 	private threadMid?: string;
 	readonly isThreadSource: boolean;
+	private pendingThreadRoot = false;
 	private threadJoinAttempted = false;
 	private rootNoticeSent = false;
 
@@ -906,6 +907,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 				},
 			},
 		});
+		this.pendingThreadRoot = false;
 		return messageIdFromSquareSendResult(sent);
 	}
 
@@ -968,7 +970,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 			}
 			this.threadMid = await this.createThreadRoot(debugLines);
 		}
-		await this.joinThread(this.threadMid, debugLines);
+		if (!this.pendingThreadRoot) await this.joinThread(this.threadMid, debugLines);
 		return this.threadMid;
 	}
 
@@ -989,6 +991,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 		if (!rootMessageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
 		const resolvedThreadMid = await this.debugThreadMidFromMessage("root", rootMessageId, debugLines);
 		if (!resolvedThreadMid) throw new Error("スレッドMIDを取得できませんでした");
+		this.pendingThreadRoot = true;
 		return resolvedThreadMid;
 	}
 
