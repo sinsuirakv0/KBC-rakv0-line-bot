@@ -2,6 +2,7 @@
 import {
 	fetchCsvMap,
 	fetchJson,
+	formatDateShort,
 	isExactInteger,
 	parseDate,
 	sendError,
@@ -9,7 +10,6 @@ import {
 } from "./shared.js";
 import {
 	formatEventPeriod,
-	formatEventPeriodShort,
 	formatEventStatus,
 	formatTimeBlockLines,
 	joinBlocks,
@@ -85,10 +85,6 @@ function idsByKind(entry: SaleEntry, kind: SaleKind): number[] {
 	return entry.stageIds.filter((id) => kindForId(id) === kind);
 }
 
-function scheduleLine(entry: SaleEntry, id: number, names: SaleNameMaps): string {
-	return `・${id} ${nameForId(id, names)} ${formatEventPeriodShort(entry.header)}`;
-}
-
 function targetLine(id: number, names: SaleNameMaps): string {
 	return `・${id} ${nameForId(id, names)}`;
 }
@@ -108,6 +104,22 @@ interface SaleScheduleRow {
 	entry: SaleEntry;
 	id: number;
 	status: "開催中" | "予定";
+	period: string;
+}
+
+function formatScheduleDate(date: Date): string {
+	const text = formatDateShort(date);
+	const separator = text.lastIndexOf(" ");
+	if (separator === -1) return text;
+	const datePart = text.slice(0, separator);
+	const timePart = text.slice(separator + 1);
+	return timePart === "11:00" ? datePart : text;
+}
+
+function formatSchedulePeriod(entry: SaleEntry): string {
+	const start = parseDate(entry.header.startDate, entry.header.startTime);
+	const end = parseDate(entry.header.endDate, entry.header.endTime);
+	return `${formatScheduleDate(start)} ~ ${formatScheduleDate(end)}`;
 }
 
 function collectScheduleRows(json: SaleJson, kind: SaleKind): SaleScheduleRow[] {
@@ -122,6 +134,7 @@ function collectScheduleRows(json: SaleJson, kind: SaleKind): SaleScheduleRow[] 
 			entry,
 			id,
 			status: isActive(entry, now) ? "開催中" as const : "予定" as const,
+			period: formatSchedulePeriod(entry),
 		})));
 }
 
@@ -133,7 +146,14 @@ function scheduleSection(title: string, rows: SaleScheduleRow[], names: SaleName
 		if (statusRows.length === 0) continue;
 		lines.push("");
 		lines.push(status);
-		lines.push(...statusRows.map((row) => scheduleLine(row.entry, row.id, names)));
+		let lastPeriod = "";
+		for (const row of statusRows) {
+			if (row.period !== lastPeriod) {
+				lines.push(row.period);
+				lastPeriod = row.period;
+			}
+			lines.push(targetLine(row.id, names));
+		}
 	}
 	return lines;
 }
@@ -214,11 +234,13 @@ function searchText(json: SaleJson, names: SaleNameMaps, query: string): string 
 			entry: row.entry,
 			id: row.id,
 			status: isActive(row.entry, now) ? "開催中" as const : "予定" as const,
+			period: formatSchedulePeriod(row.entry),
 		})), names),
 		scheduleSection("ミッション", rows.filter((row) => row.kind === "mission").map((row) => ({
 			entry: row.entry,
 			id: row.id,
 			status: isActive(row.entry, now) ? "開催中" as const : "予定" as const,
+			period: formatSchedulePeriod(row.entry),
 		})), names),
 	].filter((block) => block.length > 0);
 	return blocks.map((block) => block.join("\n")).join("\n\n");
