@@ -1,5 +1,4 @@
 ﻿import { SquareMessage, type Client } from "@evex/linejs";
-import { LINEStruct } from "@evex/linejs/thrift";
 import { appConfig } from "./config.js";
 import { handleLineCommand } from "./commands/index.js";
 import { handleOcSetupReply } from "./commands/oc.js";
@@ -847,7 +846,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	}
 
 	async sendThread(text: string): Promise<string | undefined> {
-		const threadMid = await this.resolveThreadMid();
+		const threadMid = await this.resolveThreadMid(undefined, { allowCreate: true });
 		return await this.sendThreadText(threadMid, text);
 	}
 
@@ -872,7 +871,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 		}
 		let threadMid: string;
 		try {
-			threadMid = await this.resolveThreadMid(lines);
+			threadMid = await this.resolveThreadMid(lines, { allowCreate: true });
 			lines.push(`resolvedThreadMid=${threadMid}`);
 		} catch (error) {
 			lines.push(`resolveThreadMid=ERROR ${compactError(error)}`);
@@ -883,6 +882,8 @@ class SquareReplyTarget implements ReplyableLineMessage {
 		try {
 			const messageId = await this.sendThreadText(threadMid, text);
 			lines.push(`sendSquareThreadMessage=OK id=${messageId ?? "(unknown)"}`);
+			await this.debugSquareThread("after-send", threadMid, lines);
+			await this.debugThreadEvents("after-send", threadMid, lines);
 		} catch (error) {
 			lines.push(`sendSquareThreadMessage=ERROR ${compactError(error)}`);
 		}
@@ -957,8 +958,16 @@ class SquareReplyTarget implements ReplyableLineMessage {
 		}
 	}
 
-	private async resolveThreadMid(debugLines?: string[]): Promise<string> {
-		if (!this.threadMid) this.threadMid = await this.createThreadRoot(debugLines);
+	private async resolveThreadMid(
+		debugLines?: string[],
+		options: { allowCreate?: boolean } = {},
+	): Promise<string> {
+		if (!this.threadMid) {
+			if (!options.allowCreate) {
+				throw new Error("LINE APIからスレッドを自動作成できません");
+			}
+			this.threadMid = await this.createThreadRoot(debugLines);
+		}
 		await this.joinThread(this.threadMid, debugLines);
 		return this.threadMid;
 	}
@@ -972,13 +981,11 @@ class SquareReplyTarget implements ReplyableLineMessage {
 			return threadMid;
 		}
 
-		debugLines?.push("create thread root by sendMessage(threadInfo.threadRoot=true, minimal payload)");
+		debugLines?.push("create thread root by normal bot message, then getSquareThreadMid(root)");
 		const sent = await this.sendThreadRootNotice();
 		this.rootNoticeSent = true;
-		const threadMid = threadMidFromSquareSendResult(sent);
 		const rootMessageId = messageIdFromSquareSendResult(sent);
-		debugLines?.push(`thread root send=OK id=${rootMessageId ?? "(unknown)"} threadMid=${threadMid ?? "(none)"}`);
-		if (threadMid) return threadMid;
+		debugLines?.push(`thread root send=OK id=${rootMessageId ?? "(unknown)"}`);
 		if (!rootMessageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
 		const resolvedThreadMid = await this.debugThreadMidFromMessage("root", rootMessageId, debugLines);
 		if (!resolvedThreadMid) throw new Error("スレッドMIDを取得できませんでした");
@@ -986,28 +993,10 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	}
 
 	private async sendThreadRootNotice(): Promise<unknown> {
-		return await this.client.base.request.request(
-			LINEStruct.SquareService_sendMessage_args({
-				request: {
-					reqSeq: await this.client.base.getReqseq("sq"),
-					squareChatMid: this.destination.chatMid,
-					squareMessage: {
-						squareMessageRevision: 4,
-						threadInfo: { threadRoot: true },
-						message: {
-							to: this.destination.chatMid,
-							text: THREAD_OUTPUT_NOTICE,
-							contentType: 0,
-							contentMetadata: {},
-						},
-					},
-				},
-			}),
-			"sendMessage",
-			4,
-			true,
-			"/SQ1",
-		);
+		return await this.client.base.square.sendMessage({
+			squareChatMid: this.destination.chatMid,
+			text: THREAD_OUTPUT_NOTICE,
+		});
 	}
 
 	private async debugThreadMidFromMessage(
@@ -1226,19 +1215,6 @@ function squareThreadSummary(value: unknown): string {
 	const rootText = rawString(rootMessage?.text);
 	if (rootText) parts.push(`rootText=${rootText.length > 40 ? `${rootText.slice(0, 39)}...` : rootText}`);
 	return parts.join(" ");
-}
-
-function threadMidFromSquareSendResult(value: unknown): string | undefined {
-	const result = value as {
-		createdSquareMessage?: { threadInfo?: { chatThreadMid?: string } };
-		createdThreadMessage?: { threadInfo?: { chatThreadMid?: string } };
-		squareMessage?: { threadInfo?: { chatThreadMid?: string } };
-		threadInfo?: { chatThreadMid?: string };
-	};
-	return result.createdSquareMessage?.threadInfo?.chatThreadMid ??
-		result.createdThreadMessage?.threadInfo?.chatThreadMid ??
-		result.squareMessage?.threadInfo?.chatThreadMid ??
-		result.threadInfo?.chatThreadMid;
 }
 
 function talkMentionMids(raw: RawTalkMessage): string[] {

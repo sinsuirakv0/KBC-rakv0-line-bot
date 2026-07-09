@@ -100,12 +100,16 @@ export interface CommandProgress {
 export interface SendLongOptions {
 	preferThread?: boolean;
 	threadNotice?: string;
+	threadFallbackNotice?: string;
 }
 
-export const THREAD_OUTPUT_NOTICE = "出力が長いのでスレッドに送信しました。";
+export const THREAD_OUTPUT_NOTICE = "出力が長いので、このメッセージのスレッドに送信します。";
+export const THREAD_OUTPUT_FALLBACK_NOTICE =
+	"このメッセージのスレッドへ自動送信できないため、通常トークに送信します。\nスレッド内で同じコマンドを実行すると、そのスレッド内に返信できます。";
 export const THREAD_OUTPUT_OPTIONS: SendLongOptions = {
 	preferThread: true,
 	threadNotice: THREAD_OUTPUT_NOTICE,
+	threadFallbackNotice: THREAD_OUTPUT_FALLBACK_NOTICE,
 };
 
 export interface LineCommand {
@@ -337,7 +341,8 @@ export async function sendLong(
 			return;
 		} catch (error) {
 			console.warn("[line] thread output failed; falling back to chat output", error);
-			await message.reply("スレッド送信に失敗したため、通常トークに送信します。");
+			if (message.isThreadSource) throw error;
+			await message.reply(options.threadFallbackNotice ?? "スレッド送信に失敗したため、通常トークに送信します。");
 		}
 	}
 
