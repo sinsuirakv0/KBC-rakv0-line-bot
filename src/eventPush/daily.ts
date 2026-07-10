@@ -85,7 +85,13 @@ export function formatDailyScheduleBody(
 	dayStart: Date,
 ): string {
 	const dayEnd = new Date(dayStart.getTime() + DAY_MS);
-	const occurrences = collectEventOccurrences(sale, dayStart, dayEnd);
+	const dailySale: SaleJson = {
+		...sale,
+		data: sale.data.filter((entry) =>
+			!(entry.header.endDate === "20300101" && entry.timeBlocks.length === 0)
+		),
+	};
+	const occurrences = collectEventOccurrences(dailySale, dayStart, dayEnd);
 	const groups = new Map<number, Map<string, { eventId: number; suffix: string }>>();
 	for (const occurrence of occurrences) {
 		const durationMs = occurrence.endAt.getTime() - occurrence.startAt.getTime();

@@ -10,6 +10,8 @@ export interface SaleHeader {
 	startTime: string;
 	endDate: string;
 	endTime: string;
+	minVersion?: string;
+	maxVersion?: string;
 }
 
 export interface SaleEntry {
@@ -27,6 +29,11 @@ export function selectNotificationEventIds(stageIds: number[]): number[] {
 	const uniqueIds = [...new Set(stageIds)];
 	const priorityIds = uniqueIds.filter((eventId) => PRIORITY_EVENT_IDS.has(eventId));
 	return priorityIds.length > 0 ? priorityIds : uniqueIds;
+}
+
+export function isEntryAvailableForVersion(entry: SaleEntry, currentVersion: number): boolean {
+	const maxVersion = Number.parseInt(entry.header.maxVersion ?? "", 10);
+	return !Number.isFinite(maxVersion) || maxVersion >= currentVersion;
 }
 
 export interface EventOccurrence {
