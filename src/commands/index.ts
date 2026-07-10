@@ -4,6 +4,7 @@ import { startCommandProgress } from "./progress.js";
 import { banCommand } from "./ban.js";
 import { botCommand } from "./bot.js";
 import { enemyCommand } from "./enemy.js";
+import { eventCommand } from "./event.js";
 import { gatyaCommand } from "./gatya.js";
 import { helpCommand } from "./help.js";
 import { idCommand } from "./id.js";
@@ -28,6 +29,7 @@ for (const command of [
 	itemCommand,
 	unitCommand,
 	enemyCommand,
+	eventCommand,
 	stageCommand,
 	ocCommand,
 	pushCommand,

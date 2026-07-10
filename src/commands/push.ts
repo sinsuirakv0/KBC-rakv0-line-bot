@@ -1,11 +1,10 @@
 ﻿import type { LineCommand, LineDestination } from "./shared.js";
-import { fetchCsvMap, fetchJson, isExactInteger } from "./shared.js";
+import { fetchCsvMap, isExactInteger } from "./shared.js";
 import {
-	findNextEventOccurrence,
-	formatEventSchedule,
-	formatNextEventOccurrence,
-} from "../eventPush/format.js";
-import { isIgnoredEventEntry, type SaleEntry, type SaleJson } from "../eventPush/schedule.js";
+	eventDetailsFromCatalog,
+	formatEventDetailsLines,
+	loadEventCatalog,
+} from "../eventPush/catalog.js";
 import { eventPushStore } from "../eventPush/store.js";
 import { pushReminderStore } from "../reminders/store.js";
 import {
@@ -14,24 +13,6 @@ import {
 	type ReminderParseFailureReason,
 } from "../reminders/time.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
-
-interface EventDetails {
-	name: string;
-	entries: SaleEntry[];
-}
-
-async function loadEventDetails(eventId: number): Promise<EventDetails> {
-	const [sale, names] = await Promise.all([
-		fetchJson<SaleJson>("data/sale.json", 60_000),
-		fetchCsvMap("data/sale_name.csv"),
-	]);
-	return {
-		name: names.get(eventId) || "名称不明",
-		entries: sale.data.filter((entry) =>
-			!isIgnoredEventEntry(entry) && entry.stageIds.includes(eventId)
-		),
-	};
-}
 
 async function eventLabel(eventId: number): Promise<string> {
 	const names = await fetchCsvMap("data/sale_name.csv");
@@ -56,10 +37,19 @@ function pushHelpText(): string {
 		"  このトークのスケジュール更新通知を解除します。",
 		"!push event",
 		"  この個人/グループ/OCを、イベント開始通知先として登録します。",
-		"!push event <イベントID>",
-		"  通知するイベントIDを追加します。開催5分前、開催時刻、終了10分前に通知します。",
+		"!push event <イベントID> [-分数]",
+		"  通知するイベントIDを追加します。開催時刻と終了10分前に通知します。",
+		"  -5 のように指定すると、開催5分前の通知も追加します。再指定すると上書きします。",
 		"!push event <イベントID> del",
 		"  指定したイベントIDの通知を解除します。",
+		"!push event all",
+		"  全イベントの開催時刻を通知します。個別登録との重複通知はしません。",
+		"!push event all del",
+		"  全イベント通知を解除します。個別イベントの設定は残ります。",
+		"!push event daily",
+		"  OpenChatで毎日22:00(JST)に翌日のイベント予定をスレッド通知します。",
+		"!push event daily del",
+		"  翌日イベント予定の通知を解除します。",
 		"!push event del",
 		"  このトークのイベント開始通知設定を削除します。",
 	].join("\n");
@@ -84,13 +74,17 @@ async function statusText(destination: LineDestination): Promise<string> {
 	];
 
 	if (event) {
+		lines.push(`全イベントの開催通知: ${event.allEvents ? "有効" : "無効"}`);
+		lines.push(`毎日22時の翌日予定: ${event.daily ? "有効" : "無効"}`);
 		if (event.eventIds.length === 0) {
 			lines.push("イベントID: 未登録");
 		} else {
 			const names = await fetchCsvMap("data/sale_name.csv");
 			lines.push("イベントID:");
 			for (const eventId of event.eventIds) {
-				lines.push(`  ${eventId} ${names.get(eventId) || "名称不明"}`);
+				const advanceMinutes = event.advanceMinutesByEvent[String(eventId)];
+				const advanceLabel = advanceMinutes ? ` / ${advanceMinutes}分前通知` : "";
+				lines.push(`  ${eventId} ${names.get(eventId) || "名称不明"}${advanceLabel}`);
 			}
 		}
 	}
@@ -183,11 +177,21 @@ export const pushCommand: LineCommand = {
 					"",
 					"!push event",
 					"  この個人/グループ/OCをイベント開始通知先として登録します。",
-					"!push event <イベントID>",
+					"!push event <イベントID> [-分数]",
 					"  通知するイベントIDを追加します。イベントIDはsale.jsonのstageIdsから判定します。",
-					"  stageIdsに102、104、112のいずれかを含むイベントは通知対象外です。",
+					"  stageIdsに102または112を含む場合、その2ID以外は表示・通知しません。",
+					"  開催時刻と終了10分前に通知し、-5 のように指定すると開催5分前にも通知します。",
+					"  同じイベントIDに別の分数を指定すると、事前通知時間を上書きします。",
 					"!push event <イベントID> del",
 					"  指定したイベントIDの通知を解除します。",
+					"!push event all",
+					"  sale.jsonにある全イベントの開催時刻を通知します。終了前通知はありません。",
+					"!push event all del",
+					"  全イベント通知のみ解除します。個別イベントの設定は残ります。",
+					"!push event daily",
+					"  OpenChatで毎日22:00(JST)に翌日24時間の予定をスレッド通知します。",
+					"!push event daily del",
+					"  翌日イベント予定の通知を解除します。",
 					"!push event del",
 					"  このトークのイベント開始通知設定を削除します。",
 					"!push status",
@@ -211,12 +215,56 @@ export const pushCommand: LineCommand = {
 
 			if (option === undefined) {
 				await eventPushStore.registerDestination(message.destination);
-				await message.send("このトークをイベント通知先として登録しました。\nイベントIDを !push event ID で追加してください。");
+				await message.send("このトークをイベント通知先として登録しました。\nイベントIDを !push event ID で追加するか、!push event all / daily を指定してください。");
+				return;
+			}
+
+			if (option === "all") {
+				const allAction = args[2]?.toLowerCase();
+				if (allAction === undefined) {
+					const result = await eventPushStore.setAllEvents(message.destination, true);
+					await message.send(result === "updated"
+						? "全イベントの開催通知を有効にしました。\n個別登録と重なる開催通知は1件だけ送信します。"
+						: "全イベントの開催通知はすでに有効です。");
+					return;
+				}
+				if (allAction === "del" || allAction === "off") {
+					const result = await eventPushStore.setAllEvents(message.destination, false);
+					await message.send(result === "updated"
+						? "全イベントの開催通知を解除しました。\n個別イベントの通知設定は維持されます。"
+						: "全イベントの開催通知は有効になっていません。");
+					return;
+				}
+				await message.send("使い方: !push event all [del]");
+				return;
+			}
+
+			if (option === "daily") {
+				const dailyAction = args[2]?.toLowerCase();
+				if (dailyAction === undefined) {
+					if (message.destination.kind !== "square") {
+						await message.send("!push event daily はスレッドを作成できるOpenChatでのみ利用できます。");
+						return;
+					}
+					const result = await eventPushStore.setDaily(message.destination, true);
+					await message.send(result === "updated"
+						? "毎日22:00(JST)に翌日24時間のイベント予定をスレッド通知します。"
+						: "翌日イベント予定の通知はすでに有効です。");
+					return;
+				}
+				if (dailyAction === "del" || dailyAction === "off") {
+					const result = await eventPushStore.setDaily(message.destination, false);
+					await message.send(result === "updated"
+						? "翌日イベント予定の通知を解除しました。"
+						: "翌日イベント予定の通知は有効になっていません。");
+					return;
+				}
+				await message.send("使い方: !push event daily [del]");
 				return;
 			}
 
 			if (!isExactInteger(option)) {
-				await message.send("イベントIDは整数で指定してください。\n使い方: !push event [イベントID [del]|del]\n設定確認: !push status");
+				await message.send("イベントIDは整数で指定してください。\n使い方: !push event [イベントID [-分数|del]|all [del]|daily [del]|del]\n設定確認: !push status");
 				return;
 			}
 
@@ -230,7 +278,25 @@ export const pushCommand: LineCommand = {
 				return;
 			}
 
-			const details = await loadEventDetails(eventId);
+			const advanceArgument = args[2];
+			let advanceMinutes: number | undefined;
+			if (advanceArgument !== undefined) {
+				if (!/^-\d+$/.test(advanceArgument)) {
+					await message.send("事前通知は -5 のように、開催何分前かを負の整数で指定してください。");
+					return;
+				}
+				advanceMinutes = Number.parseInt(advanceArgument.slice(1), 10);
+				if (!Number.isSafeInteger(advanceMinutes) || advanceMinutes <= 0) {
+					await message.send("事前通知の分数は1以上の整数で指定してください。");
+					return;
+				}
+			}
+			if (args.length > 3) {
+				await message.send("使い方: !push event <イベントID> [-分数]");
+				return;
+			}
+
+			const details = eventDetailsFromCatalog(await loadEventCatalog(), eventId);
 			if (details.entries.length === 0) {
 				await message.send(`ID ${eventId} は通知対象の sale.json に存在しません。`);
 				return;
@@ -240,16 +306,15 @@ export const pushCommand: LineCommand = {
 				return;
 			}
 
-			await eventPushStore.addId(message.destination, eventId);
-			const now = new Date();
-			const next = findNextEventOccurrence(eventId, details.entries, now);
+			await eventPushStore.addId(message.destination, eventId, advanceMinutes);
+			const saved = eventPushStore.get(message.destination);
+			const savedAdvanceMinutes = saved?.advanceMinutesByEvent[String(eventId)];
+			const detailLines = formatEventDetailsLines(details);
 			await message.send([
-				`${eventId} ${details.name}`,
-				"を登録しました",
-				"開催期間",
-				...formatEventSchedule(details.entries),
-				"次の開催",
-				next ? formatNextEventOccurrence(next, now) : "予定なし",
+				detailLines[0],
+				"の通知設定を保存しました",
+				`通知: 開催時刻、終了10分前${savedAdvanceMinutes ? `、開催${savedAdvanceMinutes}分前` : ""}`,
+				...detailLines.slice(1),
 			].join("\n"));
 		} catch (error) {
 			console.error("[push:event] command failed", error);

@@ -1,13 +1,19 @@
 ﻿import type { Client } from "@evex/linejs";
-import { fetchCsvMap, fetchJson } from "../commands/shared.js";
 import { appConfig } from "../config.js";
 import { permissionStore } from "../permissions/store.js";
+import { loadEventCatalog } from "./catalog.js";
+import {
+	dailyDeliveryInWindow,
+	dailyRootText,
+	formatDailyScheduleBody,
+} from "./daily.js";
 import {
 	collectEventNotifications,
 	formatEventDuration,
 	type EventNotificationPhase,
-	type SaleJson,
 } from "./schedule.js";
+import { targetWantsNotification } from "./policy.js";
+import { sendSquareThreadWithRoot } from "./squareThread.js";
 import { eventPushStore, type EventPushSubscription } from "./store.js";
 
 async function sendToTarget(
@@ -33,8 +39,12 @@ function notificationKey(
 	notifyAt: Date,
 	phase: EventNotificationPhase,
 	eventId: number,
+	minutesBeforeStart?: number,
 ): string {
-	return `${target.kind}:${target.chatMid}|${phase}|${notifyAt.getTime()}|${eventId}`;
+	const phaseKey = phase === "before-start"
+		? `${phase}:${minutesBeforeStart}`
+		: phase;
+	return `${target.kind}:${target.chatMid}|${phaseKey}|${notifyAt.getTime()}|${eventId}`;
 }
 
 function notificationLine(
@@ -42,8 +52,9 @@ function notificationLine(
 	eventId: number,
 	name: string,
 	durationMs: number,
+	minutesBeforeStart?: number,
 ): string {
-	if (phase === "start-5m") return `${eventId} ${name}の開催5分前です`;
+	if (phase === "before-start") return `${eventId} ${name}の開催${minutesBeforeStart}分前です`;
 	if (phase === "end-10m") return `${eventId} ${name}の終了10分前です`;
 	return `${eventId} ${name} <${formatEventDuration(durationMs)}>`;
 }
@@ -51,14 +62,15 @@ function notificationLine(
 export async function checkEventStarts(client: Client, now: Date): Promise<void> {
 	const targets = eventPushStore.list();
 	if (targets.length === 0) return;
-	const [sale, names] = await Promise.all([
-		fetchJson<SaleJson>("data/sale.json", 60_000),
-		fetchCsvMap("data/sale_name.csv"),
-	]);
+	const { sale, names } = await loadEventCatalog();
+	const beforeStartMinutes = targets.flatMap((target) =>
+		Object.values(target.advanceMinutesByEvent)
+	);
 	const notifications = collectEventNotifications(
 		sale,
 		new Date(now.getTime() - appConfig.eventPushLookbackMs),
 		now,
+		beforeStartMinutes,
 	);
 
 	const deliveredKeys: string[] = [];
@@ -67,9 +79,20 @@ export async function checkEventStarts(client: Client, now: Date): Promise<void>
 		for (const notification of notifications) {
 			if (notification.notifyAt.getTime() < registeredAt) continue;
 			const matchingEvents = notification.events.filter(({ eventId }) =>
-				target.eventIds.includes(eventId) &&
+				targetWantsNotification(
+					target,
+					notification.phase,
+					eventId,
+					notification.minutesBeforeStart,
+				) &&
 				!eventPushStore.hasNotified(
-					notificationKey(target, notification.notifyAt, notification.phase, eventId),
+					notificationKey(
+						target,
+						notification.notifyAt,
+						notification.phase,
+						eventId,
+						notification.minutesBeforeStart,
+					),
 				)
 			);
 			if (matchingEvents.length === 0) continue;
@@ -80,17 +103,44 @@ export async function checkEventStarts(client: Client, now: Date): Promise<void>
 					eventId,
 					names.get(eventId) || "名称不明",
 					durationMs,
+					notification.minutesBeforeStart,
 				)
 			).join("\n");
 			try {
-				await sendToTarget(client, target, text);
+				const result = await sendToTarget(client, target, text);
+				if (result === "stopped") continue;
 				for (const { eventId } of matchingEvents) {
 					deliveredKeys.push(
-					notificationKey(target, notification.notifyAt, notification.phase, eventId),
+						notificationKey(
+							target,
+							notification.notifyAt,
+							notification.phase,
+							eventId,
+							notification.minutesBeforeStart,
+						),
 					);
 				}
 			} catch (error) {
 				console.error(`[push:event] delivery failed for ${target.kind}:${target.chatMid}`, error);
+			}
+		}
+	}
+
+	const dailyDelivery = dailyDeliveryInWindow(now, appConfig.eventPushLookbackMs);
+	if (dailyDelivery) {
+		const rootText = dailyRootText(dailyDelivery.dayStart);
+		const bodyText = formatDailyScheduleBody(sale, names, dailyDelivery.dayStart);
+		for (const target of targets) {
+			if (!target.daily || target.kind !== "square") continue;
+			const registeredAt = Date.parse(target.updatedAt) || now.getTime();
+			if (dailyDelivery.dueAt.getTime() < registeredAt) continue;
+			const key = `${target.kind}:${target.chatMid}|daily|${dailyDelivery.dateKey}`;
+			if (eventPushStore.hasNotified(key) || permissionStore.isBotStopped(target)) continue;
+			try {
+				await sendSquareThreadWithRoot(client, target.chatMid, rootText, bodyText);
+				deliveredKeys.push(key);
+			} catch (error) {
+				console.error(`[push:event:daily] delivery failed for ${target.kind}:${target.chatMid}`, error);
 			}
 		}
 	}

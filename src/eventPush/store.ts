@@ -10,12 +10,15 @@ export interface EventPushSubscription {
 	chatType: "USER" | "GROUP" | "ROOM" | "SQUARE";
 	encrypted: boolean;
 	eventIds: number[];
+	advanceMinutesByEvent: Record<string, number>;
+	allEvents: boolean;
+	daily: boolean;
 	registeredBy: string;
 	updatedAt: string;
 }
 
 interface SubscriptionFile {
-	version: 1;
+	version: 3;
 	subscriptions: EventPushSubscription[];
 }
 
@@ -24,7 +27,7 @@ interface NotificationStateFile {
 	notifiedKeys: string[];
 }
 
-const EMPTY_SUBSCRIPTIONS: SubscriptionFile = { version: 1, subscriptions: [] };
+const EMPTY_SUBSCRIPTIONS: SubscriptionFile = { version: 3, subscriptions: [] };
 const EMPTY_STATE: NotificationStateFile = { version: 1, notifiedKeys: [] };
 
 function targetKey(target: Pick<LineDestination, "kind" | "chatMid">): string {
@@ -33,18 +36,44 @@ function targetKey(target: Pick<LineDestination, "kind" | "chatMid">): string {
 
 function parseSubscriptions(value: unknown): SubscriptionFile {
 	if (!value || typeof value !== "object") return structuredClone(EMPTY_SUBSCRIPTIONS);
-	const raw = value as Partial<SubscriptionFile>;
+	const raw = value as { subscriptions?: unknown };
 	const subscriptions = Array.isArray(raw.subscriptions)
-		? raw.subscriptions.filter((item): item is EventPushSubscription =>
-			Boolean(item && typeof item.chatMid === "string" &&
-				(item.kind === "talk" || item.kind === "square")))
+		? raw.subscriptions.filter((item): item is Record<string, unknown> =>
+			Boolean(item && typeof item === "object" &&
+				typeof (item as Record<string, unknown>).chatMid === "string" &&
+				((item as Record<string, unknown>).kind === "talk" ||
+					(item as Record<string, unknown>).kind === "square")))
 		: [];
 	return {
-		version: 1,
-		subscriptions: subscriptions.map((item) => ({
-			...item,
-			eventIds: [...new Set((item.eventIds ?? []).filter(Number.isInteger))].sort((a, b) => a - b),
-		})),
+		version: 3,
+		subscriptions: subscriptions.map((item) => {
+			const eventIds = [...new Set(
+				(Array.isArray(item.eventIds) ? item.eventIds : [])
+					.filter((eventId): eventId is number => Number.isSafeInteger(eventId)),
+			)].sort((a, b) => a - b);
+			const rawAdvanceMinutes = item.advanceMinutesByEvent;
+			const advanceMinutesByEvent: Record<string, number> = {};
+			if (rawAdvanceMinutes && typeof rawAdvanceMinutes === "object" && !Array.isArray(rawAdvanceMinutes)) {
+				for (const eventId of eventIds) {
+					const minutes = (rawAdvanceMinutes as Record<string, unknown>)[String(eventId)];
+					if (Number.isSafeInteger(minutes) && (minutes as number) > 0) {
+						advanceMinutesByEvent[String(eventId)] = minutes as number;
+					}
+				}
+			}
+			return {
+				kind: item.kind as EventPushSubscription["kind"],
+				chatMid: item.chatMid as string,
+				chatType: item.chatType as EventPushSubscription["chatType"],
+				encrypted: Boolean(item.encrypted),
+				eventIds,
+				advanceMinutesByEvent,
+				allEvents: item.allEvents === true,
+				daily: item.daily === true,
+				registeredBy: typeof item.registeredBy === "string" ? item.registeredBy : "",
+				updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : new Date().toISOString(),
+			};
+		}),
 	};
 }
 
@@ -79,25 +108,80 @@ class EventPushStore {
 		return this.subscriptions.subscriptions.map((item) => ({
 			...item,
 			eventIds: [...item.eventIds],
+			advanceMinutesByEvent: { ...item.advanceMinutesByEvent },
 		}));
 	}
 
 	get(destination: Pick<LineDestination, "kind" | "chatMid">): EventPushSubscription | undefined {
 		const key = targetKey(destination);
 		const found = this.subscriptions.subscriptions.find((item) => targetKey(item) === key);
-		return found ? { ...found, eventIds: [...found.eventIds] } : undefined;
+		return found
+			? {
+				...found,
+				eventIds: [...found.eventIds],
+				advanceMinutesByEvent: { ...found.advanceMinutesByEvent },
+			}
+			: undefined;
 	}
 
 	async registerDestination(destination: LineDestination): Promise<void> {
 		const current = this.get(destination);
-		await this.upsert(destination, current?.eventIds ?? []);
+		await this.upsert(
+			destination,
+			current?.eventIds ?? [],
+			current?.advanceMinutesByEvent ?? {},
+			current?.allEvents ?? false,
+			current?.daily ?? false,
+		);
 	}
 
-	async addId(destination: LineDestination, eventId: number): Promise<number[]> {
+	async addId(
+		destination: LineDestination,
+		eventId: number,
+		advanceMinutes?: number,
+	): Promise<number[]> {
 		const current = this.get(destination);
 		const eventIds = [...new Set([...(current?.eventIds ?? []), eventId])].sort((a, b) => a - b);
-		await this.upsert(destination, eventIds);
+		const advanceMinutesByEvent = { ...(current?.advanceMinutesByEvent ?? {}) };
+		if (advanceMinutes !== undefined) {
+			advanceMinutesByEvent[String(eventId)] = advanceMinutes;
+		}
+		await this.upsert(
+			destination,
+			eventIds,
+			advanceMinutesByEvent,
+			current?.allEvents ?? false,
+			current?.daily ?? false,
+		);
 		return eventIds;
+	}
+
+	async setAllEvents(destination: LineDestination, enabled: boolean): Promise<"updated" | "unchanged"> {
+		const current = this.get(destination);
+		if (!current && !enabled) return "unchanged";
+		if (current?.allEvents === enabled) return "unchanged";
+		await this.upsert(
+			destination,
+			current?.eventIds ?? [],
+			current?.advanceMinutesByEvent ?? {},
+			enabled,
+			current?.daily ?? false,
+		);
+		return "updated";
+	}
+
+	async setDaily(destination: LineDestination, enabled: boolean): Promise<"updated" | "unchanged"> {
+		const current = this.get(destination);
+		if (!current && !enabled) return "unchanged";
+		if (current?.daily === enabled) return "unchanged";
+		await this.upsert(
+			destination,
+			current?.eventIds ?? [],
+			current?.advanceMinutesByEvent ?? {},
+			current?.allEvents ?? false,
+			enabled,
+		);
+		return "updated";
 	}
 
 	async remove(destination: Pick<LineDestination, "kind" | "chatMid">): Promise<boolean> {
@@ -118,9 +202,16 @@ class EventPushStore {
 		if (!current) return "not-found";
 		if (!current.eventIds.includes(eventId)) return "not-found";
 		const remaining = current.eventIds.filter((id) => id !== eventId);
+		const advanceMinutesByEvent = { ...current.advanceMinutesByEvent };
+		delete advanceMinutesByEvent[String(eventId)];
 		this.subscriptions.subscriptions = this.subscriptions.subscriptions.map((item) =>
 			targetKey(item) === targetKey(destination)
-				? { ...item, eventIds: remaining, updatedAt: new Date().toISOString() }
+				? {
+					...item,
+					eventIds: remaining,
+					advanceMinutesByEvent,
+					updatedAt: new Date().toISOString(),
+				}
 				: item
 		);
 		await this.saveSubscriptions();
@@ -139,7 +230,13 @@ class EventPushStore {
 		await this.saveState();
 	}
 
-	private async upsert(destination: LineDestination, eventIds: number[]): Promise<void> {
+	private async upsert(
+		destination: LineDestination,
+		eventIds: number[],
+		advanceMinutesByEvent: Record<string, number>,
+		allEvents: boolean,
+		daily: boolean,
+	): Promise<void> {
 		const key = targetKey(destination);
 		const value: EventPushSubscription = {
 			kind: destination.kind,
@@ -147,6 +244,9 @@ class EventPushStore {
 			chatType: destination.chatType,
 			encrypted: destination.encrypted,
 			eventIds,
+			advanceMinutesByEvent,
+			allEvents,
+			daily,
 			registeredBy: destination.senderMid,
 			updatedAt: new Date().toISOString(),
 		};

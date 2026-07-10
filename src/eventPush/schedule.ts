@@ -3,7 +3,7 @@ import type { TimeBlock } from "../commands/shared.js";
 const JST_MS = 9 * 60 * 60 * 1_000;
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const IGNORED_STAGE_IDS = [102, 104, 112];
+const PRIORITY_EVENT_IDS = new Set([102, 112]);
 
 export interface SaleHeader {
 	startDate: string;
@@ -23,8 +23,10 @@ export interface SaleJson {
 	data: SaleEntry[];
 }
 
-export function isIgnoredEventEntry(entry: SaleEntry): boolean {
-	return IGNORED_STAGE_IDS.some((id) => entry.stageIds.includes(id));
+export function selectNotificationEventIds(stageIds: number[]): number[] {
+	const uniqueIds = [...new Set(stageIds)];
+	const priorityIds = uniqueIds.filter((eventId) => PRIORITY_EVENT_IDS.has(eventId));
+	return priorityIds.length > 0 ? priorityIds : uniqueIds;
 }
 
 export interface EventOccurrence {
@@ -33,11 +35,12 @@ export interface EventOccurrence {
 	eventIds: number[];
 }
 
-export type EventNotificationPhase = "start-5m" | "start" | "end-10m";
+export type EventNotificationPhase = "before-start" | "start" | "end-10m";
 
 export interface EventNotification {
 	notifyAt: Date;
 	phase: EventNotificationPhase;
+	minutesBeforeStart?: number;
 	events: Array<{
 		eventId: number;
 		durationMs: number;
@@ -197,19 +200,19 @@ export function collectEventOccurrences(
 ): EventOccurrence[] {
 	const occurrences = new Map<string, { startAt: Date; endAt: Date; eventIds: Set<number> }>();
 	for (const entry of sale.data) {
-		if (isIgnoredEventEntry(entry)) continue;
+		const eventIds = selectNotificationEventIds(entry.stageIds);
 		const entryStart = parseHeaderPoint(entry.header.startDate, entry.header.startTime);
 		const entryEnd = parseHeaderPoint(entry.header.endDate, entry.header.endTime);
 		if (!Number.isFinite(entryStart.getTime()) || !Number.isFinite(entryEnd.getTime())) continue;
 		if (entry.timeBlocks.length === 0) {
-			addOccurrence(occurrences, entryStart, entryEnd, entry.stageIds, entryStart, entryEnd);
+			addOccurrence(occurrences, entryStart, entryEnd, eventIds, entryStart, entryEnd);
 			continue;
 		}
 		for (const block of entry.timeBlocks) {
 			addBlockOccurrences(
 				occurrences,
 				block,
-				entry.stageIds,
+				eventIds,
 				windowFrom,
 				windowTo,
 				entryStart,
@@ -230,27 +233,69 @@ export function collectEventNotifications(
 	sale: SaleJson,
 	from: Date,
 	to: Date,
+	beforeStartMinutes: number[] = [],
 ): EventNotification[] {
 	const grouped = new Map<
 		string,
-		{ notifyAt: Date; phase: EventNotificationPhase; events: Map<number, number> }
+		{
+			notifyAt: Date;
+			phase: EventNotificationPhase;
+			minutesBeforeStart?: number;
+			events: Map<number, number>;
+		}
 	>();
+
+	const addNotification = (
+		occurrence: EventOccurrence,
+		phase: EventNotificationPhase,
+		notifyAt: Date,
+		minutesBeforeStart?: number,
+	) => {
+		if (notifyAt <= from || notifyAt > to) return;
+		const key = `${phase}|${minutesBeforeStart ?? ""}|${notifyAt.getTime()}`;
+		const notification = grouped.get(key) ?? {
+			notifyAt,
+			phase,
+			minutesBeforeStart,
+			events: new Map<number, number>(),
+		};
+		const durationMs = occurrence.endAt.getTime() - occurrence.startAt.getTime();
+		for (const eventId of occurrence.eventIds) {
+			if (!notification.events.has(eventId)) notification.events.set(eventId, durationMs);
+		}
+		grouped.set(key, notification);
+	};
+
 	const occurrences = collectEventOccurrences(sale, addDays(from, -2), addDays(to, 2));
 	for (const occurrence of occurrences) {
-		const phases: Array<[EventNotificationPhase, Date]> = [
-			["start-5m", new Date(occurrence.startAt.getTime() - 5 * 60_000)],
-			["start", occurrence.startAt],
-			["end-10m", new Date(occurrence.endAt.getTime() - 10 * 60_000)],
-		];
-		for (const [phase, notifyAt] of phases) {
-			if (notifyAt <= from || notifyAt > to) continue;
-			const key = `${phase}|${notifyAt.getTime()}`;
-			const notification = grouped.get(key) ?? { notifyAt, phase, events: new Map<number, number>() };
-			const durationMs = occurrence.endAt.getTime() - occurrence.startAt.getTime();
-			for (const eventId of occurrence.eventIds) {
-				if (!notification.events.has(eventId)) notification.events.set(eventId, durationMs);
-			}
-			grouped.set(key, notification);
+		addNotification(occurrence, "start", occurrence.startAt);
+		addNotification(
+			occurrence,
+			"end-10m",
+			new Date(occurrence.endAt.getTime() - 10 * 60_000),
+		);
+	}
+
+	const uniqueMinutes = [...new Set(beforeStartMinutes)]
+		.filter((minutes) => Number.isSafeInteger(minutes) && minutes > 0)
+		.sort((left, right) => left - right);
+	for (const minutes of uniqueMinutes) {
+		const offsetMs = minutes * 60_000;
+		const shiftedFrom = new Date(from.getTime() + offsetMs);
+		const shiftedTo = new Date(to.getTime() + offsetMs);
+		if (!Number.isFinite(shiftedFrom.getTime()) || !Number.isFinite(shiftedTo.getTime())) continue;
+		const futureOccurrences = collectEventOccurrences(
+			sale,
+			addDays(shiftedFrom, -2),
+			addDays(shiftedTo, 2),
+		);
+		for (const occurrence of futureOccurrences) {
+			addNotification(
+				occurrence,
+				"before-start",
+				new Date(occurrence.startAt.getTime() - offsetMs),
+				minutes,
+			);
 		}
 	}
 	return [...grouped.values()]
@@ -258,6 +303,7 @@ export function collectEventNotifications(
 		.map((notification) => ({
 			notifyAt: notification.notifyAt,
 			phase: notification.phase,
+			minutesBeforeStart: notification.minutesBeforeStart,
 			events: [...notification.events.entries()]
 				.sort(([left], [right]) => left - right)
 				.map(([eventId, durationMs]) => ({ eventId, durationMs })),
