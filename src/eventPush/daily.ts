@@ -3,6 +3,7 @@
 	formatEventDuration,
 	type SaleJson,
 } from "./schedule.js";
+import { isAllEventsDisplayable } from "./policy.js";
 
 const JST_MS = 9 * 60 * 60 * 1_000;
 const DAY_MS = 24 * 60 * 60 * 1_000;
@@ -98,12 +99,12 @@ export function formatDailyScheduleBody(
 		if (occurrence.startAt >= dayStart && occurrence.startAt < dayEnd) {
 			const startTime = occurrence.startAt.getTime();
 			const rows = groups.get(startTime) ?? new Map<string, { eventId: number; suffix: string }>();
-			for (const eventId of occurrence.eventIds) {
+			for (const eventId of occurrence.eventIds.filter(isAllEventsDisplayable)) {
 				const suffix = `<${formatEventDuration(durationMs).replaceAll(" ", "")}>`;
 				const key = `${eventId}|start|${durationMs}`;
 				if (!rows.has(key)) rows.set(key, { eventId, suffix });
 			}
-			groups.set(startTime, rows);
+			if (rows.size > 0) groups.set(startTime, rows);
 		}
 		if (
 			occurrence.startAt < dayStart &&
@@ -113,12 +114,12 @@ export function formatDailyScheduleBody(
 			const rows = groups.get(dayStart.getTime()) ??
 				new Map<string, { eventId: number; suffix: string }>();
 			const end = jstDateParts(occurrence.endAt);
-			for (const eventId of occurrence.eventIds) {
+			for (const eventId of occurrence.eventIds.filter(isAllEventsDisplayable)) {
 				const suffix = `~${pad(end.hour)}:${pad(end.minute)}`;
 				const key = `${eventId}|end|${occurrence.endAt.getTime()}`;
 				if (!rows.has(key)) rows.set(key, { eventId, suffix });
 			}
-			groups.set(dayStart.getTime(), rows);
+			if (rows.size > 0) groups.set(dayStart.getTime(), rows);
 		}
 	}
 
