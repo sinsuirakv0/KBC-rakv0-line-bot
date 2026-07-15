@@ -324,7 +324,7 @@ function squareMessagesFromEvent(event: RawSquareEvent): SquareEventMessage[] {
 		});
 	}
 	if (
-		isSquareEventType(event, "NOTIFICATION_THREAD_MESSAGE", 52) &&
+		isSquareEventType(event, "NOTIFICATION_THREAD_MESSAGE", 54) &&
 		payload.notificationThreadMessage?.squareMessage
 	) {
 		messages.push({
@@ -339,6 +339,16 @@ function squareMessagesFromEvent(event: RawSquareEvent): SquareEventMessage[] {
 
 function squareThreadMidFromRaw(value: unknown): string | undefined {
 	return rawString(rawObject(rawObject(value)?.threadInfo)?.chatThreadMid);
+}
+
+function squareEventCreatedAt(event: RawSquareEvent): number | undefined {
+	const timestamps = [rawNumber(event.createdTime)];
+	for (const eventMessage of squareMessagesFromEvent(event)) {
+		const rawMessage = rawObject(rawObject(eventMessage.raw)?.message);
+		timestamps.push(rawNumber(rawMessage?.createdTime));
+	}
+	const valid = timestamps.filter((value): value is number => value !== undefined);
+	return valid.length > 0 ? Math.max(...valid) : undefined;
 }
 
 function postModerationEventFromSquareEvent(
@@ -1524,8 +1534,8 @@ async function listenRawSquareEvents(
 			let replayedCount = 0;
 			for (const event of events) {
 				recordSquareEventDebug(event);
-				const createdAt = rawNumber(event.createdTime);
-				if (createdAt === undefined || createdAt < sessionStartedAt) {
+				const createdAt = squareEventCreatedAt(event);
+				if (createdAt !== undefined && createdAt < sessionStartedAt) {
 					replayedCount++;
 					continue;
 				}
