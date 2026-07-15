@@ -208,8 +208,25 @@ export async function handleOpenChatJoinSystemMessage(message: OpenChatJoinSyste
 	});
 }
 
-export async function handleOpenChatJoinEventMessage(event: OpenChatMemberJoinEvent): Promise<boolean> {
+export async function handleOpenChatJoinEventMessage(
+	event: OpenChatMemberJoinEvent,
+	options: { ignoreBefore?: number } = {},
+): Promise<boolean> {
 	if (!event.squareChatMid || event.source !== "chat-member") return false;
+	if (
+		options.ignoreBefore !== undefined &&
+		(event.joinedAt === undefined || event.joinedAt < options.ignoreBefore)
+	) {
+		console.log("[oc-join-message] skipped replayed join event", {
+			squareMid: event.squareMid,
+			squareChatMid: event.squareChatMid,
+			memberMid: event.memberMid,
+			displayName: event.displayName,
+			joinedAt: event.joinedAt,
+			ignoreBefore: options.ignoreBefore,
+		});
+		return false;
+	}
 	return await sendConfiguredJoinMessage({
 		client: event.client,
 		squareMid: event.squareMid,

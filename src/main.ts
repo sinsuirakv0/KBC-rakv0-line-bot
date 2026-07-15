@@ -84,6 +84,7 @@ interface ParsedTalkText {
 }
 
 interface RawSquareEvent {
+	createdTime?: number | bigint;
 	type: string | number;
 	payload?: {
 		notificationMessage?: {
@@ -447,6 +448,7 @@ async function memberActivityEventsFromSquareEvent(
 	event: RawSquareEvent,
 ): Promise<{ joins: OpenChatMemberJoinEvent[]; leaves: OpenChatMemberLeaveEvent[] }> {
 	const payload = event.payload;
+	const eventCreatedAt = rawNumber(event.createdTime);
 	const joins: OpenChatMemberJoinEvent[] = [];
 	const leaves: OpenChatMemberLeaveEvent[] = [];
 	if (!payload) return { joins, leaves };
@@ -460,6 +462,7 @@ async function memberActivityEventsFromSquareEvent(
 				squareMid: member.squareMid,
 				memberMid: member.memberMid,
 				displayName: member.displayName,
+				joinedAt: eventCreatedAt,
 				source: "square-member",
 			});
 		}
@@ -480,7 +483,7 @@ async function memberActivityEventsFromSquareEvent(
 				squareChatMid,
 				memberMid,
 				displayName: peer.displayName,
-				joinedAt: rawNumber(raw?.joinedAt),
+				joinedAt: rawNumber(raw?.joinedAt) ?? eventCreatedAt,
 				source: "chat-member",
 			});
 		}
@@ -490,6 +493,13 @@ async function memberActivityEventsFromSquareEvent(
 		const raw = rawObject(payload.notifiedJoinSquareChat);
 		const member = rawMember(raw?.joinedMember);
 		const squareChatMid = rawString(raw?.squareChatMid);
+		console.log("[oc-join-message] raw join event", {
+			squareChatMid,
+			squareMid: member.squareMid,
+			memberMid: member.memberMid,
+			displayName: member.displayName,
+			parsed: Boolean(member.squareMid && squareChatMid && member.memberMid),
+		});
 		if (member.squareMid && squareChatMid && member.memberMid) {
 			joins.push({
 				client,
@@ -497,6 +507,7 @@ async function memberActivityEventsFromSquareEvent(
 				squareChatMid,
 				memberMid: member.memberMid,
 				displayName: member.displayName,
+				joinedAt: eventCreatedAt,
 				source: "chat-member",
 			});
 		}
@@ -517,6 +528,7 @@ async function memberActivityEventsFromSquareEvent(
 				squareChatMid,
 				memberMid,
 				displayName: member.displayName,
+				leftAt: eventCreatedAt,
 				source: "chat-member",
 			});
 		}
@@ -536,6 +548,7 @@ async function memberActivityEventsFromSquareEvent(
 				squareMid,
 				squareChatMid,
 				memberMid,
+				joinedAt: eventCreatedAt,
 				source: "chat-member",
 			});
 		}
@@ -545,6 +558,7 @@ async function memberActivityEventsFromSquareEvent(
 				squareMid,
 				squareChatMid,
 				memberMid,
+				leftAt: eventCreatedAt,
 				source: "chat-member",
 			});
 		}
@@ -561,6 +575,7 @@ async function memberActivityEventsFromSquareEvent(
 				squareMid,
 				memberMid,
 				displayName: member.displayName,
+				leftAt: eventCreatedAt,
 				clearAllChats: false,
 				source: "square-member",
 			});
@@ -1438,6 +1453,7 @@ async function listenRawSquareEvents(
 	client: Client,
 	signal: AbortSignal,
 	onFatal: (error: unknown) => void,
+	sessionStartedAt: number,
 ): Promise<void> {
 	const polling = client.base.createPolling();
 	for await (const event of polling._listenSquareEvents({
@@ -1463,7 +1479,7 @@ async function listenRawSquareEvents(
 					encrypted: false,
 				}))
 			) {
-				void handleOpenChatJoinEventMessage(joinEvent)
+				void handleOpenChatJoinEventMessage(joinEvent, { ignoreBefore: sessionStartedAt })
 					.catch((error) => handlePollingError("square", error, onFatal));
 			}
 		}
@@ -1507,7 +1523,8 @@ async function runSession(
 ): Promise<void> {
 	const profile = await client.getMyProfile();
 	console.log(`[line] logged in as ${profile.displayName} (${profile.mid})`);
-	await runtimeStore.startSession();
+	const sessionStartedAt = Date.now();
+	await runtimeStore.startSession(sessionStartedAt);
 	try {
 		await client.base.e2ee.getE2EESelfKeyData(profile.mid);
 		console.log("[line] E2EE self key is available");
@@ -1536,7 +1553,7 @@ async function runSession(
 			.catch(onFatal);
 	}
 	if (appConfig.enableSquare) {
-		void listenRawSquareEvents(client, controller.signal, onFatal)
+		void listenRawSquareEvents(client, controller.signal, onFatal, sessionStartedAt)
 			.catch(onFatal);
 	}
 

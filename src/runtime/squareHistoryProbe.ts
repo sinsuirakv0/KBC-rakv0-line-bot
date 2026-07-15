@@ -124,7 +124,7 @@ function eventTypeName(value: unknown): string {
 function hasJoinOrLeaveText(value: unknown, depth = 0): boolean {
 	if (depth > 7) return false;
 	if (typeof value === "string") {
-		return /(?:トークに参加|トークを退出|参加しました|退出しました|joined|left the chat)/iu.test(value);
+		return /(?:トークに参加|トークを退出|参加しました|退出しました|joined (?:the )?(?:chat|openchat|open chat)|left (?:the )?(?:chat|openchat|open chat))/iu.test(value);
 	}
 	if (Array.isArray(value)) return value.some((item) => hasJoinOrLeaveText(item, depth + 1));
 	const raw = rawObject(value);
@@ -178,6 +178,10 @@ function formatEvent(event: unknown, index: number): string[] {
 	const raw = rawObject(event) ?? {};
 	const payload = rawObject(raw.payload) ?? {};
 	const systemMessage = rawObject(payload.notifiedSystemMessage);
+	const join = rawObject(payload.notifiedJoinSquareChat);
+	const joinedMember = rawObject(join?.joinedMember);
+	const leave = rawObject(payload.notifiedLeaveSquareChat);
+	const leftMember = rawObject(leave?.squareMember);
 	const lines = [
 		`${index}. ${eventCreatedAt(raw.createdTime)} type=${eventTypeLabel(raw.type)}`,
 		`payload=${Object.keys(payload).filter((key) => payload[key] !== undefined).join(",") || "(none)"}`,
@@ -186,6 +190,18 @@ function formatEvent(event: unknown, index: number): string[] {
 		lines.push(`system.chatMid=${rawString(systemMessage.squareChatMid) ?? "(none)"}`);
 		lines.push(`system.messageKey=${rawString(systemMessage.messageKey) ?? "(none)"}`);
 		lines.push(`system.text=${rawString(systemMessage.text) ?? "(none)"}`);
+	} else if (join) {
+		lines.push(`join.chatMid=${rawString(join.squareChatMid) ?? "(none)"}`);
+		lines.push(`join.squareMid=${rawString(joinedMember?.squareMid) ?? "(none)"}`);
+		lines.push(`join.memberMid=${rawString(joinedMember?.squareMemberMid) ?? "(none)"}`);
+		lines.push(`join.displayName=${rawString(joinedMember?.displayName) ?? "(none)"}`);
+	} else if (leave) {
+		lines.push(`leave.chatMid=${rawString(leave.squareChatMid) ?? "(none)"}`);
+		lines.push(`leave.squareMid=${rawString(leftMember?.squareMid) ?? "(none)"}`);
+		lines.push(
+			`leave.memberMid=${rawString(leave.squareMemberMid) ?? rawString(leftMember?.squareMemberMid) ?? "(none)"}`,
+		);
+		lines.push(`leave.displayName=${rawString(leftMember?.displayName) ?? "(none)"}`);
 	} else {
 		lines.push(`data=${payloadPreview(payload)}`);
 	}
