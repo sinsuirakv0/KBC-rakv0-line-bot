@@ -80,6 +80,18 @@ const EVENT_TYPE_NAMES: Record<number, string> = {
 
 const FORWARD_PAGE_LIMIT = 100;
 const MAX_FORWARD_PAGES = 100;
+const MAX_RELEVANT_EVENTS = 30;
+const RELEVANT_EVENT_TYPES = new Set([
+	"NOTIFIED_JOIN_SQUARE_CHAT",
+	"NOTIFIED_LEAVE_SQUARE_CHAT",
+	"NOTIFIED_CREATE_SQUARE_MEMBER",
+	"NOTIFIED_CREATE_SQUARE_CHAT_MEMBER",
+	"NOTIFICATION_JOIN_REQUEST",
+	"NOTIFICATION_JOINED",
+	"NOTIFICATION_KICKED_OUT",
+	"NOTIFICATION_NEW_CHAT_MEMBER",
+	"NOTIFIED_SYSTEM_MESSAGE",
+]);
 
 function rawObject(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value)
@@ -101,6 +113,35 @@ function eventTypeLabel(value: unknown): string {
 	if (typeof value === "string") return value;
 	if (typeof value === "number") return `${EVENT_TYPE_NAMES[value] ?? "UNKNOWN"}(${value})`;
 	return "UNKNOWN";
+}
+
+function eventTypeName(value: unknown): string {
+	if (typeof value === "string") return value;
+	if (typeof value === "number") return EVENT_TYPE_NAMES[value] ?? `UNKNOWN_${value}`;
+	return "UNKNOWN";
+}
+
+function hasJoinOrLeaveText(value: unknown, depth = 0): boolean {
+	if (depth > 7) return false;
+	if (typeof value === "string") {
+		return /(?:トークに参加|トークを退出|参加しました|退出しました|joined|left the chat)/iu.test(value);
+	}
+	if (Array.isArray(value)) return value.some((item) => hasJoinOrLeaveText(item, depth + 1));
+	const raw = rawObject(value);
+	return raw ? Object.values(raw).some((item) => hasJoinOrLeaveText(item, depth + 1)) : false;
+}
+
+function isRelevantEvent(event: unknown): boolean {
+	const raw = rawObject(event);
+	if (!raw) return false;
+	if (RELEVANT_EVENT_TYPES.has(eventTypeName(raw.type))) return true;
+	return hasJoinOrLeaveText(raw.payload);
+}
+
+function isSystemMessageEvent(event: unknown): boolean {
+	const raw = rawObject(event);
+	const payload = rawObject(raw?.payload);
+	return payload?.notifiedSystemMessage !== undefined || eventTypeName(raw?.type) === "NOTIFIED_SYSTEM_MESSAGE";
 }
 
 function eventCreatedAt(value: unknown): string {
@@ -174,7 +215,10 @@ export async function probeRecentSquareHistory(
 	let reachedCurrent = false;
 	let totalForwardEvents = 0;
 	let forwardEvents: unknown[] = [];
+	let relevantForwardEvents: unknown[] = [];
+	let forwardSystemMessageCount = 0;
 	const forwardPages: FetchPageLog[] = [];
+	const forwardTypeCounts = new Map<string, number>();
 
 	for (let page = 1; page <= MAX_FORWARD_PAGES; page++) {
 		const previousSyncToken = syncToken;
@@ -190,6 +234,17 @@ export async function probeRecentSquareHistory(
 		syncToken = response.syncToken || syncToken;
 		totalForwardEvents += pageEvents.length;
 		forwardEvents = latestEvents([...forwardEvents, ...pageEvents], safeLimit);
+		for (const event of pageEvents) {
+			const type = eventTypeName(rawObject(event)?.type);
+			forwardTypeCounts.set(type, (forwardTypeCounts.get(type) ?? 0) + 1);
+			if (isSystemMessageEvent(event)) forwardSystemMessageCount++;
+			if (isRelevantEvent(event)) {
+				relevantForwardEvents = latestEvents(
+					[...relevantForwardEvents, event],
+					MAX_RELEVANT_EVENTS,
+				);
+			}
+		}
 		forwardPages.push({
 			page,
 			eventCount: pageEvents.length,
@@ -221,11 +276,11 @@ export async function probeRecentSquareHistory(
 	}
 	const backwardEvents = Array.isArray(backwardResponse?.events) ? backwardResponse.events : [];
 	const events = latestEvents(backwardEvents.length > 0 ? backwardEvents : forwardEvents, safeLimit);
-	const systemMessageCount = events.filter((event) => {
-		const raw = rawObject(event);
-		const payload = rawObject(raw?.payload);
-		return payload?.notifiedSystemMessage !== undefined || raw?.type === 49 || raw?.type === "NOTIFIED_SYSTEM_MESSAGE";
-	}).length;
+	const latestSystemMessageCount = events.filter(isSystemMessageEvent).length;
+	const systemMessageCount = Math.max(forwardSystemMessageCount, latestSystemMessageCount);
+	const typeCounts = [...forwardTypeCounts.entries()]
+		.sort(([leftType, leftCount], [rightType, rightCount]) => rightCount - leftCount || leftType.localeCompare(rightType));
+	const displayedRelevantEvents = relevantForwardEvents.slice(-10);
 
 	console.log("[test-square-history]", serializableJson({
 		at: new Date().toISOString(),
@@ -236,6 +291,10 @@ export async function probeRecentSquareHistory(
 			maxPages: MAX_FORWARD_PAGES,
 			pages: forwardPages,
 			totalEventCount: totalForwardEvents,
+			typeCounts: Object.fromEntries(typeCounts),
+			systemMessageCount: forwardSystemMessageCount,
+			relevantEventCount: relevantForwardEvents.length,
+			relevantEvents: relevantForwardEvents,
 			reachedCurrent,
 			finalSyncToken: syncToken,
 		},
@@ -258,15 +317,26 @@ export async function probeRecentSquareHistory(
 		`同期: ${forwardPages.length}ページ / ${totalForwardEvents}イベント`,
 		`現在地点到達: ${reachedCurrent ? "はい" : "いいえ（上限または同期停止）"}`,
 		`取得件数: ${events.length}/${safeLimit}`,
-		`システムメッセージ: ${systemMessageCount}件`,
+		`専用システムイベント: ${systemMessageCount}件`,
+		`参加・退出・システム候補: ${relevantForwardEvents.length}件`,
 		`処理時間: ${Date.now() - startedAt}ms`,
 		"完全な生データ: サーバーログ [test-square-history]",
 	];
 	if (backwardError) lines.push(`BACKWARD取得エラー: ${backwardError}`);
+	lines.push("", "同期イベント種別:");
+	if (typeCounts.length === 0) lines.push("(なし)");
+	else for (const [type, count] of typeCounts) lines.push(`${type}: ${count}`);
 	if (events.length === 0) {
-		lines.push("", "イベントは返りませんでした。");
+		lines.push("", "直近の保存イベントは返りませんでした。");
 	} else {
+		lines.push("", "直近の保存イベント:");
 		for (const [index, event] of events.entries()) {
+			lines.push("", ...formatEvent(event, index + 1));
+		}
+	}
+	if (displayedRelevantEvents.length > 0) {
+		lines.push("", `参加・退出・システム候補（最新${displayedRelevantEvents.length}件）:`);
+		for (const [index, event] of displayedRelevantEvents.entries()) {
 			lines.push("", ...formatEvent(event, index + 1));
 		}
 	}
