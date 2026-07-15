@@ -38,6 +38,7 @@ import {
 	type OpenChatNoteStatusModerationEvent,
 	type OpenChatPostModerationEvent,
 } from "./moderation/ocModeration.js";
+import { handleOpenChatJoinSystemMessage } from "./moderation/ocJoinMessage.js";
 import { ocModerationSettingsStore } from "./moderation/ocModerationSettings.js";
 import { botStopTargetFromDestination, permissionStore } from "./permissions/store.js";
 import { memberNameHistoryStore } from "./nameHistory/store.js";
@@ -633,6 +634,15 @@ async function handleSquareMessage(
 		return;
 	}
 	if (!message.text.startsWith(appConfig.commandPrefix)) {
+		if (!threadMid && await handleOpenChatJoinSystemMessage({
+			client,
+			squareMid: target.destination.scopeMid,
+			squareChatMid: target.destination.chatMid,
+			senderMid: target.destination.senderMid,
+			senderName: target.destination.senderName,
+			text: message.text,
+			mentionMids: target.mentionMids,
+		})) return;
 		if (await handleOcSetupReply(message.text, target)) return;
 		if (await handleOpenChatModerationCaseReply(message.text, target)) return;
 		if (await handleLogTargetSelectionReply(message.text, target)) return;

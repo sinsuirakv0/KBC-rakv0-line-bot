@@ -50,6 +50,8 @@ function adminHelpText(): string {
 		"  副官部屋設定を解除",
 		"!oc modroom test",
 		"  副官部屋への送信をテスト",
+		"!oc joinmes [mention] <内容> / !oc joinmes del",
+		"  参加時に送信するメッセージを、このトーク単位で設定/解除",
 		"!oc lineurl / !oc lineurl del",
 		"  line.meを含むURL削除のON/OFF",
 		"!oc media / !oc media del",
@@ -1097,6 +1099,109 @@ async function executeModRoom(command: Parameters<LineCommand["execute"]>[0]): P
 	].join("\n"));
 }
 
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function commandActionRemainder(command: Parameters<LineCommand["execute"]>[0]): string {
+	const action = command.args[0];
+	if (!action) return "";
+	const pattern = new RegExp(`^\\s*\\S+\\s+${escapeRegExp(action)}(?:\\s+|$)([\\s\\S]*)$`, "i");
+	return command.body.match(pattern)?.[1]?.trim() ?? "";
+}
+
+function joinMessageUsageText(): string {
+	return [
+		"参加メッセージ設定",
+		"",
+		"設定:",
+		"!oc joinmes <内容>",
+		"!oc joinmes mention <内容>",
+		"",
+		"解除:",
+		"!oc joinmes del",
+		"",
+		"mention を付けると、参加者をメンションしてから内容を送信します。",
+	].join("\n");
+}
+
+function parseJoinMessageInput(input: string): { kind: "status" | "clear" | "set"; mention: boolean; text: string } {
+	const trimmed = input.trim();
+	if (!trimmed) return { kind: "status", mention: false, text: "" };
+	const normalized = trimmed.normalize("NFKC").toLowerCase();
+	if (["del", "off", "disable", "clear", "解除"].includes(normalized)) {
+		return { kind: "clear", mention: false, text: "" };
+	}
+	const mentionMatch = trimmed.match(/^mention(?:\s+|$)([\s\S]*)$/i);
+	if (mentionMatch) {
+		return { kind: "set", mention: true, text: (mentionMatch[1] ?? "").trim() };
+	}
+	return { kind: "set", mention: false, text: trimmed };
+}
+
+async function executeJoinMessage(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message } = command;
+	if (message.destination.kind !== "square") {
+		await message.send("このコマンドはOpenChatで実行してください。");
+		return;
+	}
+	if (message.isThreadSource) {
+		await message.send("参加メッセージは、スレッドではなく対象トーク本体で設定してください。");
+		return;
+	}
+	if (!await canRunOpenChatSetup(command)) {
+		await message.send(setupPermissionDeniedText());
+		return;
+	}
+
+	const parsed = parseJoinMessageInput(commandActionRemainder(command));
+	if (parsed.kind === "status") {
+		const current = ocModerationSettingsStore.joinMessage(message.destination.chatMid);
+		if (!current) {
+			await message.send(`${joinMessageUsageText()}\n\n現在: 未設定`);
+			return;
+		}
+		await message.send([
+			"参加メッセージ設定",
+			"現在: 設定済み",
+			`メンション: ${current.mention ? "ON" : "OFF"}`,
+			"",
+			"内容:",
+			current.text,
+		].join("\n"));
+		return;
+	}
+
+	if (parsed.kind === "clear") {
+		const result = ocModerationSettingsStore.clearJoinMessage(message.destination.chatMid);
+		await ocModerationSettingsStore.flush();
+		await message.send(result === "unchanged"
+			? "参加メッセージは未設定です。"
+			: "参加メッセージを解除しました。");
+		return;
+	}
+
+	if (!parsed.text) {
+		await message.send(`${joinMessageUsageText()}\n\n内容が空です。`);
+		return;
+	}
+	const result = ocModerationSettingsStore.setJoinMessage(
+		message.destination.scopeMid,
+		message.destination.chatMid,
+		parsed.text,
+		parsed.mention,
+		message.destination.senderMid,
+	);
+	await ocModerationSettingsStore.flush();
+	await message.send([
+		result === "unchanged" ? "参加メッセージはすでに同じ内容で設定されています。" : "参加メッセージを設定しました。",
+		`メンション: ${parsed.mention ? "ON" : "OFF"}`,
+		"",
+		"内容:",
+		parsed.text,
+	].join("\n"));
+}
+
 export async function handleOcSetupReply(messageText: string, message: ReplyableLineMessage): Promise<boolean> {
 	if (message.destination.kind !== "square" || !message.replyToMessageId) return false;
 	const session = ocModerationSettingsStore.findSetupSession(
@@ -1242,6 +1347,10 @@ export const ocCommand: LineCommand = {
 		}
 		if (action === "modroom") {
 			await executeModRoom(command);
+			return;
+		}
+		if (action === "joinmes" || action === "joinmsg" || action === "joinmessage") {
+			await executeJoinMessage(command);
 			return;
 		}
 		if (action === "lineurl" || action === "link" || action === "linkurl" || action === "adlink") {

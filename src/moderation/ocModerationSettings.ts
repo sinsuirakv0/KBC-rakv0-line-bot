@@ -37,13 +37,23 @@ export interface OcSetupSession {
 	expiresAt: string;
 }
 
+export interface OcJoinMessageSetting {
+	squareMid: string;
+	squareChatMid: string;
+	text: string;
+	mention: boolean;
+	updatedAt: string;
+	updatedBy?: string;
+}
+
 interface OcModerationSettingsFile {
 	version: 1;
 	settings: OcModerationSetting[];
 	setupSessions: OcSetupSession[];
+	joinMessages: OcJoinMessageSetting[];
 }
 
-const EMPTY_SETTINGS: OcModerationSettingsFile = { version: 1, settings: [], setupSessions: [] };
+const EMPTY_SETTINGS: OcModerationSettingsFile = { version: 1, settings: [], setupSessions: [], joinMessages: [] };
 const SAVE_DELAY_MS = 5_000;
 const SETUP_SESSION_TTL_MS = 30 * 60_000;
 
@@ -116,6 +126,31 @@ function parseSetupSessions(value: unknown): OcSetupSession[] {
 	return [...byMessageId.values()];
 }
 
+function parseJoinMessages(value: unknown): OcJoinMessageSetting[] {
+	if (!Array.isArray(value)) return [];
+	const byChatMid = new Map<string, OcJoinMessageSetting>();
+	for (const setting of value) {
+		const item = setting as Partial<OcJoinMessageSetting>;
+		if (
+			typeof item.squareMid !== "string" ||
+			!item.squareMid ||
+			typeof item.squareChatMid !== "string" ||
+			!item.squareChatMid ||
+			typeof item.text !== "string" ||
+			!item.text.trim()
+		) continue;
+		byChatMid.set(item.squareChatMid, {
+			squareMid: item.squareMid,
+			squareChatMid: item.squareChatMid,
+			text: item.text,
+			mention: item.mention === true,
+			updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : nowIso(),
+			updatedBy: typeof item.updatedBy === "string" ? item.updatedBy : undefined,
+		});
+	}
+	return [...byChatMid.values()];
+}
+
 function parseSettings(value: unknown): OcModerationSettingsFile {
 	if (!value || typeof value !== "object") return structuredClone(EMPTY_SETTINGS);
 	const raw = value as Partial<OcModerationSettingsFile>;
@@ -143,6 +178,7 @@ function parseSettings(value: unknown): OcModerationSettingsFile {
 		version: 1,
 		settings: [...bySquareMid.values()],
 		setupSessions: parseSetupSessions(raw.setupSessions),
+		joinMessages: parseJoinMessages(raw.joinMessages),
 	};
 }
 
@@ -184,6 +220,52 @@ class OcModerationSettingsStore {
 			...value,
 			urlOffenders: value.urlOffenders.map((offender) => ({ ...offender })),
 		};
+	}
+
+	joinMessage(squareChatMid: string): OcJoinMessageSetting | undefined {
+		const setting = this.data.joinMessages.find((item) => item.squareChatMid === squareChatMid);
+		return setting ? { ...setting } : undefined;
+	}
+
+	setJoinMessage(
+		squareMid: string,
+		squareChatMid: string,
+		text: string,
+		mention: boolean,
+		updatedBy: string,
+	): "set" | "unchanged" {
+		const normalizedText = text.trim();
+		const current = this.data.joinMessages.find((item) => item.squareChatMid === squareChatMid);
+		if (current) {
+			if (current.text === normalizedText && current.mention === mention && current.squareMid === squareMid) {
+				return "unchanged";
+			}
+			current.squareMid = squareMid;
+			current.text = normalizedText;
+			current.mention = mention;
+			current.updatedAt = nowIso();
+			current.updatedBy = updatedBy;
+			this.scheduleSave();
+			return "set";
+		}
+		this.data.joinMessages.push({
+			squareMid,
+			squareChatMid,
+			text: normalizedText,
+			mention,
+			updatedAt: nowIso(),
+			updatedBy,
+		});
+		this.scheduleSave();
+		return "set";
+	}
+
+	clearJoinMessage(squareChatMid: string): "cleared" | "unchanged" {
+		const before = this.data.joinMessages.length;
+		this.data.joinMessages = this.data.joinMessages.filter((item) => item.squareChatMid !== squareChatMid);
+		if (this.data.joinMessages.length === before) return "unchanged";
+		this.scheduleSave();
+		return "cleared";
 	}
 
 	setLinkDelete(squareMid: string, enabled: boolean, updatedBy: string): "enabled" | "disabled" | "unchanged" {

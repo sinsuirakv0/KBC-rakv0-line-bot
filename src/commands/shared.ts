@@ -88,6 +88,8 @@ export interface CommandContext {
 	message: ReplyableLineMessage;
 	command: string;
 	args: string[];
+	rawText: string;
+	body: string;
 	progress: CommandProgress;
 }
 

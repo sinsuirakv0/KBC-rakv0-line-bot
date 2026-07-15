@@ -54,7 +54,7 @@ export async function handleLineCommand(messageText: string, message: ReplyableL
 	rankingStore.record(message.destination);
 	const progress = await startCommandProgress(message, name);
 	try {
-		await command.execute({ message, command: name, args, progress });
+		await command.execute({ message, command: name, args, rawText: messageText, body, progress });
 	} finally {
 		await progress.finish();
 	}
