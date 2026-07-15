@@ -15,6 +15,9 @@ interface EncryptedStorageFile {
 	ciphertext: string;
 }
 
+const SQUARE_SYNC_TOKEN_STORAGE_KEY = "kbc.squareSyncToken";
+const SQUARE_SYNC_TOKEN_SAVE_DELAY_MS = 5_000;
+
 function encryptionKey(): Buffer | null {
 	if (!appConfig.lineStorageBackupKey) return null;
 	return createHash("sha256").update(appConfig.lineStorageBackupKey, "utf8").digest();
@@ -140,6 +143,11 @@ class LineStorageBackup {
 const backup = new LineStorageBackup();
 
 export class SyncedLineStorage extends FileStorage {
+	private pendingSquareSyncToken: string | undefined;
+	private persistedSquareSyncToken: string | undefined;
+	private squareSyncTokenTimer: NodeJS.Timeout | undefined;
+	private squareSyncTokenQueue: Promise<void> = Promise.resolve();
+
 	override async set(key: Storage["Key"], value: Storage["Value"]): Promise<void> {
 		await super.set(key, value);
 		backup.schedule();
@@ -151,12 +159,72 @@ export class SyncedLineStorage extends FileStorage {
 	}
 
 	override async clear(): Promise<void> {
+		if (this.squareSyncTokenTimer) {
+			clearTimeout(this.squareSyncTokenTimer);
+			this.squareSyncTokenTimer = undefined;
+		}
+		this.pendingSquareSyncToken = undefined;
+		await this.squareSyncTokenQueue;
 		await super.clear();
+		this.persistedSquareSyncToken = undefined;
 		backup.schedule();
 	}
 
-	flushBackup(): Promise<void> {
-		return backup.flush();
+	async getSquareSyncToken(): Promise<string | undefined> {
+		const value = await this.get(SQUARE_SYNC_TOKEN_STORAGE_KEY);
+		const token = typeof value === "string" && value ? value : undefined;
+		this.persistedSquareSyncToken = token;
+		return token;
+	}
+
+	scheduleSquareSyncToken(token: string): void {
+		if (!token || token === this.pendingSquareSyncToken || token === this.persistedSquareSyncToken) return;
+		this.pendingSquareSyncToken = token;
+		if (this.squareSyncTokenTimer) return;
+		this.squareSyncTokenTimer = setTimeout(() => {
+			this.squareSyncTokenTimer = undefined;
+			void this.flushSquareSyncToken().catch((error) => {
+				console.error("[line-storage] square sync token save failed", error);
+			});
+		}, SQUARE_SYNC_TOKEN_SAVE_DELAY_MS);
+	}
+
+	async clearSquareSyncToken(): Promise<void> {
+		if (this.squareSyncTokenTimer) {
+			clearTimeout(this.squareSyncTokenTimer);
+			this.squareSyncTokenTimer = undefined;
+		}
+		this.pendingSquareSyncToken = undefined;
+		await this.squareSyncTokenQueue;
+		await this.delete(SQUARE_SYNC_TOKEN_STORAGE_KEY);
+		this.persistedSquareSyncToken = undefined;
+	}
+
+	async flushBackup(): Promise<void> {
+		if (this.squareSyncTokenTimer) {
+			clearTimeout(this.squareSyncTokenTimer);
+			this.squareSyncTokenTimer = undefined;
+		}
+		await this.flushSquareSyncToken();
+		await backup.flush();
+	}
+
+	private async flushSquareSyncToken(): Promise<void> {
+		const token = this.pendingSquareSyncToken;
+		this.pendingSquareSyncToken = undefined;
+		if (!token || token === this.persistedSquareSyncToken) {
+			await this.squareSyncTokenQueue;
+			return;
+		}
+		const operation = this.squareSyncTokenQueue.then(async () => {
+			await this.set(SQUARE_SYNC_TOKEN_STORAGE_KEY, token);
+			this.persistedSquareSyncToken = token;
+		});
+		this.squareSyncTokenQueue = operation.catch((error) => {
+			this.pendingSquareSyncToken = token;
+			console.error("[line-storage] square sync token write failed", error);
+		});
+		await operation;
 	}
 }
 

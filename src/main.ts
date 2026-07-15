@@ -1500,12 +1500,15 @@ async function handleRawSquareEvent(
 
 async function listenRawSquareEvents(
 	client: Client,
+	storage: SyncedLineStorage,
 	signal: AbortSignal,
 	onFatal: (error: unknown) => void,
 	sessionStartedAt: number,
 ): Promise<void> {
-	let syncToken: string | undefined;
+	let syncToken = await storage.getSquareSyncToken();
+	let loadedPersistedToken = Boolean(syncToken);
 	let continuationToken: string | undefined;
+	console.log(`[square:event] persisted sync token ${syncToken ? "loaded" : "not found"}`);
 	while (!signal.aborted) {
 		try {
 			const previousContinuationToken = continuationToken;
@@ -1516,6 +1519,7 @@ async function listenRawSquareEvents(
 			});
 			syncToken = response.syncToken || syncToken;
 			continuationToken = response.continuationToken || undefined;
+			loadedPersistedToken = false;
 			const events = (response.events ?? []) as unknown as RawSquareEvent[];
 			let replayedCount = 0;
 			for (const event of events) {
@@ -1542,7 +1546,18 @@ async function listenRawSquareEvents(
 				console.warn("[square:event] continuation token made no progress; resetting continuation");
 				continuationToken = undefined;
 			}
+			if (!continuationToken && syncToken) storage.scheduleSquareSyncToken(syncToken);
 		} catch (error) {
+			if (loadedPersistedToken && /ILLEGAL_ARGUMENT|INVALID_ARGUMENT/i.test(compactError(error))) {
+				console.warn("[square:event] persisted sync token was rejected; restarting initial sync");
+				await storage.clearSquareSyncToken().catch((clearError) => {
+					console.warn("[square:event] failed to clear rejected sync token", clearError);
+				});
+				syncToken = undefined;
+				continuationToken = undefined;
+				loadedPersistedToken = false;
+				continue;
+			}
 			if (!signal.aborted) handlePollingError("square", error, onFatal);
 			await sleepUntilRetry(1_000, signal);
 			continue;
@@ -1597,7 +1612,7 @@ async function runSession(
 			.catch(onFatal);
 	}
 	if (appConfig.enableSquare) {
-		void listenRawSquareEvents(client, controller.signal, onFatal, sessionStartedAt)
+		void listenRawSquareEvents(client, storage, controller.signal, onFatal, sessionStartedAt)
 			.catch(onFatal);
 	}
 
