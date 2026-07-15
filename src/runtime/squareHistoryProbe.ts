@@ -5,6 +5,8 @@ interface FetchSquareChatEventsOptions {
 	limit: number;
 	direction: "FORWARD" | "BACKWARD";
 	fetchType: "DEFAULT";
+	syncToken?: string;
+	inclusive?: "ON" | "OFF";
 }
 
 interface SquareHistoryResponse {
@@ -76,6 +78,9 @@ const EVENT_TYPE_NAMES: Record<number, string> = {
 	62: "NOTIFIED_UPDATE_SQUARE_SUBSCRIPTION",
 };
 
+const FORWARD_PAGE_LIMIT = 100;
+const MAX_FORWARD_PAGES = 100;
+
 function rawObject(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value)
 		? value as Record<string, unknown>
@@ -99,10 +104,27 @@ function eventTypeLabel(value: unknown): string {
 }
 
 function eventCreatedAt(value: unknown): string {
-	const raw = typeof value === "bigint" || typeof value === "number" || typeof value === "string"
+	const raw = eventCreatedTime(value);
+	return Number.isFinite(raw) ? new Date(raw).toISOString() : "(none)";
+}
+
+function eventCreatedTime(value: unknown): number {
+	return typeof value === "bigint" || typeof value === "number" || typeof value === "string"
 		? Number(value)
 		: Number.NaN;
-	return Number.isFinite(raw) ? new Date(raw).toISOString() : "(none)";
+}
+
+function latestEvents(events: unknown[], limit: number): unknown[] {
+	return [...events]
+		.sort((left, right) => {
+			const leftTime = eventCreatedTime(rawObject(left)?.createdTime);
+			const rightTime = eventCreatedTime(rawObject(right)?.createdTime);
+			if (!Number.isFinite(leftTime) && !Number.isFinite(rightTime)) return 0;
+			if (!Number.isFinite(leftTime)) return -1;
+			if (!Number.isFinite(rightTime)) return 1;
+			return leftTime - rightTime;
+		})
+		.slice(-limit);
 }
 
 function payloadPreview(value: unknown): string {
@@ -135,6 +157,12 @@ export interface SquareHistoryProbeResult {
 	systemMessageCount: number;
 }
 
+interface FetchPageLog {
+	page: number;
+	eventCount: number;
+	syncTokenChanged: boolean;
+}
+
 export async function probeRecentSquareHistory(
 	client: Client,
 	squareChatMid: string,
@@ -142,14 +170,57 @@ export async function probeRecentSquareHistory(
 ): Promise<SquareHistoryProbeResult> {
 	const safeLimit = Math.min(Math.max(Math.trunc(limit), 1), 30);
 	const startedAt = Date.now();
-	const options: FetchSquareChatEventsOptions = {
-		squareChatMid,
-		limit: safeLimit,
-		direction: "FORWARD",
-		fetchType: "DEFAULT",
-	};
-	const response = await client.base.square.fetchSquareChatEvents(options as never) as SquareHistoryResponse;
-	const events = Array.isArray(response.events) ? response.events.slice(-safeLimit) : [];
+	let syncToken: string | undefined;
+	let reachedCurrent = false;
+	let totalForwardEvents = 0;
+	let forwardEvents: unknown[] = [];
+	const forwardPages: FetchPageLog[] = [];
+
+	for (let page = 1; page <= MAX_FORWARD_PAGES; page++) {
+		const previousSyncToken = syncToken;
+		const options: FetchSquareChatEventsOptions = {
+			squareChatMid,
+			limit: FORWARD_PAGE_LIMIT,
+			direction: "FORWARD",
+			fetchType: "DEFAULT",
+			...(syncToken ? { syncToken } : {}),
+		};
+		const response = await client.base.square.fetchSquareChatEvents(options as never) as SquareHistoryResponse;
+		const pageEvents = Array.isArray(response.events) ? response.events : [];
+		syncToken = response.syncToken || syncToken;
+		totalForwardEvents += pageEvents.length;
+		forwardEvents = latestEvents([...forwardEvents, ...pageEvents], safeLimit);
+		forwardPages.push({
+			page,
+			eventCount: pageEvents.length,
+			syncTokenChanged: Boolean(syncToken && syncToken !== previousSyncToken),
+		});
+		if (pageEvents.length === 0) {
+			reachedCurrent = true;
+			break;
+		}
+		if (!syncToken || syncToken === previousSyncToken) break;
+	}
+
+	let backwardResponse: SquareHistoryResponse | undefined;
+	let backwardError: string | undefined;
+	if (reachedCurrent && syncToken) {
+		const options: FetchSquareChatEventsOptions = {
+			squareChatMid,
+			syncToken,
+			limit: safeLimit,
+			direction: "BACKWARD",
+			inclusive: "ON",
+			fetchType: "DEFAULT",
+		};
+		try {
+			backwardResponse = await client.base.square.fetchSquareChatEvents(options as never) as SquareHistoryResponse;
+		} catch (error) {
+			backwardError = error instanceof Error ? error.message : String(error);
+		}
+	}
+	const backwardEvents = Array.isArray(backwardResponse?.events) ? backwardResponse.events : [];
+	const events = latestEvents(backwardEvents.length > 0 ? backwardEvents : forwardEvents, safeLimit);
 	const systemMessageCount = events.filter((event) => {
 		const raw = rawObject(event);
 		const payload = rawObject(raw?.payload);
@@ -159,10 +230,23 @@ export async function probeRecentSquareHistory(
 	console.log("[test-square-history]", serializableJson({
 		at: new Date().toISOString(),
 		durationMs: Date.now() - startedAt,
-		request: options,
+		squareChatMid,
+		forward: {
+			pageLimit: FORWARD_PAGE_LIMIT,
+			maxPages: MAX_FORWARD_PAGES,
+			pages: forwardPages,
+			totalEventCount: totalForwardEvents,
+			reachedCurrent,
+			finalSyncToken: syncToken,
+		},
+		backward: {
+			attempted: reachedCurrent && Boolean(syncToken),
+			error: backwardError,
+			eventCount: backwardEvents.length,
+			syncToken: backwardResponse?.syncToken,
+			continuationToken: backwardResponse?.continuationToken,
+		},
 		response: {
-			syncToken: response.syncToken,
-			continuationToken: response.continuationToken,
 			eventCount: events.length,
 			events,
 		},
@@ -171,11 +255,14 @@ export async function probeRecentSquareHistory(
 	const lines = [
 		"Square履歴取得テスト",
 		`対象トーク: ${squareChatMid}`,
+		`同期: ${forwardPages.length}ページ / ${totalForwardEvents}イベント`,
+		`現在地点到達: ${reachedCurrent ? "はい" : "いいえ（上限または同期停止）"}`,
 		`取得件数: ${events.length}/${safeLimit}`,
 		`システムメッセージ: ${systemMessageCount}件`,
 		`処理時間: ${Date.now() - startedAt}ms`,
 		"完全な生データ: サーバーログ [test-square-history]",
 	];
+	if (backwardError) lines.push(`BACKWARD取得エラー: ${backwardError}`);
 	if (events.length === 0) {
 		lines.push("", "イベントは返りませんでした。");
 	} else {
