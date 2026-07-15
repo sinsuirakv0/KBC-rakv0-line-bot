@@ -1415,6 +1415,10 @@ function isTimeoutError(error: unknown): boolean {
 	return /timeout|timed out|aborted due to timeout/i.test(detail);
 }
 
+function isTalkSyncGoneError(error: unknown): boolean {
+	return /status=410\b/i.test(compactError(error));
+}
+
 async function listenRawTalkEvents(
 	client: Client,
 	ownMid: string,
@@ -1452,6 +1456,14 @@ async function listenRawTalkEvents(
 					.catch((error) => handlePollingError("talk", error, onFatal));
 			}
 		} catch (error) {
+			if (!signal.aborted && isTalkSyncGoneError(error)) {
+				console.warn("[talk:event] sync cursor was rejected with HTTP 410; resetting revisions");
+				revision = 0;
+				globalRev = 0;
+				individualRev = 0;
+				await sleepUntilRetry(1_000, signal);
+				continue;
+			}
 			if (!signal.aborted && !isTimeoutError(error)) {
 				handlePollingError("talk", error, onFatal);
 			}
