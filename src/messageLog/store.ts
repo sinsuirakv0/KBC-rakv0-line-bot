@@ -992,11 +992,16 @@ class MessageLogStore {
 			try {
 				const content = await fs.readFile(localPathFor(relativePath), "utf8");
 				const filePath = remotePathFor(relativePath);
+				let sha = this.fileShas.get(filePath);
+				if (!sha) {
+					sha = await githubContentsClient.readSha(filePath).catch(() => undefined);
+					if (sha) this.fileShas.set(filePath, sha);
+				}
 				const nextSha = await githubContentsClient.write(
 					filePath,
 					content,
 					"Update LINE message log",
-					this.fileShas.get(filePath),
+					sha,
 				);
 				this.fileShas.set(filePath, nextSha);
 				this.pendingRemotePaths.delete(relativePath);

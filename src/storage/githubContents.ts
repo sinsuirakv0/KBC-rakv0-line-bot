@@ -15,6 +15,7 @@ export class GithubContentsClient {
 	private mutationQueue: Promise<void> = Promise.resolve();
 	private lastMutationFinishedAt = 0;
 	private queuedMutations = 0;
+	private readonly shaCache = new Map<string, string>();
 
 	get enabled(): boolean {
 		return Boolean(
@@ -36,6 +37,8 @@ export class GithubContentsClient {
 
 	async readSha(filePath: string): Promise<string | undefined> {
 		const file = await this.getFile(filePath);
+		if (file?.sha) this.shaCache.set(filePath, file.sha);
+		else this.shaCache.delete(filePath);
 		return file?.sha;
 	}
 
@@ -79,22 +82,30 @@ export class GithubContentsClient {
 		message: string,
 		sha?: string,
 	): Promise<string | undefined> {
-		let nextSha = sha;
+		let nextSha = this.shaCache.get(filePath) ?? sha;
 		let lastStatus = 0;
 		let lastDetail = "";
 		for (let attempt = 1; attempt <= 5; attempt++) {
 			const response = await this.put(filePath, content, message, nextSha);
 			if (response.ok) {
 				const result = await response.json() as { content?: { sha?: string } };
+				if (result.content?.sha) this.shaCache.set(filePath, result.content.sha);
 				return result.content?.sha;
 			}
 			lastStatus = response.status;
 			lastDetail = await response.text();
 			if (response.status !== 409 && response.status !== 422) break;
 			const latestSha = await this.readSha(filePath).catch(() => undefined);
-			if (!latestSha) break;
-			nextSha = latestSha;
-			console.warn(`[github] retrying ${filePath} with latest sha after HTTP ${response.status} (attempt ${attempt})`);
+			if (latestSha) {
+				nextSha = latestSha;
+				console.log(`[github] retrying ${filePath} with latest sha after HTTP ${response.status} (attempt ${attempt})`);
+			} else if (nextSha) {
+				nextSha = undefined;
+				this.shaCache.delete(filePath);
+				console.log(`[github] retrying ${filePath} as new file after HTTP ${response.status} (attempt ${attempt})`);
+			} else {
+				break;
+			}
 			await this.sleep(250 * attempt);
 		}
 		throw new Error(`GitHub write failed: HTTP ${lastStatus} ${lastDetail.slice(0, 1000)}`);
@@ -134,6 +145,7 @@ export class GithubContentsClient {
 			const detail = await response.text();
 			throw new Error(`GitHub delete failed: HTTP ${response.status} ${detail.slice(0, 300)}`);
 		}
+		this.shaCache.delete(filePath);
 	}
 
 	private async enqueueMutation<T>(label: string, operation: () => Promise<T>): Promise<T> {
