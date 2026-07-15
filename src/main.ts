@@ -38,7 +38,10 @@ import {
 	type OpenChatNoteStatusModerationEvent,
 	type OpenChatPostModerationEvent,
 } from "./moderation/ocModeration.js";
-import { handleOpenChatJoinSystemMessage } from "./moderation/ocJoinMessage.js";
+import {
+	handleOpenChatJoinEventMessage,
+	handleOpenChatJoinSystemMessage,
+} from "./moderation/ocJoinMessage.js";
 import { ocModerationSettingsStore } from "./moderation/ocModerationSettings.js";
 import { botStopTargetFromDestination, permissionStore } from "./permissions/store.js";
 import { memberNameHistoryStore } from "./nameHistory/store.js";
@@ -623,34 +626,48 @@ async function handleSquareMessage(
 			createdAt: rawMessage.createdTime === undefined ? undefined : Number(rawMessage.createdTime),
 		})
 	) return;
-	if (typeof message.text !== "string") {
+	const squareText = typeof message.text === "string" ? message.text : rawMessage?.text;
+	if (typeof squareText !== "string") {
+		if (!threadMid && ocModerationSettingsStore.joinMessage(target.destination.chatMid)) {
+			console.log("[oc-join-message] configured chat message skipped no text", {
+				squareMid: target.destination.scopeMid,
+				squareChatMid: target.destination.chatMid,
+				messageId: rawMessage?.id,
+				senderMid: target.destination.senderMid,
+				contentType: rawMessage?.contentType,
+				metadataKeys: Object.keys(rawMessage?.contentMetadata ?? {}).sort(),
+			});
+		}
 		if (threadMid) recordSquareHandlerDebug(`square message skipped no text id=${rawMessage?.id ?? "(none)"}`);
 		return;
 	}
-	if (shouldIgnoreStoppedText(message.text, target)) {
-		if (threadMid || message.text.startsWith(appConfig.commandPrefix)) {
+	if (shouldIgnoreStoppedText(squareText, target)) {
+		if (threadMid || squareText.startsWith(appConfig.commandPrefix)) {
 			recordSquareHandlerDebug(`square command skipped bot stopped id=${rawMessage?.id ?? "(none)"}`);
 		}
 		return;
 	}
-	if (!message.text.startsWith(appConfig.commandPrefix)) {
+	if (!squareText.startsWith(appConfig.commandPrefix)) {
 		if (!threadMid && await handleOpenChatJoinSystemMessage({
 			client,
 			squareMid: target.destination.scopeMid,
 			squareChatMid: target.destination.chatMid,
 			senderMid: target.destination.senderMid,
 			senderName: target.destination.senderName,
-			text: message.text,
+			messageId: rawMessage?.id,
+			text: squareText,
+			contentType: rawMessage?.contentType,
+			contentMetadata: rawMessage?.contentMetadata,
 			mentionMids: target.mentionMids,
 		})) return;
-		if (await handleOcSetupReply(message.text, target)) return;
-		if (await handleOpenChatModerationCaseReply(message.text, target)) return;
-		if (await handleLogTargetSelectionReply(message.text, target)) return;
-		await handleSearchPageReply(message.text, target);
+		if (await handleOcSetupReply(squareText, target)) return;
+		if (await handleOpenChatModerationCaseReply(squareText, target)) return;
+		if (await handleLogTargetSelectionReply(squareText, target)) return;
+		await handleSearchPageReply(squareText, target);
 		return;
 	}
-	if (threadMid) recordSquareHandlerDebug(`square command dispatch id=${rawMessage?.id ?? "(none)"} text=${shortDebugText(message.text)}`);
-	await dispatchText("square", message.text, target);
+	if (threadMid) recordSquareHandlerDebug(`square command dispatch id=${rawMessage?.id ?? "(none)"} text=${shortDebugText(squareText)}`);
+	await dispatchText("square", squareText, target);
 	void resolveSenderName(client, "square", message.from.id)
 		.then((name) => {
 			if (name) rankingStore.updateName("square", message.from.id, name);
@@ -1434,6 +1451,21 @@ async function listenRawSquareEvents(
 		for (const joinEvent of memberEvents.joins) {
 			void handleOpenChatMemberJoin(joinEvent)
 				.catch((error) => handlePollingError("square", error, onFatal));
+			if (
+				joinEvent.squareChatMid &&
+				!permissionStore.isBotStopped(botStopTargetFromDestination({
+					kind: "square",
+					chatMid: joinEvent.squareChatMid,
+					scopeMid: joinEvent.squareMid,
+					chatType: "SQUARE",
+					senderMid: joinEvent.memberMid,
+					senderName: joinEvent.displayName,
+					encrypted: false,
+				}))
+			) {
+				void handleOpenChatJoinEventMessage(joinEvent)
+					.catch((error) => handlePollingError("square", error, onFatal));
+			}
 		}
 		for (const leaveEvent of memberEvents.leaves) {
 			void handleOpenChatMemberLeave(leaveEvent)
