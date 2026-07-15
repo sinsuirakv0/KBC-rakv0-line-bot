@@ -1449,61 +1449,105 @@ async function listenRawTalkEvents(
 	}
 }
 
+async function handleRawSquareEvent(
+	client: Client,
+	event: RawSquareEvent,
+	onFatal: (error: unknown) => void,
+	sessionStartedAt: number,
+): Promise<void> {
+	const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
+	for (const joinEvent of memberEvents.joins) {
+		void handleOpenChatMemberJoin(joinEvent)
+			.catch((error) => handlePollingError("square", error, onFatal));
+		if (
+			joinEvent.squareChatMid &&
+			!permissionStore.isBotStopped(botStopTargetFromDestination({
+				kind: "square",
+				chatMid: joinEvent.squareChatMid,
+				scopeMid: joinEvent.squareMid,
+				chatType: "SQUARE",
+				senderMid: joinEvent.memberMid,
+				senderName: joinEvent.displayName,
+				encrypted: false,
+			}))
+		) {
+			void handleOpenChatJoinEventMessage(joinEvent, { ignoreBefore: sessionStartedAt })
+				.catch((error) => handlePollingError("square", error, onFatal));
+		}
+	}
+	for (const leaveEvent of memberEvents.leaves) {
+		void handleOpenChatMemberLeave(leaveEvent)
+			.catch((error) => handlePollingError("square", error, onFatal));
+	}
+	const postModerationEvent = postModerationEventFromSquareEvent(client, event);
+	if (postModerationEvent) {
+		void handleOpenChatPostModeration(postModerationEvent)
+			.catch((error) => handlePollingError("square", error, onFatal));
+	}
+	const noteStatusModerationEvent = noteStatusModerationEventFromSquareEvent(client, event);
+	if (noteStatusModerationEvent) {
+		void handleOpenChatNoteStatusModeration(noteStatusModerationEvent)
+			.catch((error) => handlePollingError("square", error, onFatal));
+	}
+	for (const eventMessage of squareMessagesFromEvent(event)) {
+		void handleSquareMessage(client, new SquareMessage({
+			client,
+			raw: eventMessage.raw as never,
+		}), eventMessage.threadMid, eventMessage.chatMid)
+			.catch((error) => handlePollingError("square", error, onFatal));
+	}
+}
+
 async function listenRawSquareEvents(
 	client: Client,
 	signal: AbortSignal,
 	onFatal: (error: unknown) => void,
 	sessionStartedAt: number,
 ): Promise<void> {
-	const polling = client.base.createPolling();
-	for await (const event of polling._listenSquareEvents({
-		signal,
-		pollingInterval: 1_000,
-		onError: (error) => handlePollingError("square", error, onFatal),
-	}) as AsyncIterable<RawSquareEvent>) {
-		if (signal.aborted) break;
-		recordSquareEventDebug(event);
-		const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
-		for (const joinEvent of memberEvents.joins) {
-			void handleOpenChatMemberJoin(joinEvent)
-				.catch((error) => handlePollingError("square", error, onFatal));
-			if (
-				joinEvent.squareChatMid &&
-				!permissionStore.isBotStopped(botStopTargetFromDestination({
-					kind: "square",
-					chatMid: joinEvent.squareChatMid,
-					scopeMid: joinEvent.squareMid,
-					chatType: "SQUARE",
-					senderMid: joinEvent.memberMid,
-					senderName: joinEvent.displayName,
-					encrypted: false,
-				}))
-			) {
-				void handleOpenChatJoinEventMessage(joinEvent, { ignoreBefore: sessionStartedAt })
-					.catch((error) => handlePollingError("square", error, onFatal));
+	let syncToken: string | undefined;
+	let continuationToken: string | undefined;
+	while (!signal.aborted) {
+		try {
+			const previousContinuationToken = continuationToken;
+			const response = await client.base.square.fetchMyEvents({
+				syncToken,
+				continuationToken,
+				limit: 100,
+			});
+			syncToken = response.syncToken || syncToken;
+			continuationToken = response.continuationToken || undefined;
+			const events = (response.events ?? []) as unknown as RawSquareEvent[];
+			let replayedCount = 0;
+			for (const event of events) {
+				recordSquareEventDebug(event);
+				const createdAt = rawNumber(event.createdTime);
+				if (createdAt === undefined || createdAt < sessionStartedAt) {
+					replayedCount++;
+					continue;
+				}
+				await handleRawSquareEvent(client, event, onFatal, sessionStartedAt);
 			}
+			if (replayedCount > 0) {
+				console.log("[square:event] skipped replayed events", {
+					count: replayedCount,
+					total: events.length,
+					continuation: Boolean(continuationToken),
+				});
+			}
+			if (
+				continuationToken &&
+				continuationToken === previousContinuationToken &&
+				events.length === 0
+			) {
+				console.warn("[square:event] continuation token made no progress; resetting continuation");
+				continuationToken = undefined;
+			}
+		} catch (error) {
+			if (!signal.aborted) handlePollingError("square", error, onFatal);
+			await sleepUntilRetry(1_000, signal);
+			continue;
 		}
-		for (const leaveEvent of memberEvents.leaves) {
-			void handleOpenChatMemberLeave(leaveEvent)
-				.catch((error) => handlePollingError("square", error, onFatal));
-		}
-		const postModerationEvent = postModerationEventFromSquareEvent(client, event);
-		if (postModerationEvent) {
-			void handleOpenChatPostModeration(postModerationEvent)
-				.catch((error) => handlePollingError("square", error, onFatal));
-		}
-		const noteStatusModerationEvent = noteStatusModerationEventFromSquareEvent(client, event);
-		if (noteStatusModerationEvent) {
-			void handleOpenChatNoteStatusModeration(noteStatusModerationEvent)
-				.catch((error) => handlePollingError("square", error, onFatal));
-		}
-		for (const eventMessage of squareMessagesFromEvent(event)) {
-			void handleSquareMessage(client, new SquareMessage({
-				client,
-				raw: eventMessage.raw as never,
-			}), eventMessage.threadMid, eventMessage.chatMid)
-				.catch((error) => handlePollingError("square", error, onFatal));
-		}
+		await sleepUntilRetry(continuationToken ? 25 : 1_000, signal);
 	}
 }
 
