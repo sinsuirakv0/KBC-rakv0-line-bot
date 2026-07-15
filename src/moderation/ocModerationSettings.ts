@@ -227,6 +227,10 @@ class OcModerationSettingsStore {
 		return setting ? { ...setting } : undefined;
 	}
 
+	joinMessageSettings(): OcJoinMessageSetting[] {
+		return this.data.joinMessages.map((setting) => ({ ...setting }));
+	}
+
 	setJoinMessage(
 		squareMid: string,
 		squareChatMid: string,

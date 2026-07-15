@@ -42,6 +42,7 @@ import {
 	handleOpenChatJoinEventMessage,
 	handleOpenChatJoinSystemMessage,
 } from "./moderation/ocJoinMessage.js";
+import { listenOpenChatJoinMessageEvents } from "./moderation/ocJoinMessagePolling.js";
 import { ocModerationSettingsStore } from "./moderation/ocModerationSettings.js";
 import { botStopTargetFromDestination, permissionStore } from "./permissions/store.js";
 import { memberNameHistoryStore } from "./nameHistory/store.js";
@@ -1624,6 +1625,8 @@ async function runSession(
 	if (appConfig.enableSquare) {
 		void listenRawSquareEvents(client, storage, controller.signal, onFatal, sessionStartedAt)
 			.catch(onFatal);
+		void listenOpenChatJoinMessageEvents(client, storage, controller.signal, sessionStartedAt)
+			.catch((error) => console.error("[oc-join-message:chat-poll] stopped", error));
 	}
 
 	console.log("[app] bot is listening");

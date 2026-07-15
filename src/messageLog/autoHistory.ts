@@ -1,4 +1,4 @@
-import type { Client } from "@evex/linejs";
+﻿import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
 import { memberNameHistoryStore } from "../nameHistory/store.js";
 import {
@@ -74,6 +74,37 @@ async function fetchSquareChatEvents(
 	options: FetchSquareChatEventsOptions,
 ) {
 	return await client.base.square.fetchSquareChatEvents(options as never);
+}
+
+function compactError(error: unknown): string {
+	const detail = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+	try {
+		return `${detail} ${JSON.stringify(error)}`;
+	} catch {
+		return detail;
+	}
+}
+
+function isRejectedCursorError(error: unknown): boolean {
+	return /ILLEGAL_ARGUMENT|INVALID_ARGUMENT/i.test(compactError(error));
+}
+
+async function clearRejectedCursor(
+	chat: MessageLogChatSummary,
+	lastMode: MessageLogAutoHistoryState["lastMode"],
+): Promise<void> {
+	messageLogStore.updateAutoHistoryState(chat, {
+		...(chat.autoHistory ?? {}),
+		syncToken: undefined,
+		continuationToken: undefined,
+		lastMode,
+	});
+	await messageLogStore.checkpointLocal().catch((error) => {
+		console.warn("[message-log:auto-history] failed to save cursor reset", {
+			chatMid: chat.chatMid,
+			error: compactError(error),
+		});
+	});
 }
 
 function contentTypeLabel(contentType: string | number | undefined, hasContent: boolean | undefined): string {
@@ -307,13 +338,29 @@ function autoHistorySortTime(chat: MessageLogChatSummary): number {
 async function primeRecent(client: Client, chat: MessageLogChatSummary, pages: number): Promise<string | undefined> {
 	let syncToken = chat.autoHistory?.syncToken;
 	for (let page = 0; page < pages; page++) {
-		const response = await fetchSquareChatEvents(client, {
+		const options: FetchSquareChatEventsOptions = {
 			squareChatMid: chat.chatMid,
 			syncToken,
 			limit: 100,
 			direction: "FORWARD",
 			fetchType: "DEFAULT",
-		});
+		};
+		let response: Awaited<ReturnType<typeof fetchSquareChatEvents>>;
+		try {
+			response = await fetchSquareChatEvents(client, options);
+		} catch (error) {
+			if (!syncToken || !isRejectedCursorError(error)) throw error;
+			console.warn("[message-log:auto-history] saved sync token rejected; retrying without token", {
+				chatMid: chat.chatMid,
+				error: compactError(error),
+			});
+			await clearRejectedCursor(chat, "recent");
+			syncToken = undefined;
+			response = await fetchSquareChatEvents(client, {
+				...options,
+				syncToken: undefined,
+			});
+		}
 		syncToken = response.syncToken;
 		recordEvents(chat, response.events as SquareHistoryEvent[]);
 		if (response.events.length === 0) break;
@@ -327,6 +374,7 @@ async function catchUpRecent(client: Client, chat: MessageLogChatSummary): Promi
 	messageLogStore.updateAutoHistoryState(chat, {
 		...(chat.autoHistory ?? {}),
 		syncToken,
+		continuationToken: undefined,
 		lastMode: "recent",
 	});
 	await messageLogStore.checkpointLocal();
@@ -346,7 +394,7 @@ async function incrementalBackfill(client: Client, chat: MessageLogChatSummary):
 
 	let finishedAt = state.finishedAt;
 	for (let page = 0; page < appConfig.messageLogAutoHistoryBackfillPages; page++) {
-		const response = await fetchSquareChatEvents(client, {
+		const options: FetchSquareChatEventsOptions = {
 			squareChatMid: chat.chatMid,
 			syncToken,
 			direction: "BACKWARD",
@@ -354,7 +402,21 @@ async function incrementalBackfill(client: Client, chat: MessageLogChatSummary):
 			fetchType: "DEFAULT",
 			limit: 100,
 			...(continuationToken ? { continuationToken } : {}),
-		});
+		};
+		let response: Awaited<ReturnType<typeof fetchSquareChatEvents>>;
+		try {
+			response = await fetchSquareChatEvents(client, options);
+		} catch (error) {
+			if (!isRejectedCursorError(error)) throw error;
+			console.warn("[message-log:auto-history] backfill cursor rejected; cursor will be rebuilt later", {
+				chatMid: chat.chatMid,
+				hasSyncToken: Boolean(syncToken),
+				hasContinuationToken: Boolean(continuationToken),
+				error: compactError(error),
+			});
+			await clearRejectedCursor(chat, "backfill");
+			return;
+		}
 		syncToken = response.syncToken;
 		continuationToken = response.continuationToken || undefined;
 		const stats = recordEvents(chat, response.events as SquareHistoryEvent[]);

@@ -16,6 +16,7 @@ interface EncryptedStorageFile {
 }
 
 const SQUARE_SYNC_TOKEN_STORAGE_KEY = "kbc.squareSyncToken";
+const SQUARE_CHAT_SYNC_TOKENS_STORAGE_KEY = "kbc.squareChatSyncTokens";
 const SQUARE_SYNC_TOKEN_SAVE_DELAY_MS = 5_000;
 
 function encryptionKey(): Buffer | null {
@@ -147,6 +148,10 @@ export class SyncedLineStorage extends FileStorage {
 	private persistedSquareSyncToken: string | undefined;
 	private squareSyncTokenTimer: NodeJS.Timeout | undefined;
 	private squareSyncTokenQueue: Promise<void> = Promise.resolve();
+	private squareChatSyncTokens: Record<string, string> | undefined;
+	private pendingSquareChatSyncTokens = new Map<string, string | null>();
+	private squareChatSyncTokenTimer: NodeJS.Timeout | undefined;
+	private squareChatSyncTokenQueue: Promise<void> = Promise.resolve();
 
 	override async set(key: Storage["Key"], value: Storage["Value"]): Promise<void> {
 		await super.set(key, value);
@@ -163,10 +168,17 @@ export class SyncedLineStorage extends FileStorage {
 			clearTimeout(this.squareSyncTokenTimer);
 			this.squareSyncTokenTimer = undefined;
 		}
+		if (this.squareChatSyncTokenTimer) {
+			clearTimeout(this.squareChatSyncTokenTimer);
+			this.squareChatSyncTokenTimer = undefined;
+		}
 		this.pendingSquareSyncToken = undefined;
+		this.pendingSquareChatSyncTokens.clear();
 		await this.squareSyncTokenQueue;
+		await this.squareChatSyncTokenQueue;
 		await super.clear();
 		this.persistedSquareSyncToken = undefined;
+		this.squareChatSyncTokens = undefined;
 		backup.schedule();
 	}
 
@@ -200,12 +212,40 @@ export class SyncedLineStorage extends FileStorage {
 		this.persistedSquareSyncToken = undefined;
 	}
 
+	async getSquareChatSyncToken(squareChatMid: string): Promise<string | undefined> {
+		await this.loadSquareChatSyncTokens();
+		return this.squareChatSyncTokens?.[squareChatMid];
+	}
+
+	scheduleSquareChatSyncToken(squareChatMid: string, token: string): void {
+		if (!squareChatMid || !token || this.squareChatSyncTokens?.[squareChatMid] === token) return;
+		this.pendingSquareChatSyncTokens.set(squareChatMid, token);
+		if (this.squareChatSyncTokenTimer) return;
+		this.squareChatSyncTokenTimer = setTimeout(() => {
+			this.squareChatSyncTokenTimer = undefined;
+			void this.flushSquareChatSyncTokens().catch((error) => {
+				console.error("[line-storage] square chat sync token save failed", error);
+			});
+		}, SQUARE_SYNC_TOKEN_SAVE_DELAY_MS);
+	}
+
+	async clearSquareChatSyncToken(squareChatMid: string): Promise<void> {
+		await this.loadSquareChatSyncTokens();
+		this.pendingSquareChatSyncTokens.set(squareChatMid, null);
+		await this.flushSquareChatSyncTokens();
+	}
+
 	async flushBackup(): Promise<void> {
 		if (this.squareSyncTokenTimer) {
 			clearTimeout(this.squareSyncTokenTimer);
 			this.squareSyncTokenTimer = undefined;
 		}
+		if (this.squareChatSyncTokenTimer) {
+			clearTimeout(this.squareChatSyncTokenTimer);
+			this.squareChatSyncTokenTimer = undefined;
+		}
 		await this.flushSquareSyncToken();
+		await this.flushSquareChatSyncTokens();
 		await backup.flush();
 	}
 
@@ -223,6 +263,48 @@ export class SyncedLineStorage extends FileStorage {
 		this.squareSyncTokenQueue = operation.catch((error) => {
 			this.pendingSquareSyncToken = token;
 			console.error("[line-storage] square sync token write failed", error);
+		});
+		await operation;
+	}
+
+	private async loadSquareChatSyncTokens(): Promise<void> {
+		if (this.squareChatSyncTokens) return;
+		const value = await this.get(SQUARE_CHAT_SYNC_TOKENS_STORAGE_KEY);
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			this.squareChatSyncTokens = {};
+			return;
+		}
+		this.squareChatSyncTokens = Object.fromEntries(
+			Object.entries(value).flatMap(([chatMid, token]) => (
+				typeof token === "string" && token ? [[chatMid, token]] : []
+			)),
+		);
+	}
+
+	private async flushSquareChatSyncTokens(): Promise<void> {
+		if (this.pendingSquareChatSyncTokens.size === 0) {
+			await this.squareChatSyncTokenQueue;
+			return;
+		}
+		await this.loadSquareChatSyncTokens();
+		const updates = new Map(this.pendingSquareChatSyncTokens);
+		this.pendingSquareChatSyncTokens.clear();
+		const operation = this.squareChatSyncTokenQueue.then(async () => {
+			const next = { ...(this.squareChatSyncTokens ?? {}) };
+			for (const [chatMid, token] of updates) {
+				if (token) next[chatMid] = token;
+				else delete next[chatMid];
+			}
+			await this.set(SQUARE_CHAT_SYNC_TOKENS_STORAGE_KEY, next);
+			this.squareChatSyncTokens = next;
+		});
+		this.squareChatSyncTokenQueue = operation.catch((error) => {
+			for (const [chatMid, token] of updates) {
+				if (!this.pendingSquareChatSyncTokens.has(chatMid)) {
+					this.pendingSquareChatSyncTokens.set(chatMid, token);
+				}
+			}
+			console.error("[line-storage] square chat sync token write failed", error);
 		});
 		await operation;
 	}
