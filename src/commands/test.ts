@@ -2,6 +2,7 @@
 import { sendLong } from "./shared.js";
 import { notifyScheduleUpdate } from "../notifications/eventUpdates.js";
 import { formatSquareEventDebugLog } from "../runtime/squareEventDebug.js";
+import { probeRecentSquareHistory } from "../runtime/squareHistoryProbe.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
 
 const EVENT_REPO_TREE_API =
@@ -63,6 +64,8 @@ export const testCommand: LineCommand = {
 				"  実行メッセージのスレッドへ送信できるか検証します。",
 				"!test thread-log [件数]",
 				"  直近のSquareイベント要約を表示します。",
+				"!test oc-history",
+				"  現在のOCトークから過去10件のイベントとシステムメッセージを取得します。",
 			].join("\n"));
 			return;
 		}
@@ -88,8 +91,28 @@ export const testCommand: LineCommand = {
 			return;
 		}
 
+		if (action === "oc-history" || action === "square-history" || action === "oc-log") {
+			if (message.destination.kind !== "square") {
+				await message.reply("この検証コマンドはOpenChat内でのみ使用できます。");
+				return;
+			}
+			try {
+				const result = await probeRecentSquareHistory(
+					message.client,
+					message.destination.chatMid,
+					10,
+				);
+				await sendLong(message, result.text);
+			} catch (error) {
+				const reason = error instanceof Error ? error.message : String(error);
+				console.error("[test-square-history] failed", error);
+				await message.reply(`Square履歴取得テストに失敗しました: ${reason}`);
+			}
+			return;
+		}
+
 		if (action !== "event-update") {
-			await message.reply("使い方: !test event-update / !test thread / !test thread-log");
+			await message.reply("使い方: !test event-update / !test thread / !test thread-log / !test oc-history");
 			return;
 		}
 		if (!pushSubscriptionStore.has(message.destination)) {

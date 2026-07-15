@@ -127,8 +127,25 @@ async function sendConfiguredJoinMessage(input: {
 	source: "system-message" | "join-event";
 }): Promise<boolean> {
 	const setting = ocModerationSettingsStore.joinMessage(input.squareChatMid);
+	if (input.source === "join-event") {
+		console.log("[oc-join-message] join event received", {
+			squareMid: input.squareMid,
+			squareChatMid: input.squareChatMid,
+			memberMid: input.memberMid,
+			displayName: input.displayName,
+			configured: Boolean(setting),
+		});
+	}
 	if (!setting) return false;
-	if (!reserveJoinResponse(input.squareChatMid, input.memberMid)) return true;
+	if (!reserveJoinResponse(input.squareChatMid, input.memberMid)) {
+		console.log("[oc-join-message] skipped duplicate", {
+			squareMid: input.squareMid,
+			squareChatMid: input.squareChatMid,
+			memberMid: input.memberMid,
+			source: input.source,
+		});
+		return true;
+	}
 
 	const displayName = await displayNameForJoin(input);
 	const prefix = `@${displayName}`;
