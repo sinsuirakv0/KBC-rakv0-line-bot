@@ -114,7 +114,7 @@ export function classifyEventId(id: number): EventIdClassification {
 			? `https://battlecats-db.com/stage/s${String(id).padStart(5, "0")}.html`
 			: null,
 		stageProxyUrl: external?.type && externalCode
-			? `https://kbc-rakv0.vercel.app/api/stage-proxy?type=${external.type}&num=${externalCode}`
+			? `https://kbc-rakv0.vercel.app/stage/${external.type}${externalCode}.html`
 			: null,
 	};
 }
