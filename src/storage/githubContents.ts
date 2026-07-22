@@ -6,9 +6,25 @@ interface GithubFileResponse {
 	sha?: string;
 }
 
+interface GithubTreeResponse {
+	tree?: Array<{
+		path?: string;
+		type?: string;
+		sha?: string;
+		size?: number;
+	}>;
+	truncated?: boolean;
+}
+
 export interface GithubTextFile {
 	content: string;
 	sha?: string;
+}
+
+export interface GithubTreeFile {
+	path: string;
+	sha?: string;
+	size: number;
 }
 
 export class GithubContentsClient {
@@ -26,11 +42,14 @@ export class GithubContentsClient {
 	async read(filePath: string): Promise<GithubTextFile | null> {
 		const file = await this.getFile(filePath);
 		if (!file) return null;
-		if (file.encoding !== "base64" || !file.content) {
-			throw new Error("GitHub file content is not available as base64");
+		if (file.encoding === "base64" && file.content) {
+			return {
+				content: Buffer.from(file.content.replace(/\s/g, ""), "base64").toString("utf8"),
+				sha: file.sha,
+			};
 		}
 		return {
-			content: Buffer.from(file.content.replace(/\s/g, ""), "base64").toString("utf8"),
+			content: await this.readRaw(filePath),
 			sha: file.sha,
 		};
 	}
@@ -40,6 +59,35 @@ export class GithubContentsClient {
 		if (file?.sha) this.shaCache.set(filePath, file.sha);
 		else this.shaCache.delete(filePath);
 		return file?.sha;
+	}
+
+	async listFiles(prefix: string): Promise<GithubTreeFile[]> {
+		if (!this.enabled) return [];
+		const branch = encodeURIComponent(appConfig.pushSubscriptionsGithubBranch);
+		const response = await fetch(
+			`https://api.github.com/repos/${appConfig.pushSubscriptionsGithubRepo}/git/trees/${branch}?recursive=1`,
+			{
+				headers: this.headers(),
+				signal: AbortSignal.timeout(appConfig.githubContentsTimeoutMs),
+			},
+		);
+		if (!response.ok) throw new Error(`GitHub tree read failed: HTTP ${response.status}`);
+		const result = await response.json() as GithubTreeResponse;
+		if (result.truncated) {
+			throw new Error("GitHub tree response was truncated; remote index reconciliation was skipped");
+		}
+		const normalizedPrefix = prefix.replace(/^\/+|\/+$/g, "");
+		const pathPrefix = normalizedPrefix ? `${normalizedPrefix}/` : "";
+		return (result.tree ?? []).flatMap((entry) => {
+			if (entry.type !== "blob" || typeof entry.path !== "string" || !entry.path.startsWith(pathPrefix)) {
+				return [];
+			}
+			return [{
+				path: entry.path,
+				sha: entry.sha,
+				size: Number(entry.size) || 0,
+			}];
+		});
 	}
 
 	private async getFile(filePath: string): Promise<GithubFileResponse | null> {
@@ -53,6 +101,17 @@ export class GithubContentsClient {
 		if (!response.ok) throw new Error(`GitHub read failed: HTTP ${response.status}`);
 		const file = await response.json() as GithubFileResponse;
 		return file;
+	}
+
+	private async readRaw(filePath: string): Promise<string> {
+		const url = new URL(this.url(filePath));
+		url.searchParams.set("ref", appConfig.pushSubscriptionsGithubBranch);
+		const response = await fetch(url, {
+			headers: { ...this.headers(), Accept: "application/vnd.github.raw+json" },
+			signal: AbortSignal.timeout(appConfig.githubContentsTimeoutMs),
+		});
+		if (!response.ok) throw new Error(`GitHub raw read failed: HTTP ${response.status}`);
+		return await response.text();
 	}
 
 	async write(

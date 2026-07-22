@@ -1,4 +1,4 @@
-import fs from "node:fs/promises";
+﻿import fs from "node:fs/promises";
 import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import type { LineDestination } from "../commands/shared.js";
@@ -57,6 +57,12 @@ export interface MessageLogFlushResult {
 	remoteEnabled: boolean;
 	remoteSkipped: boolean;
 	remotePending: number;
+}
+
+export interface MessageLogReconcileResult {
+	remoteFiles: number;
+	discoveredChats: number;
+	discoveredParts: number;
 }
 
 export interface MessageLogAutoHistoryState {
@@ -246,6 +252,56 @@ function remotePathFor(relativePath: string): string {
 	return `${remoteRoot()}/${relativePath}`;
 }
 
+interface ParsedRemotePartPath {
+	relativePath: string;
+	kind: "talk" | "square";
+	chatMid: string;
+	chatType: "USER" | "GROUP" | "ROOM" | "SQUARE";
+	date: string;
+	part: number;
+	bytes: number;
+}
+
+function decodeSafeSegment(value: string): string {
+	try {
+		return decodeURIComponent(value.replace(/_([0-9a-f]{2})/gi, "%$1"));
+	} catch {
+		return value;
+	}
+}
+
+function parseRemotePartPath(remotePath: string, root: string, bytes: number): ParsedRemotePartPath | undefined {
+	const prefix = `${root.replace(/^\/+|\/+$/g, "")}/`;
+	if (!remotePath.startsWith(prefix)) return undefined;
+	const relativePath = remotePath.slice(prefix.length);
+	const match = relativePath.match(
+		/^(square|user|group|room)\/([^/]+)\/\d{4}\/\d{2}\/(\d{4}-\d{2}-\d{2})\.(\d+)\.json$/i,
+	);
+	if (!match) return undefined;
+	const folder = match[1].toLowerCase();
+	const chatType = folder === "square" ? "SQUARE" : folder.toUpperCase() as "USER" | "GROUP" | "ROOM";
+	return {
+		relativePath,
+		kind: folder === "square" ? "square" : "talk",
+		chatMid: decodeSafeSegment(match[2]),
+		chatType,
+		date: match[3],
+		part: Number(match[4]) || 1,
+		bytes,
+	};
+}
+
+function recoveredPartTimeRange(date: string): { firstCreatedAt?: number; lastCreatedAt?: number } {
+	const match = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+	if (!match) return {};
+	const dayStart = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])) - JST_OFFSET_MS;
+	if (!Number.isFinite(dayStart)) return {};
+	return {
+		firstCreatedAt: dayStart,
+		lastCreatedAt: dayStart + 24 * 60 * 60 * 1000 - 1,
+	};
+}
+
 function encodeWrappedJson(value: unknown): string {
 	return `${JSON.stringify(value, null, 2)}\n`;
 }
@@ -397,6 +453,7 @@ class MessageLogStore {
 	private membersLoaded = new Set<string>();
 	private fileShas = new Map<string, string | undefined>();
 	private pendingRemotePaths = new Set<string>();
+	private recoveredRemotePaths = new Set<string>();
 	private dirtyMessages = new Map<string, Map<string, StoredMessageLog>>();
 	private dirtyMembers = new Set<string>();
 	private saveTimer: NodeJS.Timeout | undefined;
@@ -567,6 +624,77 @@ class MessageLogStore {
 			}));
 	}
 
+	async reconcileRemoteIndex(): Promise<MessageLogReconcileResult> {
+		if (!githubContentsClient.enabled) {
+			return { remoteFiles: 0, discoveredChats: 0, discoveredParts: 0 };
+		}
+		const root = remoteRoot();
+		const remoteFiles = await githubContentsClient.listFiles(root);
+		const remoteParts = remoteFiles.flatMap((file) => {
+			const parsed = parseRemotePartPath(file.path, root, file.size);
+			return parsed ? [parsed] : [];
+		});
+		const partsByKey = new Map<string, ParsedRemotePartPath[]>();
+		for (const part of remoteParts) {
+			const key = chatKey(part);
+			const parts = partsByKey.get(key) ?? [];
+			parts.push(part);
+			partsByKey.set(key, parts);
+		}
+
+		let discoveredChats = 0;
+		let discoveredParts = 0;
+		for (const [key, parts] of partsByKey) {
+			let manifestChat = this.manifestChatsByKey.get(key);
+			if (!manifestChat) {
+				const sample = [...parts].sort((left, right) => right.relativePath.localeCompare(left.relativePath))[0];
+				const raw = await this.readJson(sample.relativePath) as Partial<MessageLogPartFile> | undefined;
+				if (!raw || (raw.kind !== "talk" && raw.kind !== "square") ||
+					typeof raw.chatMid !== "string" || typeof raw.scopeMid !== "string" ||
+					!["USER", "GROUP", "ROOM", "SQUARE"].includes(String(raw.chatType))) {
+					console.warn("[message-log] skipped remote chat with unreadable sample", {
+						chatMid: sample.chatMid,
+						path: sample.relativePath,
+					});
+					continue;
+				}
+				const chat = this.ensureChat({
+					kind: raw.kind,
+					chatMid: raw.chatMid,
+					scopeMid: raw.scopeMid,
+					chatType: raw.chatType as StoredChat["chatType"],
+				});
+				manifestChat = this.getOrCreateManifestChat(chat);
+				discoveredChats += 1;
+			}
+
+			const knownPaths = new Set(manifestChat.parts.map((part) => part.path));
+			for (const part of parts) {
+				if (knownPaths.has(part.relativePath)) continue;
+				const timeRange = recoveredPartTimeRange(part.date);
+				manifestChat.parts.push({
+					path: part.relativePath,
+					date: part.date,
+					part: part.part,
+					count: 0,
+					firstCreatedAt: timeRange.firstCreatedAt,
+					lastCreatedAt: timeRange.lastCreatedAt,
+					bytes: part.bytes,
+				});
+				knownPaths.add(part.relativePath);
+				this.recoveredRemotePaths.add(part.relativePath);
+				discoveredParts += 1;
+			}
+			manifestChat.parts.sort((left, right) => left.path.localeCompare(right.path));
+		}
+
+		if (discoveredChats > 0 || discoveredParts > 0) {
+			this.dirty = true;
+			await this.flush();
+		}
+		return { remoteFiles: remoteFiles.length, discoveredChats, discoveredParts };
+	}
+
 	updateAutoHistoryState(
 		destination: Pick<LineDestination, "kind" | "chatMid" | "scopeMid" | "chatType">,
 		state: MessageLogAutoHistoryState,
@@ -677,7 +805,9 @@ class MessageLogStore {
 		}
 
 		const parts = [...(manifestChat?.parts ?? [])]
-			.sort((left, right) => (right.lastCreatedAt ?? 0) - (left.lastCreatedAt ?? 0));
+			.sort((left, right) =>
+				(right.lastCreatedAt ?? 0) - (left.lastCreatedAt ?? 0) || right.part - left.part
+			);
 		for (const part of parts) {
 			if (sinceCreatedAt !== undefined && part.lastCreatedAt !== undefined && part.lastCreatedAt < sinceCreatedAt) break;
 			const file = await this.readPartFile(part.path, manifestChat);
@@ -804,6 +934,7 @@ class MessageLogStore {
 		this.manifestChatsByKey.clear();
 		this.messagesByChat.clear();
 		this.membersLoaded.clear();
+		this.recoveredRemotePaths.clear();
 		for (const manifestChat of manifest.chats) {
 			const chat: StoredChat = {
 				kind: manifestChat.kind,
@@ -906,6 +1037,7 @@ class MessageLogStore {
 		if (!this.dirty && this.dirtyMessages.size === 0 && this.dirtyMembers.size === 0 && !this.importedLegacy) {
 			return 0;
 		}
+		const manifestDirty = this.dirty;
 		let written = 0;
 		const dirtyMessages = new Map(this.dirtyMessages);
 		const dirtyMembers = new Set(this.dirtyMembers);
@@ -965,7 +1097,7 @@ class MessageLogStore {
 			written += 1;
 		}
 
-		if (written > 0 || dirtyMembers.size > 0 || dirtyMessages.size > 0) {
+		if (manifestDirty || written > 0 || dirtyMembers.size > 0 || dirtyMessages.size > 0) {
 			await this.writeManifestLocal();
 			this.pendingRemotePaths.add("manifest.json");
 			written += 1;
@@ -990,7 +1122,9 @@ class MessageLogStore {
 		for (const relativePath of paths) {
 			if (relativePath === "manifest.json" && nonManifestFailed) continue;
 			try {
-				const content = await fs.readFile(localPathFor(relativePath), "utf8");
+				const content = relativePath === "manifest.json"
+					? encodeWrappedJson(this.remoteManifestSnapshot())
+					: await fs.readFile(localPathFor(relativePath), "utf8");
 				const filePath = remotePathFor(relativePath);
 				let sha = this.fileShas.get(filePath);
 				if (!sha) {
@@ -1023,7 +1157,7 @@ class MessageLogStore {
 		const base = manifestChat ?? this.manifest.chats.find((chat) => chat.parts.some((part) => part.path === relativePath));
 		if (!base) return undefined;
 		const file = raw as Partial<MessageLogPartFile>;
-		return {
+		const parsed: MessageLogPartFile = {
 			version: 2,
 			kind: base.kind,
 			chatMid: base.chatMid,
@@ -1036,6 +1170,18 @@ class MessageLogStore {
 				return parsed ? [parsed] : [];
 			}),
 		};
+		const meta = base.parts.find((part) => part.path === relativePath);
+		if (meta && parsed.messages.length > 0) {
+			const firstCreatedAt = parsed.messages.reduce((oldest, message) => Math.min(oldest, message.createdAt), Number.POSITIVE_INFINITY);
+			const lastCreatedAt = parsed.messages.reduce((latest, message) => Math.max(latest, message.createdAt), 0);
+			if (meta.count !== parsed.messages.length || meta.firstCreatedAt !== firstCreatedAt || meta.lastCreatedAt !== lastCreatedAt) {
+				meta.count = parsed.messages.length;
+				meta.firstCreatedAt = firstCreatedAt;
+				meta.lastCreatedAt = lastCreatedAt;
+				this.scheduleSave();
+			}
+		}
+		return parsed;
 	}
 
 	private async ensureMembersLoaded(chat: StoredChat): Promise<void> {
@@ -1090,18 +1236,26 @@ class MessageLogStore {
 		const key = chatKey(message);
 		const existing = this.chatsByKey.get(key);
 		if (existing) return existing;
+		const chat = this.ensureChat(message);
+		this.dirtyMembers.add(key);
+		return chat;
+	}
+
+	private ensureChat(identity: Pick<StoredChat, "kind" | "chatMid" | "scopeMid" | "chatType">): StoredChat {
+		const key = chatKey(identity);
+		const existing = this.chatsByKey.get(key);
+		if (existing) return existing;
 		const chat: StoredChat = {
-			kind: message.kind,
-			chatMid: message.chatMid,
-			scopeMid: message.scopeMid,
-			chatType: message.chatType,
+			kind: identity.kind,
+			chatMid: identity.chatMid,
+			scopeMid: identity.scopeMid,
+			chatType: identity.chatType,
 			messages: [],
 			members: [],
 		};
 		this.chatsByKey.set(key, chat);
 		this.messagesByChat.set(key, new Map());
 		this.getOrCreateManifestChat(chat);
-		this.dirtyMembers.add(key);
 		return chat;
 	}
 
@@ -1137,6 +1291,16 @@ class MessageLogStore {
 	private async writeManifestLocal(): Promise<void> {
 		this.manifest.generatedAt = new Date().toISOString();
 		await this.writeLocalJson("manifest.json", this.manifest);
+	}
+
+	private remoteManifestSnapshot(): MessageLogManifest {
+		return {
+			...this.manifest,
+			chats: this.manifest.chats.map((chat) => ({
+				...chat,
+				parts: chat.parts.filter((part) => !this.recoveredRemotePaths.has(part.path)),
+			})),
+		};
 	}
 
 	private async writeLocalJson(relativePath: string, value: unknown): Promise<void> {
