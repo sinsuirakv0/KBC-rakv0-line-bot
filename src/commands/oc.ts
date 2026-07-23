@@ -1,4 +1,4 @@
-import { LINEStruct } from "@evex/linejs/thrift";
+﻿import { LINEStruct } from "@evex/linejs/thrift";
 import {
 	ocIdentitySnapshotsStore,
 	type OcIdentityMatch,
@@ -50,8 +50,10 @@ function adminHelpText(): string {
 		"  副官部屋設定を解除",
 		"!oc modroom test",
 		"  副官部屋への送信をテスト",
-		"!oc joinmes [mention] <内容> / !oc joinmes del",
+		"!oc joinmes [mention] [id] <内容> / !oc joinmes del",
 		"  参加時に送信するメッセージを、このトーク単位で設定/解除",
+		"!oc leavemes [mention] [id] <内容> / !oc leavemes del",
+		"  退室時に送信するメッセージを、このトーク単位で設定/解除",
 		"!oc lineurl / !oc lineurl del",
 		"  line.meを含むURL削除のON/OFF",
 		"!oc media / !oc media del",
@@ -300,7 +302,7 @@ function setupStatusLines(squareMid: string): string[] {
 		`line.me URL削除: ${enabledText(settings.linkDeleteEnabled)}`,
 		`URL再犯の発言削除対象: ${lockedCount}人`,
 		`画像/動画連投削除: ${enabledText(settings.mediaBurstDeleteEnabled)}`,
-		`初参加・即抜け監視: ${enabledText(settings.leftSoonMonitoringEnabled)}`,
+		`即抜け監視: ${enabledText(settings.leftSoonMonitoringEnabled)}`,
 		`初参加・危険語処分: ${enabledText(settings.dangerWordAutoKickEnabled)}`,
 		`短時間一斉参加監視: ${enabledText(settings.joinCohortWatchEnabled)}`,
 		`副官部屋: ${settings.modRoomChatMid ? `設定済み (${shortId(settings.modRoomChatMid)})` : "未設定"}`,
@@ -888,7 +890,7 @@ function setupMenuText(squareMid: string): string {
 		"1. line.me URL削除",
 		"2. 画像/動画連投削除",
 		"3. このトークを副官部屋に設定",
-		"4. 初参加・即抜け監視",
+		"4. 即抜け監視",
 		"5. 初参加・危険語処分",
 		"6. 短時間一斉参加監視",
 		"7. 実装済み項目をまとめてON",
@@ -953,7 +955,7 @@ async function applySetupSelection(
 	};
 	const applyLeftSoon = (enabled: boolean): void => {
 		const result = ocModerationSettingsStore.setLeftSoonMonitoring(squareMid, enabled, actorMid);
-		lines.push(flagChangeText("初参加・即抜け監視", result, enabled));
+		lines.push(flagChangeText("即抜け監視", result, enabled));
 	};
 	const applyDangerWord = (enabled: boolean): void => {
 		const result = ocModerationSettingsStore.setDangerWordAutoKick(squareMid, enabled, actorMid);
@@ -1110,43 +1112,415 @@ function commandActionRemainder(command: Parameters<LineCommand["execute"]>[0]):
 	return command.body.match(pattern)?.[1]?.trim() ?? "";
 }
 
-function joinMessageUsageText(): string {
+type MemberMessageMode = "join" | "leave";
+
+interface MemberMessageLabels {
+	command: string;
+	title: string;
+	actionName: string;
+	personName: string;
+}
+
+const MEMBER_MESSAGE_LABELS: Record<MemberMessageMode, MemberMessageLabels> = {
+	join: {
+		command: "joinmes",
+		title: "参加メッセージ設定",
+		actionName: "参加メッセージ",
+		personName: "参加者",
+	},
+	leave: {
+		command: "leavemes",
+		title: "退室メッセージ設定",
+		actionName: "退室メッセージ",
+		personName: "退室者",
+	},
+};
+
+function memberMessageUsageText(mode: MemberMessageMode): string {
+	const labels = MEMBER_MESSAGE_LABELS[mode];
 	return [
-		"参加メッセージ設定",
+		labels.title,
 		"",
 		"設定:",
-		"!oc joinmes <内容>",
-		"!oc joinmes mention <内容>",
+		`!oc ${labels.command} <内容>`,
+		`!oc ${labels.command} mention <内容>`,
+		`!oc ${labels.command} id <内容>`,
 		"",
 		"解除:",
-		"!oc joinmes del",
+		`!oc ${labels.command} del`,
 		"",
-		"mention を付けると、参加者をメンションしてから内容を送信します。",
+		`mention を付けると、${labels.personName}をメンションしてから内容を送信します。`,
+		`id を付けると、${labels.personName}のOC内短縮IDを送信します。`,
+		`本文中の <name> は${labels.personName}名に置き換わります。`,
+		"副官部屋で実行した場合は、送信先を番号で選択します。",
 	].join("\n");
 }
 
-function parseJoinMessageInput(input: string): { kind: "status" | "clear" | "set"; mention: boolean; text: string } {
-	const trimmed = input.trim();
-	if (!trimmed) return { kind: "status", mention: false, text: "" };
-	const normalized = trimmed.normalize("NFKC").toLowerCase();
-	if (["del", "off", "disable", "clear", "解除"].includes(normalized)) {
-		return { kind: "clear", mention: false, text: "" };
-	}
-	const mentionMatch = trimmed.match(/^mention(?:\s+|$)([\s\S]*)$/i);
-	if (mentionMatch) {
-		return { kind: "set", mention: true, text: (mentionMatch[1] ?? "").trim() };
-	}
-	return { kind: "set", mention: false, text: trimmed };
+interface ParsedMemberMessageInput {
+	kind: "status" | "clear" | "set";
+	mention: boolean;
+	showId: boolean;
+	text: string;
 }
 
-async function executeJoinMessage(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+function parseMemberMessageInput(input: string): ParsedMemberMessageInput {
+	const trimmed = input.trim();
+	if (!trimmed) return { kind: "status", mention: false, showId: false, text: "" };
+
+	let rest = trimmed;
+	let mention = false;
+	let showId = false;
+	let clear = false;
+	while (rest) {
+		const match = rest.match(/^(\S+)(?:\s+|$)([\s\S]*)$/);
+		if (!match) break;
+		const token = match[1].normalize("NFKC").toLowerCase();
+		if (token === "mention") {
+			mention = true;
+			rest = (match[2] ?? "").trimStart();
+			continue;
+		}
+		if (token === "id") {
+			showId = true;
+			rest = (match[2] ?? "").trimStart();
+			continue;
+		}
+		if (["del", "off", "disable", "clear", "解除"].includes(token)) {
+			clear = true;
+			rest = (match[2] ?? "").trimStart();
+			continue;
+		}
+		break;
+	}
+
+	if (clear) return { kind: "clear", mention: false, showId, text: "" };
+	const text = rest.trim();
+	if (!text) return { kind: showId ? "status" : "set", mention, showId, text: "" };
+	return { kind: "set", mention, showId, text };
+}
+
+interface MemberMessageTargetOption {
+	squareMid: string;
+	squareChatMid: string;
+	name: string;
+	type?: SquareRole;
+	configured: boolean;
+}
+
+interface MemberMessageTargetSelectionSession {
+	mode: MemberMessageMode;
+	squareMid: string;
+	promptChatMid: string;
+	createdBy: string;
+	expiresAt: number;
+	parsed: ParsedMemberMessageInput;
+	options: MemberMessageTargetOption[];
+}
+
+const MEMBER_MESSAGE_SELECTION_TTL_MS = 10 * 60_000;
+const memberMessageTargetSessions = new Map<string, MemberMessageTargetSelectionSession>();
+
+function isMainSquareChatType(type: SquareRole): boolean {
+	return type === 4 || type === "SQUARE_DEFAULT";
+}
+
+function memberMessageSetting(mode: MemberMessageMode, squareChatMid: string) {
+	return mode === "join"
+		? ocModerationSettingsStore.joinMessage(squareChatMid)
+		: ocModerationSettingsStore.leaveMessage(squareChatMid);
+}
+
+function memberMessageSettings(mode: MemberMessageMode) {
+	return mode === "join"
+		? ocModerationSettingsStore.joinMessageSettings()
+		: ocModerationSettingsStore.leaveMessageSettings();
+}
+
+function setMemberMessageSetting(
+	mode: MemberMessageMode,
+	squareMid: string,
+	squareChatMid: string,
+	text: string,
+	mention: boolean,
+	showId: boolean,
+	updatedBy: string,
+): "set" | "unchanged" {
+	return mode === "join"
+		? ocModerationSettingsStore.setJoinMessage(squareMid, squareChatMid, text, mention, showId, updatedBy)
+		: ocModerationSettingsStore.setLeaveMessage(squareMid, squareChatMid, text, mention, showId, updatedBy);
+}
+
+function clearMemberMessageSetting(mode: MemberMessageMode, squareChatMid: string): "cleared" | "unchanged" {
+	return mode === "join"
+		? ocModerationSettingsStore.clearJoinMessage(squareChatMid)
+		: ocModerationSettingsStore.clearLeaveMessage(squareChatMid);
+}
+
+function memberTargetKindText(option: Pick<MemberMessageTargetOption, "type">): string {
+	return isMainSquareChatType(option.type) ? "本OC" : "サブOC";
+}
+
+function squareChatName(value: unknown): string | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const chat = value as { name?: unknown };
+	const name = typeof chat.name === "string" ? chat.name.trim() : "";
+	return name || undefined;
+}
+
+function squareChatMid(value: unknown): string | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const chat = value as { squareChatMid?: unknown };
+	const mid = typeof chat.squareChatMid === "string" ? chat.squareChatMid.trim() : "";
+	return mid || undefined;
+}
+
+function squareChatSquareMid(value: unknown): string | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const chat = value as { squareMid?: unknown };
+	const mid = typeof chat.squareMid === "string" ? chat.squareMid.trim() : "";
+	return mid || undefined;
+}
+
+function squareChatType(value: unknown): SquareRole {
+	if (!value || typeof value !== "object") return undefined;
+	const chat = value as { type?: unknown };
+	return typeof chat.type === "string" || typeof chat.type === "number" ? chat.type : undefined;
+}
+
+function isJoinedChatMember(value: unknown): boolean {
+	if (!value || typeof value !== "object") return true;
+	const member = value as { membershipState?: unknown };
+	const state = member.membershipState;
+	return state === undefined || state === 1 || state === "JOINED";
+}
+
+async function addSquareChatOption(
+	options: Map<string, MemberMessageTargetOption>,
+	chat: unknown,
+	squareMid: string,
+	mode: MemberMessageMode,
+): Promise<void> {
+	const chatMid = squareChatMid(chat);
+	const chatSquareMid = squareChatSquareMid(chat);
+	if (!chatMid || chatSquareMid !== squareMid) return;
+	const existing = options.get(chatMid);
+	const name = squareChatName(chat) ?? existing?.name ?? (isMainSquareChatType(squareChatType(chat)) ? "本OC" : "名前未取得のサブOC");
+	options.set(chatMid, {
+		squareMid,
+		squareChatMid: chatMid,
+		name,
+		type: squareChatType(chat) ?? existing?.type,
+		configured: Boolean(memberMessageSetting(mode, chatMid)),
+	});
+}
+
+async function addSquareChatByMid(
+	command: Parameters<LineCommand["execute"]>[0],
+	options: Map<string, MemberMessageTargetOption>,
+	squareMid: string,
+	squareChatMid: string | undefined,
+	mode: MemberMessageMode,
+): Promise<void> {
+	if (!squareChatMid || options.has(squareChatMid)) return;
+	try {
+		const response = await command.message.client.base.square.getSquareChat({ squareChatMid });
+		await addSquareChatOption(options, (response as { squareChat?: unknown }).squareChat, squareMid, mode);
+	} catch (error) {
+		console.warn("[oc] failed to resolve member message target chat", { squareChatMid, mode, error });
+	}
+}
+
+async function memberMessageTargetOptions(
+	command: Parameters<LineCommand["execute"]>[0],
+	mode: MemberMessageMode,
+): Promise<MemberMessageTargetOption[]> {
 	const { message } = command;
+	const squareMid = message.destination.scopeMid;
+	const options = new Map<string, MemberMessageTargetOption>();
+	try {
+		let continuationToken = "";
+		for (let page = 0; page < 10; page++) {
+			const response = await message.client.base.square.getJoinedSquareChats({
+				request: { continuationToken, limit: 100 },
+			});
+			const rawResponse = response as {
+				chats?: unknown[];
+				chatMembers?: Record<string, unknown>;
+				continuationToken?: string;
+			};
+			for (const chat of rawResponse.chats ?? []) {
+				const chatMid = squareChatMid(chat);
+				if (chatMid && !isJoinedChatMember(rawResponse.chatMembers?.[chatMid])) continue;
+				await addSquareChatOption(options, chat, squareMid, mode);
+			}
+			continuationToken = rawResponse.continuationToken || "";
+			if (!continuationToken) break;
+		}
+	} catch (error) {
+		console.warn("[oc] failed to fetch joined square chats", error);
+	}
+
+	await addSquareChatByMid(command, options, squareMid, message.destination.chatMid, mode);
+	const settings = ocModerationSettingsStore.snapshot(squareMid);
+	await addSquareChatByMid(command, options, squareMid, settings.modRoomChatMid, mode);
+	for (const setting of memberMessageSettings(mode).filter((item) => item.squareMid === squareMid)) {
+		await addSquareChatByMid(command, options, squareMid, setting.squareChatMid, mode);
+	}
+
+	const sorted = [...options.values()]
+		.sort((left, right) => {
+			const typeOrder = Number(!isMainSquareChatType(left.type)) - Number(!isMainSquareChatType(right.type));
+			if (typeOrder !== 0) return typeOrder;
+			return left.name.localeCompare(right.name, "ja") || left.squareChatMid.localeCompare(right.squareChatMid);
+		});
+	return sorted;
+}
+
+function memberTargetLine(option: MemberMessageTargetOption, index: number): string {
+	return [
+		`${index + 1}. ${memberTargetKindText(option)}: ${option.name}`,
+		option.configured ? "設定済み" : "",
+	].filter(Boolean).join(" / ");
+}
+
+function isModRoom(message: ReplyableLineMessage): boolean {
+	if (message.destination.kind !== "square") return false;
+	const settings = ocModerationSettingsStore.snapshot(message.destination.scopeMid);
+	return Boolean(settings.modRoomChatMid && settings.modRoomChatMid === message.destination.chatMid);
+}
+
+function cleanupMemberMessageTargetSessions(): void {
+	const now = Date.now();
+	for (const [messageId, session] of memberMessageTargetSessions) {
+		if (session.expiresAt <= now) memberMessageTargetSessions.delete(messageId);
+	}
+}
+
+function selectedMemberTarget(session: MemberMessageTargetSelectionSession, text: string): MemberMessageTargetOption | undefined {
+	const normalized = text.normalize("NFKC").trim().toLowerCase();
+	const number = Number(normalized.match(/^\d+/)?.[0] ?? Number.NaN);
+	if (Number.isInteger(number) && number >= 1 && number <= session.options.length) {
+		return session.options[number - 1];
+	}
+	return undefined;
+}
+
+async function applyMemberMessageSetting(
+	message: ReplyableLineMessage,
+	parsed: ParsedMemberMessageInput,
+	target: MemberMessageTargetOption,
+	mode: MemberMessageMode,
+): Promise<void> {
+	const labels = MEMBER_MESSAGE_LABELS[mode];
+	if (parsed.kind === "clear") {
+		const result = clearMemberMessageSetting(mode, target.squareChatMid);
+		await ocModerationSettingsStore.flush();
+		await message.send(result === "unchanged"
+			? `${target.name} の${labels.actionName}は未設定です。`
+			: `${target.name} の${labels.actionName}を解除しました。`);
+		return;
+	}
+
+	if (!parsed.text) {
+		await message.send(`${memberMessageUsageText(mode)}\n\n内容が空です。`);
+		return;
+	}
+
+	const result = setMemberMessageSetting(
+		mode,
+		target.squareMid,
+		target.squareChatMid,
+		parsed.text,
+		parsed.mention,
+		parsed.showId,
+		message.destination.senderMid,
+	);
+	await ocModerationSettingsStore.flush();
+	await message.send([
+		result === "unchanged"
+			? `${labels.actionName}はすでに同じ内容で設定されています。`
+			: `${labels.actionName}を設定しました。`,
+		`送信先: ${target.name}`,
+		`メンション: ${parsed.mention ? "ON" : "OFF"}`,
+		`短縮ID: ${parsed.showId ? "ON" : "OFF"}`,
+		parsed.text.includes("<name>") ? "名前差し込み: ON" : "名前差し込み: OFF",
+		"",
+		"内容:",
+		parsed.text,
+	].join("\n"));
+}
+
+async function sendMemberMessageTargetSelection(
+	command: Parameters<LineCommand["execute"]>[0],
+	parsed: ParsedMemberMessageInput,
+	mode: MemberMessageMode,
+): Promise<void> {
+	const { message } = command;
+	const labels = MEMBER_MESSAGE_LABELS[mode];
+	const options = await memberMessageTargetOptions(command, mode);
+	if (options.length === 0) {
+		await message.send(`送信先候補を取得できませんでした。対象トーク本体で !oc ${labels.command} を実行してください。`);
+		return;
+	}
+	const lines = [
+		`${labels.actionName}の送信先を選択してください。`,
+		"このメッセージに番号でリプライすると設定します。",
+		"",
+		...options.map((option, index) => memberTargetLine(option, index)),
+	].filter(Boolean);
+	const sentId = await message.send(lines.join("\n"));
+	if (!sentId) {
+		await message.send("選択メッセージIDを取得できなかったため、対象トーク本体で直接設定してください。");
+		return;
+	}
+	cleanupMemberMessageTargetSessions();
+	memberMessageTargetSessions.set(sentId, {
+		mode,
+		squareMid: message.destination.scopeMid,
+		promptChatMid: message.destination.chatMid,
+		createdBy: message.destination.senderMid,
+		expiresAt: Date.now() + MEMBER_MESSAGE_SELECTION_TTL_MS,
+		parsed,
+		options,
+	});
+}
+
+async function sendMemberMessageStatus(
+	command: Parameters<LineCommand["execute"]>[0],
+	mode: MemberMessageMode,
+): Promise<void> {
+	const { message } = command;
+	const labels = MEMBER_MESSAGE_LABELS[mode];
+	const current = memberMessageSetting(mode, message.destination.chatMid);
+	const currentTarget = (await memberMessageTargetOptions(command, mode)).find((option) =>
+		option.squareChatMid === message.destination.chatMid
+	);
+	if (!current) {
+		await message.send(`${memberMessageUsageText(mode)}\n\n現在: 未設定`);
+		return;
+	}
+	await message.send([
+		labels.title,
+		"現在: 設定済み",
+		currentTarget ? `送信先: ${currentTarget.name}` : "",
+		`メンション: ${current.mention ? "ON" : "OFF"}`,
+		`短縮ID: ${current.showId ? "ON" : "OFF"}`,
+		current.text.includes("<name>") ? "名前差し込み: ON" : "名前差し込み: OFF",
+		"",
+		"内容:",
+		current.text,
+	].filter(Boolean).join("\n"));
+}
+
+async function executeMemberMessage(command: Parameters<LineCommand["execute"]>[0], mode: MemberMessageMode): Promise<void> {
+	const { message } = command;
+	const labels = MEMBER_MESSAGE_LABELS[mode];
 	if (message.destination.kind !== "square") {
 		await message.send("このコマンドはOpenChatで実行してください。");
 		return;
 	}
 	if (message.isThreadSource) {
-		await message.send("参加メッセージは、スレッドではなく対象トーク本体で設定してください。");
+		await message.send(`${labels.actionName}は、スレッドではなく対象トーク本体で設定してください。`);
 		return;
 	}
 	if (!await canRunOpenChatSetup(command)) {
@@ -1154,56 +1528,54 @@ async function executeJoinMessage(command: Parameters<LineCommand["execute"]>[0]
 		return;
 	}
 
-	const parsed = parseJoinMessageInput(commandActionRemainder(command));
+	const parsed = parseMemberMessageInput(commandActionRemainder(command));
 	if (parsed.kind === "status") {
-		const current = ocModerationSettingsStore.joinMessage(message.destination.chatMid);
-		if (!current) {
-			await message.send(`${joinMessageUsageText()}\n\n現在: 未設定`);
-			return;
-		}
-		await message.send([
-			"参加メッセージ設定",
-			"現在: 設定済み",
-			`メンション: ${current.mention ? "ON" : "OFF"}`,
-			"",
-			"内容:",
-			current.text,
-		].join("\n"));
+		await sendMemberMessageStatus(command, mode);
 		return;
 	}
 
-	if (parsed.kind === "clear") {
-		const result = ocModerationSettingsStore.clearJoinMessage(message.destination.chatMid);
-		await ocModerationSettingsStore.flush();
-		await message.send(result === "unchanged"
-			? "参加メッセージは未設定です。"
-			: "参加メッセージを解除しました。");
+	if (isModRoom(message)) {
+		await sendMemberMessageTargetSelection(command, parsed, mode);
 		return;
 	}
 
-	if (!parsed.text) {
-		await message.send(`${joinMessageUsageText()}\n\n内容が空です。`);
-		return;
-	}
-	const result = ocModerationSettingsStore.setJoinMessage(
-		message.destination.scopeMid,
-		message.destination.chatMid,
-		parsed.text,
-		parsed.mention,
-		message.destination.senderMid,
-	);
-	await ocModerationSettingsStore.flush();
-	await message.send([
-		result === "unchanged" ? "参加メッセージはすでに同じ内容で設定されています。" : "参加メッセージを設定しました。",
-		`メンション: ${parsed.mention ? "ON" : "OFF"}`,
-		"",
-		"内容:",
-		parsed.text,
-	].join("\n"));
+	const target: MemberMessageTargetOption = {
+		squareMid: message.destination.scopeMid,
+		squareChatMid: message.destination.chatMid,
+		name: (await memberMessageTargetOptions(command, mode)).find((option) => option.squareChatMid === message.destination.chatMid)
+			?.name ?? "このトーク",
+		type: undefined,
+		configured: Boolean(memberMessageSetting(mode, message.destination.chatMid)),
+	};
+	await applyMemberMessageSetting(message, parsed, target, mode);
 }
 
 export async function handleOcSetupReply(messageText: string, message: ReplyableLineMessage): Promise<boolean> {
 	if (message.destination.kind !== "square" || !message.replyToMessageId) return false;
+	const targetSession = memberMessageTargetSessions.get(message.replyToMessageId);
+	if (targetSession) {
+		const labels = MEMBER_MESSAGE_LABELS[targetSession.mode];
+		if (targetSession.expiresAt <= Date.now()) {
+			memberMessageTargetSessions.delete(message.replyToMessageId);
+			await message.send(`${labels.actionName}の送信先選択は期限切れです。もう一度 !oc ${labels.command} を実行してください。`);
+			return true;
+		}
+		if (targetSession.squareMid !== message.destination.scopeMid || targetSession.promptChatMid !== message.destination.chatMid) {
+			return false;
+		}
+		if (!await canRunOpenChatSetupMessage(message)) {
+			await message.send(setupPermissionDeniedText());
+			return true;
+		}
+		const target = selectedMemberTarget(targetSession, messageText);
+		if (!target) {
+			await message.send("番号で指定してください。");
+			return true;
+		}
+		memberMessageTargetSessions.delete(message.replyToMessageId);
+		await applyMemberMessageSetting(message, targetSession.parsed, target, targetSession.mode);
+		return true;
+	}
 	const session = ocModerationSettingsStore.findSetupSession(
 		message.replyToMessageId,
 		message.destination.scopeMid,
@@ -1247,6 +1619,52 @@ async function kickHistory(command: Parameters<LineCommand["execute"]>[0]): Prom
 	].join("\n\n"));
 }
 
+interface KickResultSummary {
+	targetMid: string;
+	targetName: string;
+	result: "success" | "failed";
+	error?: string;
+}
+
+async function sendKickSummaryToModRoom(
+	command: Parameters<LineCommand["execute"]>[0],
+	results: KickResultSummary[],
+	reason: string,
+): Promise<void> {
+	const { message } = command;
+	if (message.destination.kind !== "square" || results.length === 0) return;
+	const settings = ocModerationSettingsStore.snapshot(message.destination.scopeMid);
+	if (!settings.modRoomChatMid || settings.modRoomChatMid === message.destination.chatMid) return;
+
+	const actorName = message.destination.senderName || message.destination.senderMid;
+	const lines = [
+		"【手動処分】OC再参加禁止",
+		"",
+		`実行トーク: ${shortId(message.destination.chatMid)}`,
+		`実行者: ${actorName} (${message.destination.senderMid})`,
+		`理由: ${reason || "なし"}`,
+		"",
+		"対象:",
+		...results.map((result) =>
+			`- ${result.result === "success" ? "成功" : "失敗"}: ${result.targetName} (${result.targetMid})${
+				result.error ? ` / ${result.error}` : ""
+			}`
+		),
+	];
+	try {
+		await message.client.base.square.sendMessage({
+			squareChatMid: settings.modRoomChatMid,
+			text: lines.join("\n"),
+		});
+	} catch (error) {
+		console.warn("[oc] kick mod room log send failed", {
+			squareMid: message.destination.scopeMid,
+			modRoomChatMid: settings.modRoomChatMid,
+			error,
+		});
+	}
+}
+
 async function executeKick(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
 	const { message, args } = command;
 	const currentTarget = targetFromDestination(message.destination);
@@ -1273,6 +1691,7 @@ async function executeKick(command: Parameters<LineCommand["execute"]>[0]): Prom
 
 	const actorName = message.destination.senderName || message.destination.senderMid;
 	const lines = ["強制退会結果"];
+	const results: KickResultSummary[] = [];
 	for (const userMid of mids) {
 		let targetName = userMid;
 		try {
@@ -1295,6 +1714,7 @@ async function executeKick(command: Parameters<LineCommand["execute"]>[0]): Prom
 				reason: reason || undefined,
 				result: "success",
 			});
+			results.push({ targetMid: userMid, targetName: kickedName, result: "success" });
 			lines.push(`成功: ${kickedName} (${userMid})`);
 		} catch (error) {
 			const summary = compactError(error);
@@ -1309,10 +1729,12 @@ async function executeKick(command: Parameters<LineCommand["execute"]>[0]): Prom
 				result: "failed",
 				error: summary,
 			});
+			results.push({ targetMid: userMid, targetName, result: "failed", error: summary });
 			lines.push(`失敗: ${targetName} (${userMid}) ${summary}`);
 		}
 	}
 	await ocKickHistoryStore.flush();
+	await sendKickSummaryToModRoom(command, results, reason);
 	if (reason) lines.push(`理由: ${reason}`);
 	await message.send(lines.join("\n"));
 }
@@ -1350,7 +1772,20 @@ export const ocCommand: LineCommand = {
 			return;
 		}
 		if (action === "joinmes" || action === "joinmsg" || action === "joinmessage") {
-			await executeJoinMessage(command);
+			await executeMemberMessage(command, "join");
+			return;
+		}
+		if (
+			action === "leavemes" ||
+			action === "leavemsg" ||
+			action === "leavemessage" ||
+			action === "leftmes" ||
+			action === "leftmsg" ||
+			action === "leftmessage" ||
+			action === "exitmes" ||
+			action === "exitmsg"
+		) {
+			await executeMemberMessage(command, "leave");
 			return;
 		}
 		if (action === "lineurl" || action === "link" || action === "linkurl" || action === "adlink") {

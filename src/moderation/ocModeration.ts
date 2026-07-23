@@ -1,4 +1,4 @@
-import type { Client } from "@evex/linejs";
+﻿import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
 import type { ReplyableLineMessage } from "../commands/shared.js";
 import { ocKickHistoryStore } from "./ocKickHistory.js";
@@ -95,10 +95,8 @@ const LINK_DELETE_NOTICE = [
 const MEDIA_BURST_WINDOW_MS = positiveNumber(appConfig.ocMediaBurstWindowMs, 30_000, 1_000);
 const MEDIA_BURST_LIMIT = positiveNumber(appConfig.ocMediaBurstLimit, 7, 1);
 const DANGER_WORD_WINDOW_MS = 2 * 60_000;
-const LEFT_SOON_NO_MESSAGE_AUTO_BAN_MS = 60_000;
-const LEFT_SOON_WITH_MESSAGE_AUTO_BAN_MS = 30_000;
-const LEFT_SOON_NO_MESSAGE_REVIEW_MS = 5 * 60_000;
-const LEFT_SOON_WITH_MESSAGE_REVIEW_MS = 2 * 60_000;
+const LEFT_SOON_AUTO_BAN_MS = 5 * 60_000;
+const LEFT_SOON_REVIEW_MS = 30 * 60_000;
 const COHORT_JOIN_WINDOW_MS = 2 * 60_000;
 const COHORT_MIN_MEMBERS = 3;
 const COHORT_WATCH_MS = 30 * 60_000;
@@ -1050,15 +1048,11 @@ async function maybeStartJoinCohortWatch(event: OpenChatMemberJoinEvent): Promis
 }
 
 function leftSoonMode(info: OcLeaveDecisionInfo): "auto" | "review" | "log" | "none" {
-	if (!info.isFirstJoin || info.stayMs === undefined) return "none";
-	if (info.remainingChatMids.length > 0) return "log";
-	if (info.messageCount === 0) {
-		if (info.stayMs <= LEFT_SOON_NO_MESSAGE_AUTO_BAN_MS) return "auto";
-		if (info.stayMs <= LEFT_SOON_NO_MESSAGE_REVIEW_MS) return "review";
-		return "none";
-	}
-	if (info.stayMs <= LEFT_SOON_WITH_MESSAGE_AUTO_BAN_MS) return "auto";
-	if (info.stayMs <= LEFT_SOON_WITH_MESSAGE_REVIEW_MS) return "review";
+	if (info.stayMs === undefined) return "none";
+	if (info.remainingChatMids.length > 0) return info.stayMs <= LEFT_SOON_REVIEW_MS ? "log" : "none";
+	if (!info.isFirstJoin) return info.stayMs <= LEFT_SOON_REVIEW_MS ? "log" : "none";
+	if (info.stayMs <= LEFT_SOON_AUTO_BAN_MS) return "auto";
+	if (info.stayMs <= LEFT_SOON_REVIEW_MS) return "review";
 	return "none";
 }
 
@@ -1070,19 +1064,24 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 
 	const targetName = info.activity.displayName ?? event.displayName;
 	if (mode === "log") {
+		const hasRemainingChats = info.remainingChatMids.length > 0;
 		await sendModRoomLog(
 			event.client,
 			event.squareMid,
 			[
-				"【監視ログ】初参加・短時間退会",
+				hasRemainingChats
+					? "【監視ログ】参加後30分以内の退会（サブトーク残存）"
+					: "【監視ログ】再参加者の短時間退会",
 				"",
 				`対象: ${memberLine(targetName, event.memberMid)}`,
 				`滞在: ${formatDuration(info.stayMs)}`,
 				`発言数: ${info.messageCount}`,
-				"サブトーク残存: あり",
+				`サブトーク残存: ${hasRemainingChats ? "あり" : "なし"}`,
 				"処分: 未実行",
 				"",
-				"サブトークに残っているため、自動再参加禁止は行いませんでした。",
+				hasRemainingChats
+					? "サブトークに残っているため、OC全体からの退会とは扱わず、自動再参加禁止は行いませんでした。"
+					: "初参加ではないため、自動再参加禁止や確認待ち処分は行いませんでした。",
 			].join("\n"),
 			{
 				type: "left_soon_log",
@@ -1105,7 +1104,7 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 			event.client,
 			event.squareMid,
 			[
-				"【確認待ち】初参加・短時間退会",
+				"【確認待ち】参加後30分以内の退会",
 				"",
 				`対象: ${memberLine(targetName, event.memberMid)}`,
 				`滞在: ${formatDuration(info.stayMs)}`,
@@ -1136,13 +1135,13 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 		event.squareMid,
 		event.memberMid,
 		targetName,
-		"初参加・即抜け",
+		"即抜け: 参加後5分以内の退会",
 	);
 	await sendModRoomLog(
 		event.client,
 		event.squareMid,
 		[
-			"【自動処分】初参加・即抜け",
+			"【自動処分】参加後5分以内の退会",
 			"",
 			`対象: ${memberLine(targetName, event.memberMid)}`,
 			`滞在: ${formatDuration(info.stayMs)}`,
@@ -1152,7 +1151,7 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 			banResult.error ? `エラー: ${banResult.error}` : "",
 			"",
 			"理由:",
-			"初参加後、短時間で退会し、サブトークにも残っていなかったため、",
+			"参加後5分以内にOC全体から退会し、サブトークにも残っていなかったため、",
 			"即抜け荒らし対策として自動的に再参加禁止にしました。",
 			"",
 			"誤入室だった可能性がある場合は、このログに「解除」と返信してください。",

@@ -1,8 +1,8 @@
-import type { Client } from "@evex/linejs";
+﻿import type { Client } from "@evex/linejs";
 import type { SyncedLineStorage } from "../storage/lineStorage.js";
 import { permissionStore } from "../permissions/store.js";
-import { handleOpenChatJoinEventMessage } from "./ocJoinMessage.js";
-import { ocModerationSettingsStore, type OcJoinMessageSetting } from "./ocModerationSettings.js";
+import { handleOpenChatJoinEventMessage, handleOpenChatLeaveEventMessage } from "./ocJoinMessage.js";
+import { ocModerationSettingsStore, type OcMemberMessageSetting } from "./ocModerationSettings.js";
 
 interface RawSquareEvent {
 	createdTime?: number | bigint;
@@ -14,6 +14,12 @@ interface ChatPollingState {
 	syncToken?: string;
 	ignoreBefore: number;
 	retryAfter: number;
+}
+
+interface WatchedMemberMessageChat {
+	squareMid: string;
+	squareChatMid: string;
+	updatedAt: string;
 }
 
 const POLLING_INTERVAL_MS = 1_000;
@@ -37,6 +43,22 @@ function rawNumber(value: unknown): number | undefined {
 
 function isJoinEvent(event: RawSquareEvent): boolean {
 	return event.type === 2 || event.type === "NOTIFIED_JOIN_SQUARE_CHAT";
+}
+
+function isLeaveEvent(event: RawSquareEvent): boolean {
+	return event.type === 4 || event.type === "NOTIFIED_LEAVE_SQUARE_CHAT";
+}
+
+function isChatMemberUpdateEvent(event: RawSquareEvent): boolean {
+	return event.type === 14 || event.type === "NOTIFIED_UPDATE_SQUARE_CHAT_MEMBER";
+}
+
+function isJoinedState(value: unknown): boolean {
+	return value === 1 || value === "JOINED";
+}
+
+function isLeftState(value: unknown): boolean {
+	return value === 4 || value === "LEFT";
 }
 
 function compactError(error: unknown): string {
@@ -64,11 +86,12 @@ function wait(ms: number, signal: AbortSignal): Promise<void> {
 
 async function handleJoinEvent(
 	client: Client,
-	setting: OcJoinMessageSetting,
+	setting: WatchedMemberMessageChat,
 	event: RawSquareEvent,
 	ignoreBefore: number,
 ): Promise<void> {
 	if (!isJoinEvent(event)) return;
+	if (!ocModerationSettingsStore.joinMessage(setting.squareChatMid)) return;
 	const join = rawObject(event.payload?.notifiedJoinSquareChat);
 	const member = rawObject(join?.joinedMember);
 	const squareChatMid = rawString(join?.squareChatMid);
@@ -76,7 +99,7 @@ async function handleJoinEvent(
 	const squareMid = rawString(member?.squareMid) ?? setting.squareMid;
 	const joinedAt = rawNumber(event.createdTime);
 	if (squareChatMid !== setting.squareChatMid || !memberMid) {
-		console.warn("[oc-join-message:chat-poll] failed to parse join event", {
+		console.warn("[oc-member-message:chat-poll] failed to parse join event", {
 			configuredChatMid: setting.squareChatMid,
 			eventChatMid: squareChatMid,
 			memberMid,
@@ -95,10 +118,96 @@ async function handleJoinEvent(
 	}, { ignoreBefore });
 }
 
+async function handleLeaveEvent(
+	client: Client,
+	setting: WatchedMemberMessageChat,
+	event: RawSquareEvent,
+	ignoreBefore: number,
+): Promise<void> {
+	if (!isLeaveEvent(event)) return;
+	if (!ocModerationSettingsStore.leaveMessage(setting.squareChatMid)) return;
+	const leave = rawObject(event.payload?.notifiedLeaveSquareChat);
+	const member = rawObject(leave?.squareMember);
+	const squareChatMid = rawString(leave?.squareChatMid);
+	const memberMid = rawString(leave?.squareMemberMid) ?? rawString(member?.squareMemberMid);
+	const squareMid = rawString(member?.squareMid) ?? setting.squareMid;
+	const leftAt = rawNumber(event.createdTime);
+	if (squareChatMid !== setting.squareChatMid || !memberMid) {
+		console.warn("[oc-member-message:chat-poll] failed to parse leave event", {
+			configuredChatMid: setting.squareChatMid,
+			eventChatMid: squareChatMid,
+			memberMid,
+		});
+		return;
+	}
+	if (permissionStore.isBotStopped({ kind: "square", chatMid: squareChatMid, chatType: "SQUARE" })) return;
+	await handleOpenChatLeaveEventMessage({
+		client,
+		squareMid,
+		squareChatMid,
+		memberMid,
+		displayName: rawString(member?.displayName),
+		leftAt,
+		source: "chat-member",
+	}, { ignoreBefore });
+}
+
+async function handleChatMemberUpdateEvent(
+	client: Client,
+	setting: WatchedMemberMessageChat,
+	event: RawSquareEvent,
+	ignoreBefore: number,
+): Promise<void> {
+	if (!isChatMemberUpdateEvent(event)) return;
+	const update = rawObject(event.payload?.notifiedUpdateSquareChatMember);
+	const chatMember = rawObject(update?.squareChatMember);
+	const peer = rawObject(update?.peerSquareMember);
+	const squareChatMid = rawString(update?.squareChatMid) ?? rawString(chatMember?.squareChatMid);
+	const memberMid = rawString(chatMember?.squareMemberMid) ?? rawString(peer?.squareMemberMid);
+	const squareMid = rawString(peer?.squareMid) ?? setting.squareMid;
+	const membershipState = chatMember?.membershipState;
+	const eventAt = rawNumber(event.createdTime);
+	if (squareChatMid !== setting.squareChatMid || !memberMid) return;
+	if (permissionStore.isBotStopped({ kind: "square", chatMid: squareChatMid, chatType: "SQUARE" })) return;
+	if (isJoinedState(membershipState) && ocModerationSettingsStore.joinMessage(setting.squareChatMid)) {
+		await handleOpenChatJoinEventMessage({
+			client,
+			squareMid,
+			squareChatMid,
+			memberMid,
+			displayName: rawString(peer?.displayName),
+			joinedAt: eventAt,
+			source: "chat-member",
+		}, { ignoreBefore });
+	}
+	if (isLeftState(membershipState) && ocModerationSettingsStore.leaveMessage(setting.squareChatMid)) {
+		await handleOpenChatLeaveEventMessage({
+			client,
+			squareMid,
+			squareChatMid,
+			memberMid,
+			displayName: rawString(peer?.displayName),
+			leftAt: eventAt,
+			source: "chat-member",
+		}, { ignoreBefore });
+	}
+}
+
+async function handleMemberMessageEvent(
+	client: Client,
+	setting: WatchedMemberMessageChat,
+	event: RawSquareEvent,
+	ignoreBefore: number,
+): Promise<void> {
+	await handleJoinEvent(client, setting, event, ignoreBefore);
+	await handleLeaveEvent(client, setting, event, ignoreBefore);
+	await handleChatMemberUpdateEvent(client, setting, event, ignoreBefore);
+}
+
 async function pollChat(
 	client: Client,
 	storage: SyncedLineStorage,
-	setting: OcJoinMessageSetting,
+	setting: WatchedMemberMessageChat,
 	state: ChatPollingState,
 ): Promise<void> {
 	if (Date.now() < state.retryAfter) return;
@@ -115,7 +224,7 @@ async function pollChat(
 			state.syncToken = response.syncToken || state.syncToken;
 			const events = (response.events ?? []) as unknown as RawSquareEvent[];
 			for (const event of events) {
-				await handleJoinEvent(client, setting, event, state.ignoreBefore);
+				await handleMemberMessageEvent(client, setting, event, state.ignoreBefore);
 			}
 			if (events.length === 0 || !state.syncToken || state.syncToken === previousSyncToken) {
 				if (state.syncToken) storage.scheduleSquareChatSyncToken(setting.squareChatMid, state.syncToken);
@@ -124,13 +233,13 @@ async function pollChat(
 		} catch (error) {
 			const detail = compactError(error);
 			if (state.syncToken && /ILLEGAL_ARGUMENT|INVALID_ARGUMENT/i.test(detail)) {
-				console.warn("[oc-join-message:chat-poll] saved sync token rejected", {
+				console.warn("[oc-member-message:chat-poll] saved sync token rejected", {
 					squareChatMid: setting.squareChatMid,
 				});
 				state.syncToken = undefined;
 				await storage.clearSquareChatSyncToken(setting.squareChatMid).catch(() => {});
 			} else {
-				console.warn("[oc-join-message:chat-poll] failed", {
+				console.warn("[oc-member-message:chat-poll] failed", {
 					squareChatMid: setting.squareChatMid,
 					error: detail,
 				});
@@ -139,9 +248,30 @@ async function pollChat(
 			return;
 		}
 	}
-	console.warn("[oc-join-message:chat-poll] catch-up page limit reached", {
+	console.warn("[oc-member-message:chat-poll] catch-up page limit reached", {
 		squareChatMid: setting.squareChatMid,
 	});
+}
+
+function mergeMemberMessageSettings(): WatchedMemberMessageChat[] {
+	const byChatMid = new Map<string, WatchedMemberMessageChat>();
+	const settings: OcMemberMessageSetting[] = [
+		...ocModerationSettingsStore.joinMessageSettings(),
+		...ocModerationSettingsStore.leaveMessageSettings(),
+	];
+	for (const setting of settings) {
+		const current = byChatMid.get(setting.squareChatMid);
+		const currentAt = current ? Date.parse(current.updatedAt) : Number.NEGATIVE_INFINITY;
+		const nextAt = Date.parse(setting.updatedAt);
+		if (!current || (Number.isFinite(nextAt) && nextAt > currentAt)) {
+			byChatMid.set(setting.squareChatMid, {
+				squareMid: setting.squareMid,
+				squareChatMid: setting.squareChatMid,
+				updatedAt: setting.updatedAt,
+			});
+		}
+	}
+	return [...byChatMid.values()];
 }
 
 export async function listenOpenChatJoinMessageEvents(
@@ -152,7 +282,7 @@ export async function listenOpenChatJoinMessageEvents(
 ): Promise<void> {
 	const states = new Map<string, ChatPollingState>();
 	while (!signal.aborted) {
-		const settings = ocModerationSettingsStore.joinMessageSettings();
+		const settings = mergeMemberMessageSettings();
 		const activeChatMids = new Set(settings.map((setting) => setting.squareChatMid));
 		for (const [squareChatMid] of states) {
 			if (activeChatMids.has(squareChatMid)) continue;
@@ -169,7 +299,7 @@ export async function listenOpenChatJoinMessageEvents(
 					retryAfter: 0,
 				};
 				states.set(setting.squareChatMid, state);
-				console.log("[oc-join-message:chat-poll] watching", {
+				console.log("[oc-member-message:chat-poll] watching", {
 					squareChatMid: setting.squareChatMid,
 					persistedSyncToken: Boolean(state.syncToken),
 				});

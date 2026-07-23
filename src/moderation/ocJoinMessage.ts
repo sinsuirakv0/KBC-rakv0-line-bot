@@ -1,5 +1,6 @@
 ﻿import type { Client } from "@evex/linejs";
-import type { OpenChatMemberJoinEvent } from "./ocModeration.js";
+import { createHash } from "node:crypto";
+import type { OpenChatMemberJoinEvent, OpenChatMemberLeaveEvent } from "./ocModeration.js";
 import { ocModerationSettingsStore } from "./ocModerationSettings.js";
 
 export interface OpenChatJoinSystemMessage {
@@ -15,8 +16,10 @@ export interface OpenChatJoinSystemMessage {
 	mentionMids: string[];
 }
 
-const RECENT_JOIN_RESPONSE_MS = 90_000;
-const recentJoinResponses = new Map<string, number>();
+type MemberMessageMode = "join" | "leave";
+
+const RECENT_MEMBER_MESSAGE_RESPONSE_MS = 90_000;
+const recentMemberMessageResponses = new Map<string, number>();
 
 function cleanDisplayName(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();
@@ -45,16 +48,20 @@ function looksLikeJoinNotification(text: string | undefined): boolean {
 	return /(?:参加|入室|加入|joined)/i.test(text ?? "");
 }
 
-function reserveJoinResponse(squareChatMid: string, memberMid: string | undefined): boolean {
+function reserveMemberMessageResponse(
+	mode: MemberMessageMode,
+	squareChatMid: string,
+	memberMid: string | undefined,
+): boolean {
 	if (!memberMid) return true;
 	const now = Date.now();
-	for (const [key, at] of recentJoinResponses) {
-		if (now - at > RECENT_JOIN_RESPONSE_MS) recentJoinResponses.delete(key);
+	for (const [key, at] of recentMemberMessageResponses) {
+		if (now - at > RECENT_MEMBER_MESSAGE_RESPONSE_MS) recentMemberMessageResponses.delete(key);
 	}
-	const key = `${squareChatMid}:${memberMid}`;
-	const previous = recentJoinResponses.get(key);
-	if (previous !== undefined && now - previous <= RECENT_JOIN_RESPONSE_MS) return false;
-	recentJoinResponses.set(key, now);
+	const key = `${mode}:${squareChatMid}:${memberMid}`;
+	const previous = recentMemberMessageResponses.get(key);
+	if (previous !== undefined && now - previous <= RECENT_MEMBER_MESSAGE_RESPONSE_MS) return false;
+	recentMemberMessageResponses.set(key, now);
 	return true;
 }
 
@@ -64,6 +71,16 @@ function mentionMetadata(start: number, end: number, mid: string): Record<string
 			MENTIONEES: [{ S: String(start), E: String(end), M: mid }],
 		}),
 	};
+}
+
+function memberShortId(squareMid: string, memberMid: string | undefined): string | undefined {
+	if (!memberMid) return undefined;
+	return createHash("sha1")
+		.update(`${squareMid}:${memberMid}`)
+		.digest("base64url")
+		.replace(/[^0-9a-z]/gi, "")
+		.slice(0, 6)
+		.toLowerCase();
 }
 
 function joinedMemberMid(message: OpenChatJoinSystemMessage): string | undefined {
@@ -94,11 +111,12 @@ async function joinedMemberName(
 	return "参加者";
 }
 
-async function displayNameForJoin(input: {
+async function displayNameForMember(input: {
 	client: Client;
 	memberMid?: string;
 	detectedName?: string;
 	displayName?: string;
+	fallbackName: string;
 }): Promise<string> {
 	const detected = cleanDisplayName(input.detectedName);
 	if (detected) return detected;
@@ -113,10 +131,11 @@ async function displayNameForJoin(input: {
 			console.warn("[oc-join-message] member name lookup failed", error);
 		}
 	}
-	return "参加者";
+	return input.fallbackName;
 }
 
-async function sendConfiguredJoinMessage(input: {
+async function sendConfiguredMemberMessage(input: {
+	mode: MemberMessageMode;
 	client: Client;
 	squareMid: string;
 	squareChatMid: string;
@@ -124,11 +143,15 @@ async function sendConfiguredJoinMessage(input: {
 	displayName?: string;
 	detectedName?: string;
 	messageId?: string;
-	source: "system-message" | "join-event";
+	source: "system-message" | "join-event" | "leave-event";
+	fallbackName: string;
 }): Promise<boolean> {
-	const setting = ocModerationSettingsStore.joinMessage(input.squareChatMid);
-	if (input.source === "join-event") {
-		console.log("[oc-join-message] join event received", {
+	const setting = input.mode === "join"
+		? ocModerationSettingsStore.joinMessage(input.squareChatMid)
+		: ocModerationSettingsStore.leaveMessage(input.squareChatMid);
+	if (input.source === "join-event" || input.source === "leave-event") {
+		console.log("[oc-member-message] event received", {
+			mode: input.mode,
 			squareMid: input.squareMid,
 			squareChatMid: input.squareChatMid,
 			memberMid: input.memberMid,
@@ -137,8 +160,9 @@ async function sendConfiguredJoinMessage(input: {
 		});
 	}
 	if (!setting) return false;
-	if (!reserveJoinResponse(input.squareChatMid, input.memberMid)) {
-		console.log("[oc-join-message] skipped duplicate", {
+	if (!reserveMemberMessageResponse(input.mode, input.squareChatMid, input.memberMid)) {
+		console.log("[oc-member-message] skipped duplicate", {
+			mode: input.mode,
 			squareMid: input.squareMid,
 			squareChatMid: input.squareChatMid,
 			memberMid: input.memberMid,
@@ -147,9 +171,15 @@ async function sendConfiguredJoinMessage(input: {
 		return true;
 	}
 
-	const displayName = await displayNameForJoin(input);
+	const displayName = await displayNameForMember(input);
 	const prefix = `@${displayName}`;
-	const text = setting.mention && input.memberMid ? `${prefix}\n${setting.text}` : setting.text;
+	const body = setting.text.replaceAll("<name>", displayName);
+	const shortId = setting.showId ? memberShortId(input.squareMid, input.memberMid) : undefined;
+	const text = [
+		setting.mention && input.memberMid ? prefix : "",
+		shortId ? `ID: ${shortId}` : "",
+		body,
+	].filter(Boolean).join("\n");
 	const contentMetadata = setting.mention && input.memberMid
 		? mentionMetadata(0, prefix.length, input.memberMid)
 		: undefined;
@@ -160,7 +190,8 @@ async function sendConfiguredJoinMessage(input: {
 			text,
 			contentMetadata,
 		});
-		console.log("[oc-join-message] sent", {
+		console.log("[oc-member-message] sent", {
+			mode: input.mode,
 			squareMid: input.squareMid,
 			squareChatMid: input.squareChatMid,
 			messageId: input.messageId,
@@ -169,7 +200,7 @@ async function sendConfiguredJoinMessage(input: {
 			mentioned: Boolean(setting.mention && input.memberMid),
 		});
 	} catch (error) {
-		console.warn("[oc-join-message] send failed", error);
+		console.warn("[oc-member-message] send failed", error);
 	}
 	return true;
 }
@@ -196,7 +227,8 @@ export async function handleOpenChatJoinSystemMessage(message: OpenChatJoinSyste
 
 	const memberMid = joinedMemberMid(message);
 	const displayName = await joinedMemberName(message, memberMid, joinedName);
-	return await sendConfiguredJoinMessage({
+	return await sendConfiguredMemberMessage({
+		mode: "join",
 		client: message.client,
 		squareMid: message.squareMid,
 		squareChatMid: message.squareChatMid,
@@ -205,6 +237,7 @@ export async function handleOpenChatJoinSystemMessage(message: OpenChatJoinSyste
 		detectedName: joinedName,
 		messageId: message.messageId,
 		source: "system-message",
+		fallbackName: "参加者",
 	});
 }
 
@@ -227,12 +260,45 @@ export async function handleOpenChatJoinEventMessage(
 		});
 		return false;
 	}
-	return await sendConfiguredJoinMessage({
+	return await sendConfiguredMemberMessage({
+		mode: "join",
 		client: event.client,
 		squareMid: event.squareMid,
 		squareChatMid: event.squareChatMid,
 		memberMid: event.memberMid,
 		displayName: event.displayName,
 		source: "join-event",
+		fallbackName: "参加者",
+	});
+}
+
+export async function handleOpenChatLeaveEventMessage(
+	event: OpenChatMemberLeaveEvent,
+	options: { ignoreBefore?: number } = {},
+): Promise<boolean> {
+	if (!event.squareChatMid || event.source !== "chat-member") return false;
+	if (
+		options.ignoreBefore !== undefined &&
+		(event.leftAt === undefined || event.leftAt < options.ignoreBefore)
+	) {
+		console.log("[oc-member-message] skipped replayed leave event", {
+			squareMid: event.squareMid,
+			squareChatMid: event.squareChatMid,
+			memberMid: event.memberMid,
+			displayName: event.displayName,
+			leftAt: event.leftAt,
+			ignoreBefore: options.ignoreBefore,
+		});
+		return false;
+	}
+	return await sendConfiguredMemberMessage({
+		mode: "leave",
+		client: event.client,
+		squareMid: event.squareMid,
+		squareChatMid: event.squareChatMid,
+		memberMid: event.memberMid,
+		displayName: event.displayName,
+		source: "leave-event",
+		fallbackName: "退室者",
 	});
 }

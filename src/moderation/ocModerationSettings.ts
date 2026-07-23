@@ -1,4 +1,4 @@
-import fs from "node:fs/promises";
+﻿import fs from "node:fs/promises";
 import path from "node:path";
 import { appConfig } from "../config.js";
 import { githubContentsClient } from "../storage/githubContents.js";
@@ -37,23 +37,34 @@ export interface OcSetupSession {
 	expiresAt: string;
 }
 
-export interface OcJoinMessageSetting {
+export interface OcMemberMessageSetting {
 	squareMid: string;
 	squareChatMid: string;
 	text: string;
 	mention: boolean;
+	showId: boolean;
 	updatedAt: string;
 	updatedBy?: string;
 }
+
+export type OcJoinMessageSetting = OcMemberMessageSetting;
+export type OcLeaveMessageSetting = OcMemberMessageSetting;
 
 interface OcModerationSettingsFile {
 	version: 1;
 	settings: OcModerationSetting[];
 	setupSessions: OcSetupSession[];
 	joinMessages: OcJoinMessageSetting[];
+	leaveMessages: OcLeaveMessageSetting[];
 }
 
-const EMPTY_SETTINGS: OcModerationSettingsFile = { version: 1, settings: [], setupSessions: [], joinMessages: [] };
+const EMPTY_SETTINGS: OcModerationSettingsFile = {
+	version: 1,
+	settings: [],
+	setupSessions: [],
+	joinMessages: [],
+	leaveMessages: [],
+};
 const SAVE_DELAY_MS = 5_000;
 const SETUP_SESSION_TTL_MS = 30 * 60_000;
 
@@ -126,11 +137,11 @@ function parseSetupSessions(value: unknown): OcSetupSession[] {
 	return [...byMessageId.values()];
 }
 
-function parseJoinMessages(value: unknown): OcJoinMessageSetting[] {
+function parseMemberMessages(value: unknown): OcMemberMessageSetting[] {
 	if (!Array.isArray(value)) return [];
-	const byChatMid = new Map<string, OcJoinMessageSetting>();
+	const byChatMid = new Map<string, OcMemberMessageSetting>();
 	for (const setting of value) {
-		const item = setting as Partial<OcJoinMessageSetting>;
+		const item = setting as Partial<OcMemberMessageSetting>;
 		if (
 			typeof item.squareMid !== "string" ||
 			!item.squareMid ||
@@ -144,6 +155,7 @@ function parseJoinMessages(value: unknown): OcJoinMessageSetting[] {
 			squareChatMid: item.squareChatMid,
 			text: item.text,
 			mention: item.mention === true,
+			showId: item.showId === true,
 			updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : nowIso(),
 			updatedBy: typeof item.updatedBy === "string" ? item.updatedBy : undefined,
 		});
@@ -178,7 +190,8 @@ function parseSettings(value: unknown): OcModerationSettingsFile {
 		version: 1,
 		settings: [...bySquareMid.values()],
 		setupSessions: parseSetupSessions(raw.setupSessions),
-		joinMessages: parseJoinMessages(raw.joinMessages),
+		joinMessages: parseMemberMessages(raw.joinMessages),
+		leaveMessages: parseMemberMessages(raw.leaveMessages),
 	};
 }
 
@@ -236,40 +249,38 @@ class OcModerationSettingsStore {
 		squareChatMid: string,
 		text: string,
 		mention: boolean,
+		showId: boolean,
 		updatedBy: string,
 	): "set" | "unchanged" {
-		const normalizedText = text.trim();
-		const current = this.data.joinMessages.find((item) => item.squareChatMid === squareChatMid);
-		if (current) {
-			if (current.text === normalizedText && current.mention === mention && current.squareMid === squareMid) {
-				return "unchanged";
-			}
-			current.squareMid = squareMid;
-			current.text = normalizedText;
-			current.mention = mention;
-			current.updatedAt = nowIso();
-			current.updatedBy = updatedBy;
-			this.scheduleSave();
-			return "set";
-		}
-		this.data.joinMessages.push({
-			squareMid,
-			squareChatMid,
-			text: normalizedText,
-			mention,
-			updatedAt: nowIso(),
-			updatedBy,
-		});
-		this.scheduleSave();
-		return "set";
+		return this.setMemberMessage("joinMessages", squareMid, squareChatMid, text, mention, showId, updatedBy);
 	}
 
 	clearJoinMessage(squareChatMid: string): "cleared" | "unchanged" {
-		const before = this.data.joinMessages.length;
-		this.data.joinMessages = this.data.joinMessages.filter((item) => item.squareChatMid !== squareChatMid);
-		if (this.data.joinMessages.length === before) return "unchanged";
-		this.scheduleSave();
-		return "cleared";
+		return this.clearMemberMessage("joinMessages", squareChatMid);
+	}
+
+	leaveMessage(squareChatMid: string): OcLeaveMessageSetting | undefined {
+		const setting = this.data.leaveMessages.find((item) => item.squareChatMid === squareChatMid);
+		return setting ? { ...setting } : undefined;
+	}
+
+	leaveMessageSettings(): OcLeaveMessageSetting[] {
+		return this.data.leaveMessages.map((setting) => ({ ...setting }));
+	}
+
+	setLeaveMessage(
+		squareMid: string,
+		squareChatMid: string,
+		text: string,
+		mention: boolean,
+		showId: boolean,
+		updatedBy: string,
+	): "set" | "unchanged" {
+		return this.setMemberMessage("leaveMessages", squareMid, squareChatMid, text, mention, showId, updatedBy);
+	}
+
+	clearLeaveMessage(squareChatMid: string): "cleared" | "unchanged" {
+		return this.clearMemberMessage("leaveMessages", squareChatMid);
 	}
 
 	setLinkDelete(squareMid: string, enabled: boolean, updatedBy: string): "enabled" | "disabled" | "unchanged" {
@@ -463,6 +474,56 @@ class OcModerationSettingsStore {
 		setting.updatedBy = updatedBy;
 		this.scheduleSave();
 		return enabled ? "enabled" : "disabled";
+	}
+
+	private setMemberMessage(
+		key: "joinMessages" | "leaveMessages",
+		squareMid: string,
+		squareChatMid: string,
+		text: string,
+		mention: boolean,
+		showId: boolean,
+		updatedBy: string,
+	): "set" | "unchanged" {
+		const normalizedText = text.trim();
+		const current = this.data[key].find((item) => item.squareChatMid === squareChatMid);
+		if (current) {
+			if (
+				current.text === normalizedText &&
+				current.mention === mention &&
+				current.showId === showId &&
+				current.squareMid === squareMid
+			) {
+				return "unchanged";
+			}
+			current.squareMid = squareMid;
+			current.text = normalizedText;
+			current.mention = mention;
+			current.showId = showId;
+			current.updatedAt = nowIso();
+			current.updatedBy = updatedBy;
+			this.scheduleSave();
+			return "set";
+		}
+		this.data[key].push({
+			squareMid,
+			squareChatMid,
+			text: normalizedText,
+			mention,
+			showId,
+			updatedAt: nowIso(),
+			updatedBy,
+		});
+		this.scheduleSave();
+		return "set";
+	}
+
+	private clearMemberMessage(key: "joinMessages" | "leaveMessages", squareChatMid: string): "cleared" | "unchanged" {
+		const before = this.data[key].length;
+		this.data[key] = this.data[key].filter((item) => item.squareChatMid !== squareChatMid);
+		if (this.data[key].length === before) return "unchanged";
+		this.scheduleSave();
+		return "cleared";
 	}
 
 	private ensureSetting(squareMid: string, updatedBy: string): OcModerationSetting {

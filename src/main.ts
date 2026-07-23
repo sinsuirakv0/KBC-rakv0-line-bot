@@ -40,6 +40,7 @@ import {
 } from "./moderation/ocModeration.js";
 import {
 	handleOpenChatJoinEventMessage,
+	handleOpenChatLeaveEventMessage,
 	handleOpenChatJoinSystemMessage,
 } from "./moderation/ocJoinMessage.js";
 import { listenOpenChatJoinMessageEvents } from "./moderation/ocJoinMessagePolling.js";
@@ -588,7 +589,7 @@ async function memberActivityEventsFromSquareEvent(
 				memberMid,
 				displayName: member.displayName,
 				leftAt: eventCreatedAt,
-				clearAllChats: false,
+				clearAllChats: true,
 				source: "square-member",
 			});
 		}
@@ -1485,6 +1486,7 @@ async function handleRawSquareEvent(
 			.catch((error) => handlePollingError("square", error, onFatal));
 		if (
 			joinEvent.squareChatMid &&
+			ocModerationSettingsStore.joinMessage(joinEvent.squareChatMid) &&
 			!permissionStore.isBotStopped(botStopTargetFromDestination({
 				kind: "square",
 				chatMid: joinEvent.squareChatMid,
@@ -1502,6 +1504,22 @@ async function handleRawSquareEvent(
 	for (const leaveEvent of memberEvents.leaves) {
 		void handleOpenChatMemberLeave(leaveEvent)
 			.catch((error) => handlePollingError("square", error, onFatal));
+		if (
+			leaveEvent.squareChatMid &&
+			ocModerationSettingsStore.leaveMessage(leaveEvent.squareChatMid) &&
+			!permissionStore.isBotStopped(botStopTargetFromDestination({
+				kind: "square",
+				chatMid: leaveEvent.squareChatMid,
+				scopeMid: leaveEvent.squareMid,
+				chatType: "SQUARE",
+				senderMid: leaveEvent.memberMid,
+				senderName: leaveEvent.displayName,
+				encrypted: false,
+			}))
+		) {
+			void handleOpenChatLeaveEventMessage(leaveEvent, { ignoreBefore: sessionStartedAt })
+				.catch((error) => handlePollingError("square", error, onFatal));
+		}
 	}
 	const postModerationEvent = postModerationEventFromSquareEvent(client, event);
 	if (postModerationEvent) {
@@ -1639,7 +1657,7 @@ async function runSession(
 		void listenRawSquareEvents(client, storage, controller.signal, onFatal, sessionStartedAt)
 			.catch(onFatal);
 		void listenOpenChatJoinMessageEvents(client, storage, controller.signal, sessionStartedAt)
-			.catch((error) => console.error("[oc-join-message:chat-poll] stopped", error));
+			.catch((error) => console.error("[oc-member-message:chat-poll] stopped", error));
 	}
 
 	console.log("[app] bot is listening");
