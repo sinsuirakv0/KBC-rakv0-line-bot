@@ -9,7 +9,8 @@ export type OcModerationCaseType =
 	| "left_soon_log"
 	| "danger_word_auto_kick"
 	| "cohort_watch"
-	| "cohort_suspicious";
+	| "cohort_suspicious"
+	| "url_review";
 
 export type OcModerationCaseStatus =
 	| "open"
@@ -19,6 +20,9 @@ export type OcModerationCaseStatus =
 	| "ban_succeeded"
 	| "ban_failed"
 	| "unban_requested"
+	| "pending_review"
+	| "url_allowed"
+	| "url_rejected"
 	| "resolved";
 
 export interface OcModerationCase {

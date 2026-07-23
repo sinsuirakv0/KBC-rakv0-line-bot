@@ -5,11 +5,23 @@ import { ocKickHistoryStore } from "./ocKickHistory.js";
 import { ocMemberActivityStore, type OcLeaveDecisionInfo, type OcMemberActivity } from "./ocMemberActivity.js";
 import {
 	ocModerationCasesStore,
+	type OcModerationCase,
 	type OcModerationCaseStatus,
 	type OcModerationCaseType,
 } from "./ocModerationCases.js";
 import { permissionStore, targetFromDestination, type PermissionTarget } from "../permissions/store.js";
 import { ocModerationSettingsStore } from "./ocModerationSettings.js";
+import {
+	blockedOcUrlComponent,
+	createOcUrlAllowRule,
+	extractOcUrls,
+	isOcUrlAllowed,
+	ocUrlRuleTarget,
+	parseOcUrl,
+	type OcUrlBlockedComponent,
+	type OcUrlRuleScope,
+	type ParsedOcUrl,
+} from "./ocUrlPolicy.js";
 
 type SquareRole = string | number | undefined;
 
@@ -87,11 +99,6 @@ interface NotePostCandidate {
 	text: string;
 }
 
-const LINE_ME_URL_PATTERN = /(?:https?:\/\/|www\.)?\bline\.me(?:[/?#:]|\b)|https?:\/\/\S*line\.me\S*/i;
-const LINK_DELETE_NOTICE = [
-	"このOCではトークでの宣伝が許可されていません。",
-	"ノートの宣伝用ノートにお願いします。",
-].join("\n");
 const MEDIA_BURST_WINDOW_MS = positiveNumber(appConfig.ocMediaBurstWindowMs, 30_000, 1_000);
 const MEDIA_BURST_LIMIT = positiveNumber(appConfig.ocMediaBurstLimit, 7, 1);
 const DANGER_WORD_WINDOW_MS = 2 * 60_000;
@@ -164,9 +171,13 @@ function isImageOrVideo(contentType: string | number | undefined): boolean {
 		contentType === "EXTIMAGE";
 }
 
-function containsLineMeUrl(text: string | undefined): boolean {
-	if (!text) return false;
-	return LINE_ME_URL_PATTERN.test(text);
+function deniedOcUrls(squareMid: string, text: string | undefined): ParsedOcUrl[] {
+	const rules = ocModerationSettingsStore.urlAllowRules(squareMid);
+	return extractOcUrls(text).filter((url) => !isOcUrlAllowed(url, rules));
+}
+
+function containsDeniedOcUrl(squareMid: string, text: string | undefined): boolean {
+	return deniedOcUrls(squareMid, text).length > 0;
 }
 
 function stringValue(value: unknown): string | undefined {
@@ -591,7 +602,7 @@ async function scanSquareNotePosts(event: OpenChatNoteStatusModerationEvent): Pr
 	let deleted = false;
 	for (const candidate of candidates) {
 		if (wasPostHandled(event.squareMid, candidate.postId)) continue;
-		if (!containsLineMeUrl(candidate.text)) continue;
+		if (!containsDeniedOcUrl(event.squareMid, candidate.text)) continue;
 		await deleteSquareNotePost(event, candidate.postId);
 		deleted = true;
 	}
@@ -755,12 +766,13 @@ async function sendModRoomLog(
 		targetName?: string;
 		reason?: string;
 		payload?: Record<string, unknown>;
+		deferFlush?: boolean;
 	},
-): Promise<void> {
+): Promise<boolean> {
 	const settings = ocModerationSettingsStore.snapshot(squareMid);
 	if (!settings.modRoomChatMid) {
 		console.warn("[oc-moderation] mod room not configured", { squareMid, text });
-		return;
+		return false;
 	}
 	let caseId: string | undefined;
 	if (caseInfo) {
@@ -783,15 +795,102 @@ async function sendModRoomLog(
 		const messageId = squareSendMessageId(sent);
 		if (caseId && messageId) {
 			ocModerationCasesStore.attachMessage(caseId, settings.modRoomChatMid, messageId);
-			await ocModerationCasesStore.flush();
+			if (!caseInfo?.deferFlush) await ocModerationCasesStore.flush();
 		}
+		return true;
 	} catch (error) {
 		console.warn("[oc-moderation] mod room log send failed", {
 			squareMid,
 			modRoomChatMid: settings.modRoomChatMid,
 			error,
 		});
+		return false;
 	}
+}
+
+function urlComponentLabel(component: OcUrlBlockedComponent): string {
+	if (component === "scheme") return "スキーム";
+	if (component === "domain") return "ドメイン";
+	if (component === "path") return "パス";
+	return "パラメータ";
+}
+
+function truncateReviewText(value: string | undefined, maxLength = 1_500): string {
+	if (!value) return "(本文なし)";
+	if (value.length <= maxLength) return value;
+	return `${value.slice(0, maxLength)}\n…（以降省略）`;
+}
+
+function urlReviewChoices(url: ParsedOcUrl): string[] {
+	if (url.scheme !== "https") {
+		return [
+			"このスキームは許可できません。",
+			"HTTPS形式で再送された場合に、改めて審議してください。",
+			"",
+			"5. 却下・対応済みにする",
+		];
+	}
+	return [
+		"このメッセージに番号で返信してください。",
+		"1. このURLだけ許可（パラメータまで完全一致）",
+		"2. このパスを許可（パラメータは自由）",
+		"3. このパスと配下を許可",
+		"4. このドメイン全体を許可",
+		"5. 許可しない",
+	];
+}
+
+async function sendUrlReview(
+	message: OpenChatModerationMessage,
+	url: ParsedOcUrl,
+	senderName: string | undefined,
+	index: number,
+	total: number,
+): Promise<boolean> {
+	const rules = ocModerationSettingsStore.urlAllowRules(message.squareMid);
+	const blockedComponent = blockedOcUrlComponent(url, rules);
+	return await sendModRoomLog(
+		message.client,
+		message.squareMid,
+		[
+			`【URL審議${total > 1 ? ` ${index}/${total}` : ""}】`,
+			`送信者: ${memberLine(senderName, message.senderMid)}`,
+			`送信元トークMID: ${message.squareChatMid}`,
+			`未許可項目: ${urlComponentLabel(blockedComponent)}`,
+			`URL: ${url.href}`,
+			"",
+			"削除した内容:",
+			truncateReviewText(message.text),
+			"",
+			...urlReviewChoices(url),
+		].join("\n"),
+		{
+			type: "url_review",
+			status: "pending_review",
+			targetMid: message.senderMid,
+			targetName: senderName,
+			reason: `url-${blockedComponent}`,
+			deferFlush: true,
+			payload: {
+				url: url.href,
+				originalUrl: url.original,
+				blockedComponent,
+				sourceText: truncateReviewText(message.text, 4_000),
+				sourceChatMid: message.squareChatMid,
+				sourceMessageId: message.messageId,
+			},
+		},
+	);
+}
+
+function urlDeleteNotice(component: OcUrlBlockedComponent, reviewSent: boolean): string {
+	const lines = [`この${urlComponentLabel(component)}は許可されていません。`];
+	if (reviewSent) {
+		lines.push("内容を副官部屋に送信しました！審議次第送信可能になります。");
+	} else {
+		lines.push("副官部屋が未設定、または送信に失敗したため、内容を送信できませんでした。");
+	}
+	return lines.join("\n");
 }
 
 async function banFromSquare(
@@ -833,11 +932,6 @@ async function banFromSquare(
 		await ocKickHistoryStore.flush();
 		return { ok: false, error: summary };
 	}
-}
-
-async function deleteAndNotify(message: OpenChatModerationMessage, notice: string, shouldWarn: boolean): Promise<void> {
-	await deleteSquareMessage(message, "moderation");
-	if (shouldWarn) await sendMentionNotice(message, notice);
 }
 
 async function deleteMediaBurstMessages(
@@ -1191,6 +1285,30 @@ export async function handleOpenChatModeration(message: OpenChatModerationMessag
 	} catch {
 		senderName = undefined;
 	}
+	const deniedUrls = settings.linkDeleteEnabled
+		? deniedOcUrls(message.squareMid, message.text)
+		: [];
+	if (deniedUrls.length > 0) {
+		await deleteSquareMessage(message, "url-not-allowed");
+		let reviewSent = true;
+		for (const [index, url] of deniedUrls.entries()) {
+			const sent = await sendUrlReview(
+				message,
+				url,
+				senderName,
+				index + 1,
+				deniedUrls.length,
+			);
+			if (!sent) reviewSent = false;
+		}
+		const firstComponent = blockedOcUrlComponent(
+			deniedUrls[0],
+			ocModerationSettingsStore.urlAllowRules(message.squareMid),
+		);
+		await sendMentionNotice(message, urlDeleteNotice(firstComponent, reviewSent));
+		return true;
+	}
+
 	const activity = ocMemberActivityStore.recordMessage({
 		squareMid: message.squareMid,
 		squareChatMid: message.squareChatMid,
@@ -1202,21 +1320,6 @@ export async function handleOpenChatModeration(message: OpenChatModerationMessag
 
 	if (settings.joinCohortWatchEnabled) await handleCohortSuspiciousMessage(message, activity);
 	if (settings.dangerWordAutoKickEnabled && await handleDangerWordAutoKick(message, activity)) return true;
-
-	if (settings.linkDeleteEnabled && containsLineMeUrl(message.text)) {
-		const result = ocModerationSettingsStore.recordLinkViolation(
-			message.squareMid,
-			message.senderMid,
-			message.senderMid,
-		);
-		await deleteAndNotify(message, LINK_DELETE_NOTICE, result.shouldWarn);
-		return true;
-	}
-
-	if (settings.linkDeleteEnabled && ocModerationSettingsStore.isLinkDeletionLocked(message.squareMid, message.senderMid)) {
-		await deleteSquareMessage(message, "locked-url-offender");
-		return true;
-	}
 
 	if (settings.mediaBurstDeleteEnabled) logMediaModerationCandidate(message);
 	if (settings.mediaBurstDeleteEnabled && isImageOrVideo(message.contentType)) {
@@ -1249,7 +1352,7 @@ export async function handleOpenChatPostModeration(event: OpenChatPostModeration
 	const text = [event.text, await fetchPostText(event, postId)]
 		.filter((value): value is string => typeof value === "string" && value.length > 0)
 		.join("\n");
-	if (!containsLineMeUrl(text)) return false;
+	if (!containsDeniedOcUrl(event.squareMid, text)) return false;
 
 	await deleteSquareNotePost(event, postId);
 	return true;
@@ -1355,6 +1458,76 @@ function moderationCaseReplyAction(text: string): "ban" | "ignore" | "unban" | u
 	return undefined;
 }
 
+function urlReviewReplyAction(text: string): OcUrlRuleScope | "reject" | undefined {
+	const normalized = text.normalize("NFKC").toLowerCase().trim();
+	if (/^(?:1|完全一致|exact)$/.test(normalized)) return "exact";
+	if (/^(?:2|パス|path)$/.test(normalized)) return "path";
+	if (/^(?:3|配下|prefix)$/.test(normalized)) return "prefix";
+	if (/^(?:4|ドメイン|domain)$/.test(normalized)) return "domain";
+	if (/^(?:5|却下|拒否|reject|deny)$/.test(normalized)) return "reject";
+	return undefined;
+}
+
+function urlRuleScopeLabel(scope: OcUrlRuleScope): string {
+	if (scope === "exact") return "URL完全一致";
+	if (scope === "path") return "同一パス";
+	if (scope === "prefix") return "パスと配下";
+	return "ドメイン全体";
+}
+
+async function handleUrlReviewReply(
+	messageText: string,
+	message: ReplyableLineMessage,
+	moderationCase: OcModerationCase,
+): Promise<void> {
+	if (moderationCase.status !== "pending_review") {
+		await message.send("このURL審議はすでに処理済みです。");
+		return;
+	}
+	const action = urlReviewReplyAction(messageText);
+	if (!action) {
+		await message.send("1（完全一致）、2（同一パス）、3（配下を含む）、4（ドメイン全体）、5（却下）のいずれかで返信してください。");
+		return;
+	}
+	if (action === "reject") {
+		ocModerationCasesStore.update(moderationCase.id, {
+			status: "url_rejected",
+			updatedBy: message.destination.senderMid,
+		});
+		await ocModerationCasesStore.flush();
+		await message.send("このURLは許可せず、審議を完了しました。");
+		return;
+	}
+	const rawUrl = moderationCase.payload?.url;
+	const parsed = typeof rawUrl === "string" ? parseOcUrl(rawUrl) : undefined;
+	if (!parsed) {
+		await message.send("審議対象URLを読み取れないため、許可設定を追加できませんでした。");
+		return;
+	}
+	if (parsed.scheme !== "https") {
+		await message.send("HTTPS以外のスキームは許可できません。5で審議を終了するか、HTTPS形式のURLを改めて送信してください。");
+		return;
+	}
+	const nextRule = createOcUrlAllowRule(parsed, action, message.destination.senderMid);
+	const added = ocModerationSettingsStore.addUrlAllowRule(
+		moderationCase.squareMid,
+		nextRule,
+		message.destination.senderMid,
+	);
+	await ocModerationSettingsStore.flush();
+	ocModerationCasesStore.update(moderationCase.id, {
+		status: "url_allowed",
+		updatedBy: message.destination.senderMid,
+	});
+	await ocModerationCasesStore.flush();
+	await message.send([
+		added.result === "added" ? "URL許可ルールを追加しました。" : "同じURL許可ルールはすでに登録されています。",
+		`範囲: ${urlRuleScopeLabel(added.rule.scope)}`,
+		`対象: ${ocUrlRuleTarget(added.rule)}`,
+		"以後、新しく送信されたメッセージから適用されます。",
+	].join("\n"));
+}
+
 export async function handleOpenChatModerationCaseReply(
 	messageText: string,
 	message: ReplyableLineMessage,
@@ -1367,6 +1540,10 @@ export async function handleOpenChatModerationCaseReply(
 	if (!moderationCase || moderationCase.modRoomChatMid !== message.destination.chatMid) return false;
 	if (!await canHandleModerationCaseReply(message)) {
 		await message.send("実行権限がありません。BOT管理者、またはこのOCの管理者/副官のみ実行できます。");
+		return true;
+	}
+	if (moderationCase.type === "url_review") {
+		await handleUrlReviewReply(messageText, message, moderationCase);
 		return true;
 	}
 

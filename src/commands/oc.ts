@@ -6,6 +6,13 @@ import {
 import { ocKickHistoryStore } from "../moderation/ocKickHistory.js";
 import { ocModerationSettingsStore } from "../moderation/ocModerationSettings.js";
 import {
+	createOcUrlAllowRule,
+	ocUrlRuleTarget,
+	parseOcUrl,
+	type OcUrlAllowRule,
+	type OcUrlRuleScope,
+} from "../moderation/ocUrlPolicy.js";
+import {
 	permissionDeniedText,
 	permissionStore,
 	targetFromDestination,
@@ -54,8 +61,14 @@ function adminHelpText(): string {
 		"  参加時に送信するメッセージを、このトーク単位で設定/解除",
 		"!oc leavemes [mention] [id] <内容> / !oc leavemes del",
 		"  退室時に送信するメッセージを、このトーク単位で設定/解除",
-		"!oc lineurl / !oc lineurl del",
-		"  line.meを含むURL削除のON/OFF",
+		"!oc url",
+		"  URL監視の状態と使い方を表示",
+		"!oc url on / !oc url off",
+		"  HTTPS許可リスト方式のURL監視をON/OFF",
+		"!oc url add <URL> [exact|path|prefix|domain]",
+		"  HTTPS URLの許可ルールを追加",
+		"!oc url list / !oc url del <番号|all>",
+		"  許可ルールの確認/削除",
 		"!oc media / !oc media del",
 		"  画像/動画連投削除のON/OFF",
 		"!oc identity [@ユーザー|userID:<p...>]",
@@ -297,16 +310,57 @@ function isDeleteArgs(args: string[]): boolean {
 
 function setupStatusLines(squareMid: string): string[] {
 	const settings = ocModerationSettingsStore.snapshot(squareMid);
-	const lockedCount = settings.urlOffenders.filter((offender) => offender.deleteAllMessages).length;
 	return [
-		`line.me URL削除: ${enabledText(settings.linkDeleteEnabled)}`,
-		`URL再犯の発言削除対象: ${lockedCount}人`,
+		`URL許可制削除: ${enabledText(settings.linkDeleteEnabled)}`,
+		`URL許可ルール: ${settings.urlAllowRules.length}件（HTTPSのみ）`,
 		`画像/動画連投削除: ${enabledText(settings.mediaBurstDeleteEnabled)}`,
 		`即抜け監視: ${enabledText(settings.leftSoonMonitoringEnabled)}`,
 		`初参加・危険語処分: ${enabledText(settings.dangerWordAutoKickEnabled)}`,
 		`短時間一斉参加監視: ${enabledText(settings.joinCohortWatchEnabled)}`,
 		`副官部屋: ${settings.modRoomChatMid ? `設定済み (${shortId(settings.modRoomChatMid)})` : "未設定"}`,
 	];
+}
+
+function urlRuleScopeLabel(scope: OcUrlRuleScope): string {
+	if (scope === "exact") return "完全一致";
+	if (scope === "path") return "同一パス";
+	if (scope === "prefix") return "配下を含む";
+	return "ドメイン全体";
+}
+
+function urlRuleLines(rules: OcUrlAllowRule[]): string[] {
+	if (rules.length === 0) return ["許可ルールはありません。"];
+	return rules.map((rule, index) =>
+		`${index + 1}. [${urlRuleScopeLabel(rule.scope)}] ${ocUrlRuleTarget(rule)}`
+	);
+}
+
+function parseUrlRuleScope(value: string | undefined): OcUrlRuleScope | undefined {
+	if (!value) return "exact";
+	const normalized = value.normalize("NFKC").toLowerCase();
+	if (normalized === "exact" || normalized === "完全一致") return "exact";
+	if (normalized === "path" || normalized === "パス") return "path";
+	if (normalized === "prefix" || normalized === "配下") return "prefix";
+	if (normalized === "domain" || normalized === "ドメイン") return "domain";
+	return undefined;
+}
+
+function urlCommandText(squareMid: string): string {
+	const settings = ocModerationSettingsStore.snapshot(squareMid);
+	return [
+		"URL監視設定",
+		`監視: ${enabledText(settings.linkDeleteEnabled)}`,
+		`許可ルール: ${settings.urlAllowRules.length}件`,
+		"許可可能なスキーム: HTTPSのみ",
+		"",
+		"!oc url on",
+		"!oc url off",
+		"!oc url add <URL> [exact|path|prefix|domain]",
+		"!oc url list",
+		"!oc url del <番号|all>",
+		"",
+		"範囲を省略してaddすると、そのURLだけを完全一致で許可します。",
+	].join("\n");
 }
 
 async function canManageOpenChatSettings(command: Parameters<LineCommand["execute"]>[0]): Promise<boolean> {
@@ -358,7 +412,7 @@ async function sendModerationStatus(command: Parameters<LineCommand["execute"]>[
 
 async function executeModerationSetting(
 	command: Parameters<LineCommand["execute"]>[0],
-	kind: "lineurl" | "media",
+	kind: "url" | "media",
 ): Promise<void> {
 	const { message, args } = command;
 	if (message.destination.kind !== "square") {
@@ -370,13 +424,117 @@ async function executeModerationSetting(
 		return;
 	}
 
+	if (kind === "url") {
+		const subAction = args[1]?.normalize("NFKC").toLowerCase();
+		const rules = ocModerationSettingsStore.urlAllowRules(message.destination.scopeMid);
+		if (!subAction || subAction === "status" || subAction === "help") {
+			await message.send(urlCommandText(message.destination.scopeMid));
+			return;
+		}
+		if (subAction === "rules" || subAction === "list" || subAction === "一覧") {
+			await message.send([
+				`URL監視: ${enabledText(ocModerationSettingsStore.snapshot(message.destination.scopeMid).linkDeleteEnabled)}`,
+				`許可ルール: ${rules.length}件`,
+				...urlRuleLines(rules),
+			].join("\n"));
+			return;
+		}
+		if (subAction === "add" || subAction === "追加") {
+			const parsed = args[2] ? parseOcUrl(args[2]) : undefined;
+			if (!parsed) {
+				await message.send("使い方: !oc url add <HTTPS URL> [exact|path|prefix|domain]");
+				return;
+			}
+			if (parsed.scheme !== "https") {
+				await message.send("HTTPS以外のURLは許可できません。");
+				return;
+			}
+			const scope = parseUrlRuleScope(args[3]);
+			if (!scope) {
+				await message.send("許可範囲は exact / path / prefix / domain のいずれかを指定してください。");
+				return;
+			}
+			const added = ocModerationSettingsStore.addUrlAllowRule(
+				message.destination.scopeMid,
+				createOcUrlAllowRule(parsed, scope, message.destination.senderMid),
+				message.destination.senderMid,
+			);
+			await ocModerationSettingsStore.flush();
+			await message.send([
+				added.result === "added" ? "URL許可ルールを追加しました。" : "同じURL許可ルールはすでに登録されています。",
+				`範囲: ${urlRuleScopeLabel(added.rule.scope)}`,
+				`対象: ${ocUrlRuleTarget(added.rule)}`,
+			].join("\n"));
+			return;
+		}
+		if (subAction === "del" || subAction === "remove" || subAction === "削除") {
+			if (!args[2]) {
+				await message.send("使い方: !oc url del <番号|all>\n番号は !oc url list で確認できます。");
+				return;
+			}
+			const selector = args[2].normalize("NFKC").toLowerCase();
+			if (selector === "all" || selector === "全部" || selector === "すべて") {
+				const removed = ocModerationSettingsStore.clearUrlAllowRules(
+					message.destination.scopeMid,
+					message.destination.senderMid,
+				);
+				await ocModerationSettingsStore.flush();
+				await message.send(`URL許可ルールを${removed}件削除しました。`);
+				return;
+			}
+			const index = Number(selector);
+			const target = Number.isInteger(index) && index >= 1 ? rules[index - 1] : rules.find((rule) => rule.id === selector);
+			if (!target) {
+				await message.send("指定したURL許可ルールが見つかりません。!oc url list で番号を確認してください。");
+				return;
+			}
+			ocModerationSettingsStore.removeUrlAllowRule(
+				message.destination.scopeMid,
+				target.id,
+				message.destination.senderMid,
+			);
+			await ocModerationSettingsStore.flush();
+			await message.send(`URL許可ルールを削除しました。\n対象: ${ocUrlRuleTarget(target)}`);
+			return;
+		}
+		const enabled = subAction === "on" ||
+			subAction === "enable" ||
+			subAction === "monitor" ||
+			subAction === "start" ||
+			subAction === "監視" ||
+			subAction === "有効";
+		const disabled = subAction === "off" ||
+			subAction === "disable" ||
+			subAction === "stop" ||
+			subAction === "停止" ||
+			subAction === "無効";
+		if (!enabled && !disabled) {
+			await message.send(urlCommandText(message.destination.scopeMid));
+			return;
+		}
+		const result = ocModerationSettingsStore.setLinkDelete(
+			message.destination.scopeMid,
+			enabled,
+			message.destination.senderMid,
+		);
+		await ocModerationSettingsStore.flush();
+		if (result === "unchanged") {
+			await message.send(`URL監視はすでに${enabledText(enabled)}です。`);
+			return;
+		}
+		await message.send(`URL監視を${enabled ? "有効化" : "停止"}しました。`);
+		return;
+	}
+
 	const enabled = !isDeleteArgs(args);
-	const result = kind === "lineurl"
-		? ocModerationSettingsStore.setLinkDelete(message.destination.scopeMid, enabled, message.destination.senderMid)
-		: ocModerationSettingsStore.setMediaBurstDelete(message.destination.scopeMid, enabled, message.destination.senderMid);
+	const result = ocModerationSettingsStore.setMediaBurstDelete(
+		message.destination.scopeMid,
+		enabled,
+		message.destination.senderMid,
+	);
 	await ocModerationSettingsStore.flush();
 
-	const label = kind === "lineurl" ? "line.me URL削除" : "画像/動画連投削除";
+	const label = "画像/動画連投削除";
 	if (result === "unchanged") {
 		await message.send(`${label}はすでに${enabledText(enabled)}です。`);
 		return;
@@ -887,7 +1045,7 @@ function setupMenuText(squareMid: string): string {
 		"複数指定できます。例: 1 2 3",
 		"解除は off 1 2 のように送信してください。",
 		"",
-		"1. line.me URL削除",
+		"1. URL許可制削除（HTTPSのみ許可可能）",
 		"2. 画像/動画連投削除",
 		"3. このトークを副官部屋に設定",
 		"4. 即抜け監視",
@@ -936,7 +1094,7 @@ async function applySetupSelection(
 
 	const applyLinkDelete = (enabled: boolean): void => {
 		const result = ocModerationSettingsStore.setLinkDelete(squareMid, enabled, actorMid);
-		lines.push(flagChangeText("line.me URL削除", result, enabled));
+		lines.push(flagChangeText("URL許可制削除", result, enabled));
 	};
 	const applyMediaDelete = (enabled: boolean): void => {
 		const result = ocModerationSettingsStore.setMediaBurstDelete(squareMid, enabled, actorMid);
@@ -1834,8 +1992,8 @@ export const ocCommand: LineCommand = {
 			await executeMemberMessage(command, "leave");
 			return;
 		}
-		if (action === "lineurl" || action === "link" || action === "linkurl" || action === "adlink") {
-			await executeModerationSetting(command, "lineurl");
+		if (action === "url" || action === "link" || action === "linkurl" || action === "adlink") {
+			await executeModerationSetting(command, "url");
 			return;
 		}
 		if (action === "media" || action === "mediadel" || action === "mediaburst") {

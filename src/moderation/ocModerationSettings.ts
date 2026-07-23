@@ -2,16 +2,11 @@
 import path from "node:path";
 import { appConfig } from "../config.js";
 import { githubContentsClient } from "../storage/githubContents.js";
-
-export interface OcUrlOffender {
-	userMid: string;
-	warningCount: number;
-	deleteAllMessages: boolean;
-	firstWarnedAt?: string;
-	lockedAt?: string;
-	updatedAt: string;
-	updatedBy?: string;
-}
+import {
+	parseOcUrlAllowRules,
+	sameOcUrlRule,
+	type OcUrlAllowRule,
+} from "./ocUrlPolicy.js";
 
 export interface OcModerationSetting {
 	squareMid: string;
@@ -23,7 +18,7 @@ export interface OcModerationSetting {
 	modRoomChatMid?: string;
 	modRoomSetAt?: string;
 	modRoomSetBy?: string;
-	urlOffenders: OcUrlOffender[];
+	urlAllowRules: OcUrlAllowRule[];
 	updatedAt: string;
 	updatedBy?: string;
 }
@@ -83,31 +78,9 @@ function emptySetting(squareMid: string): OcModerationSetting {
 		modRoomChatMid: undefined,
 		modRoomSetAt: undefined,
 		modRoomSetBy: undefined,
-		urlOffenders: [],
+		urlAllowRules: [],
 		updatedAt: "",
 	};
-}
-
-function parseUrlOffenders(value: unknown): OcUrlOffender[] {
-	if (!Array.isArray(value)) return [];
-	const byUserMid = new Map<string, OcUrlOffender>();
-	for (const offender of value) {
-		const item = offender as Partial<OcUrlOffender>;
-		if (typeof item.userMid !== "string" || !item.userMid) continue;
-		const warningCount = Number.isFinite(item.warningCount)
-			? Math.max(0, Math.min(3, Math.floor(item.warningCount ?? 0)))
-			: 0;
-		byUserMid.set(item.userMid, {
-			userMid: item.userMid,
-			warningCount,
-			deleteAllMessages: item.deleteAllMessages === true,
-			firstWarnedAt: typeof item.firstWarnedAt === "string" ? item.firstWarnedAt : undefined,
-			lockedAt: typeof item.lockedAt === "string" ? item.lockedAt : undefined,
-			updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : nowIso(),
-			updatedBy: typeof item.updatedBy === "string" ? item.updatedBy : undefined,
-		});
-	}
-	return [...byUserMid.values()];
 }
 
 function parseSetupSessions(value: unknown): OcSetupSession[] {
@@ -181,7 +154,7 @@ function parseSettings(value: unknown): OcModerationSettingsFile {
 			modRoomChatMid: typeof item.modRoomChatMid === "string" ? item.modRoomChatMid : undefined,
 			modRoomSetAt: typeof item.modRoomSetAt === "string" ? item.modRoomSetAt : undefined,
 			modRoomSetBy: typeof item.modRoomSetBy === "string" ? item.modRoomSetBy : undefined,
-			urlOffenders: parseUrlOffenders(item.urlOffenders),
+			urlAllowRules: parseOcUrlAllowRules(item.urlAllowRules),
 			updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : nowIso(),
 			updatedBy: typeof item.updatedBy === "string" ? item.updatedBy : undefined,
 		});
@@ -231,8 +204,54 @@ class OcModerationSettingsStore {
 		const value = setting ?? emptySetting(squareMid);
 		return {
 			...value,
-			urlOffenders: value.urlOffenders.map((offender) => ({ ...offender })),
+			urlAllowRules: value.urlAllowRules.map((rule) => ({ ...rule })),
 		};
+	}
+
+	urlAllowRules(squareMid: string): OcUrlAllowRule[] {
+		return this.snapshot(squareMid).urlAllowRules;
+	}
+
+	addUrlAllowRule(
+		squareMid: string,
+		rule: OcUrlAllowRule,
+		updatedBy: string,
+	): { result: "added" | "unchanged"; rule: OcUrlAllowRule } {
+		const setting = this.ensureSetting(squareMid, updatedBy);
+		const current = setting.urlAllowRules.find((item) => sameOcUrlRule(item, rule));
+		if (current) return { result: "unchanged", rule: { ...current } };
+		setting.urlAllowRules.push({ ...rule });
+		setting.updatedAt = nowIso();
+		setting.updatedBy = updatedBy;
+		this.scheduleSave();
+		return { result: "added", rule: { ...rule } };
+	}
+
+	removeUrlAllowRule(
+		squareMid: string,
+		ruleId: string,
+		updatedBy: string,
+	): "removed" | "unchanged" {
+		const setting = this.data.settings.find((item) => item.squareMid === squareMid);
+		if (!setting) return "unchanged";
+		const before = setting.urlAllowRules.length;
+		setting.urlAllowRules = setting.urlAllowRules.filter((rule) => rule.id !== ruleId);
+		if (setting.urlAllowRules.length === before) return "unchanged";
+		setting.updatedAt = nowIso();
+		setting.updatedBy = updatedBy;
+		this.scheduleSave();
+		return "removed";
+	}
+
+	clearUrlAllowRules(squareMid: string, updatedBy: string): number {
+		const setting = this.data.settings.find((item) => item.squareMid === squareMid);
+		if (!setting || setting.urlAllowRules.length === 0) return 0;
+		const removed = setting.urlAllowRules.length;
+		setting.urlAllowRules = [];
+		setting.updatedAt = nowIso();
+		setting.updatedBy = updatedBy;
+		this.scheduleSave();
+		return removed;
 	}
 
 	joinMessage(squareChatMid: string): OcJoinMessageSetting | undefined {
@@ -364,56 +383,6 @@ class OcModerationSettingsStore {
 		if (this.data.setupSessions.length !== before) this.scheduleSave();
 	}
 
-	isLinkDeletionLocked(squareMid: string, userMid: string): boolean {
-		const setting = this.data.settings.find((item) => item.squareMid === squareMid);
-		return setting?.urlOffenders.some((offender) =>
-			offender.userMid === userMid && offender.deleteAllMessages
-		) ?? false;
-	}
-
-	recordLinkViolation(
-		squareMid: string,
-		userMid: string,
-		updatedBy: string,
-	): { shouldWarn: boolean; warningCount: number; locked: boolean; lockedNow: boolean } {
-		const setting = this.ensureSetting(squareMid, updatedBy);
-		let offender = setting.urlOffenders.find((item) => item.userMid === userMid);
-		if (!offender) {
-			offender = {
-				userMid,
-				warningCount: 0,
-				deleteAllMessages: false,
-				updatedAt: nowIso(),
-				updatedBy,
-			};
-			setting.urlOffenders.push(offender);
-		}
-
-		const alreadyWarned = offender.warningCount > 0;
-		const lockedNow = alreadyWarned && !offender.deleteAllMessages;
-		if (lockedNow) {
-			offender.deleteAllMessages = true;
-			offender.lockedAt = nowIso();
-		}
-
-		const shouldWarn = offender.warningCount < 3;
-		if (shouldWarn) {
-			offender.warningCount += 1;
-			if (!offender.firstWarnedAt) offender.firstWarnedAt = nowIso();
-		}
-		offender.updatedAt = nowIso();
-		offender.updatedBy = updatedBy;
-		setting.updatedAt = offender.updatedAt;
-		setting.updatedBy = updatedBy;
-		this.scheduleSave();
-		return {
-			shouldWarn,
-			warningCount: offender.warningCount,
-			locked: offender.deleteAllMessages,
-			lockedNow,
-		};
-	}
-
 	async flush(): Promise<void> {
 		if (this.saveTimer) {
 			clearTimeout(this.saveTimer);
@@ -461,14 +430,7 @@ class OcModerationSettingsStore {
 			setting = { ...emptySetting(squareMid), updatedAt: nowIso(), updatedBy };
 			this.data.settings.push(setting);
 		}
-		const clearedOffenders = key === "linkDeleteEnabled" && !enabled && setting.urlOffenders.length > 0;
-		if (clearedOffenders) {
-			setting.urlOffenders = [];
-		}
-		if (setting[key] === enabled) {
-			if (clearedOffenders) this.scheduleSave();
-			return "unchanged";
-		}
+		if (setting[key] === enabled) return "unchanged";
 		setting[key] = enabled;
 		setting.updatedAt = nowIso();
 		setting.updatedBy = updatedBy;
