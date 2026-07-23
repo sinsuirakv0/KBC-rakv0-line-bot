@@ -1299,17 +1299,22 @@ async function addSquareChatOption(
 	chat: unknown,
 	squareMid: string,
 	mode: MemberMessageMode,
+	extra: { fallbackName?: string; type?: SquareRole } = {},
 ): Promise<void> {
 	const chatMid = squareChatMid(chat);
 	const chatSquareMid = squareChatSquareMid(chat);
 	if (!chatMid || chatSquareMid !== squareMid) return;
 	const existing = options.get(chatMid);
-	const name = squareChatName(chat) ?? existing?.name ?? (isMainSquareChatType(squareChatType(chat)) ? "本OC" : "名前未取得のサブOC");
+	const type = extra.type ?? squareChatType(chat) ?? existing?.type;
+	const name = squareChatName(chat) ??
+		existing?.name ??
+		extra.fallbackName ??
+		(isMainSquareChatType(type) ? "本OC" : "名前未取得のサブOC");
 	options.set(chatMid, {
 		squareMid,
 		squareChatMid: chatMid,
 		name,
-		type: squareChatType(chat) ?? existing?.type,
+		type,
 		configured: Boolean(memberMessageSetting(mode, chatMid)),
 	});
 }
@@ -1320,13 +1325,53 @@ async function addSquareChatByMid(
 	squareMid: string,
 	squareChatMid: string | undefined,
 	mode: MemberMessageMode,
+	extra: { fallbackName?: string; type?: SquareRole } = {},
 ): Promise<void> {
-	if (!squareChatMid || options.has(squareChatMid)) return;
+	if (!squareChatMid || (options.has(squareChatMid) && !extra.fallbackName && extra.type === undefined)) return;
 	try {
 		const response = await command.message.client.base.square.getSquareChat({ squareChatMid });
-		await addSquareChatOption(options, (response as { squareChat?: unknown }).squareChat, squareMid, mode);
+		await addSquareChatOption(options, (response as { squareChat?: unknown }).squareChat, squareMid, mode, extra);
 	} catch (error) {
 		console.warn("[oc] failed to resolve member message target chat", { squareChatMid, mode, error });
+	}
+}
+
+async function addDefaultSquareChatOption(
+	command: Parameters<LineCommand["execute"]>[0],
+	options: Map<string, MemberMessageTargetOption>,
+	squareMid: string,
+	fromSquareChatMid: string,
+	mode: MemberMessageMode,
+): Promise<void> {
+	try {
+		const response = await command.message.client.base.livetalk.getSquareInfoByChatMid({
+			request: { squareChatMid: fromSquareChatMid },
+		});
+		const raw = response as { defaultChatMid?: unknown; squareName?: unknown };
+		const defaultChatMid = valueString(raw.defaultChatMid);
+		if (!defaultChatMid) return;
+
+		const fallbackName = valueString(raw.squareName) ?? "本OC";
+		await addSquareChatByMid(command, options, squareMid, defaultChatMid, mode, {
+			fallbackName,
+			type: "SQUARE_DEFAULT",
+		});
+		if (!options.has(defaultChatMid)) {
+			options.set(defaultChatMid, {
+				squareMid,
+				squareChatMid: defaultChatMid,
+				name: fallbackName,
+				type: "SQUARE_DEFAULT",
+				configured: Boolean(memberMessageSetting(mode, defaultChatMid)),
+			});
+		}
+	} catch (error) {
+		console.warn("[oc] failed to resolve default square chat", {
+			squareMid,
+			fromSquareChatMid,
+			mode,
+			error,
+		});
 	}
 }
 
@@ -1360,6 +1405,7 @@ async function memberMessageTargetOptions(
 		console.warn("[oc] failed to fetch joined square chats", error);
 	}
 
+	await addDefaultSquareChatOption(command, options, squareMid, message.destination.chatMid, mode);
 	await addSquareChatByMid(command, options, squareMid, message.destination.chatMid, mode);
 	const settings = ocModerationSettingsStore.snapshot(squareMid);
 	await addSquareChatByMid(command, options, squareMid, settings.modRoomChatMid, mode);
