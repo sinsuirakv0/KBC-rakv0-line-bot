@@ -1,4 +1,4 @@
-import fs from "node:fs/promises";
+﻿import fs from "node:fs/promises";
 import path from "node:path";
 import { appConfig } from "../config.js";
 import { githubContentsClient } from "../storage/githubContents.js";
@@ -49,6 +49,9 @@ export interface OcLeaveDecisionInfo {
 	activity: OcMemberActivity;
 	stayMs?: number;
 	messageCount: number;
+	joinedAt?: string;
+	lastMessageAt?: string;
+	lastMessageText?: string;
 	remainingChatMids: string[];
 	isFirstJoin: boolean;
 }
@@ -175,9 +178,22 @@ class OcMemberActivityStore {
 		return activity ? structuredClone(activity) : undefined;
 	}
 
-	recordSquareJoin(input: OcJoinInput): { activity: OcMemberActivity; isFirstJoin: boolean } {
+	recordSquareJoin(input: OcJoinInput): { activity: OcMemberActivity; isFirstJoin: boolean; recorded: boolean } {
 		const at = isoFromMs(input.at);
 		const activity = this.ensureActivity(input.squareMid, input.memberMid, at);
+		const hasActiveSquareMembership = Boolean(activity.latestJoinAt && !activity.latestLeftAt);
+		if (hasActiveSquareMembership) {
+			activity.displayName = input.displayName ?? activity.displayName;
+			activity.activeChatMids = addUnique(activity.activeChatMids, input.squareChatMid);
+			activity.joinedChatMids = addUnique(activity.joinedChatMids, input.squareChatMid);
+			activity.updatedAt = nowIso();
+			this.scheduleSave();
+			return {
+				activity: structuredClone(activity),
+				isFirstJoin: activity.totalJoinCount <= 1,
+				recorded: false,
+			};
+		}
 		const previousJoinCount = activity.totalJoinCount;
 		activity.displayName = input.displayName ?? activity.displayName;
 		if (!activity.firstJoinAt) activity.firstJoinAt = at;
@@ -190,7 +206,7 @@ class OcMemberActivityStore {
 		activity.updatedAt = nowIso();
 		this.trim();
 		this.scheduleSave();
-		return { activity: structuredClone(activity), isFirstJoin: previousJoinCount === 0 };
+		return { activity: structuredClone(activity), isFirstJoin: previousJoinCount === 0, recorded: true };
 	}
 
 	recordChatJoin(input: OcJoinInput): OcMemberActivity {
@@ -210,7 +226,6 @@ class OcMemberActivityStore {
 		activity.activeChatMids = input.clearAllChats
 			? []
 			: removeValue(activity.activeChatMids, input.squareChatMid);
-		activity.latestLeftAt = isoFromMs(input.at);
 		activity.updatedAt = nowIso();
 		this.scheduleSave();
 		return structuredClone(activity);
@@ -230,6 +245,9 @@ class OcMemberActivityStore {
 			activity: structuredClone(activity),
 			stayMs,
 			messageCount: activity.currentSessionMessageCount,
+			joinedAt: activity.latestJoinAt,
+			lastMessageAt: activity.lastMessageAt,
+			lastMessageText: activity.lastMessageText,
 			remainingChatMids,
 			isFirstJoin: activity.totalJoinCount <= 1,
 		};

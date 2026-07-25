@@ -416,14 +416,16 @@ function rawMember(value: unknown): {
 	memberMid?: string;
 	squareMid?: string;
 	displayName?: string;
-	membershipState?: string | number;
+	membershipState?: unknown;
+	createdAt?: number;
 } {
 	const raw = rawObject(value);
 	return {
 		memberMid: rawString(raw?.squareMemberMid),
 		squareMid: rawString(raw?.squareMid),
 		displayName: rawString(raw?.displayName),
-		membershipState: raw?.membershipState as string | number | undefined,
+		membershipState: raw?.membershipState,
+		createdAt: rawNumber(raw?.createdAt),
 	};
 }
 
@@ -438,22 +440,22 @@ function rawChat(value: unknown): { squareChatMid?: string; squareMid?: string }
 function rawChatMember(value: unknown): {
 	memberMid?: string;
 	squareChatMid?: string;
-	membershipState?: string | number;
+	membershipState?: unknown;
 } {
 	const raw = rawObject(value);
 	return {
 		memberMid: rawString(raw?.squareMemberMid),
 		squareChatMid: rawString(raw?.squareChatMid),
-		membershipState: raw?.membershipState as string | number | undefined,
+		membershipState: raw?.membershipState,
 	};
 }
 
-function isJoinedState(value: string | number | undefined): boolean {
-	return value === 1 || value === "JOINED";
+function isJoinedState(value: unknown): boolean {
+	return Number(value) === 1 || String(value ?? "").trim().toUpperCase() === "JOINED";
 }
 
-function isLeftState(value: string | number | undefined): boolean {
-	return value === 4 || value === "LEFT";
+function isLeftState(value: unknown): boolean {
+	return Number(value) === 4 || String(value ?? "").trim().toUpperCase() === "LEFT";
 }
 
 async function memberActivityEventsFromSquareEvent(
@@ -475,7 +477,8 @@ async function memberActivityEventsFromSquareEvent(
 				squareMid: member.squareMid,
 				memberMid: member.memberMid,
 				displayName: member.displayName,
-				joinedAt: eventCreatedAt,
+				joinedAt: member.createdAt ?? eventCreatedAt,
+				memberCreatedAt: member.createdAt,
 				source: "square-member",
 			});
 		}
@@ -496,7 +499,8 @@ async function memberActivityEventsFromSquareEvent(
 				squareChatMid,
 				memberMid,
 				displayName: peer.displayName,
-				joinedAt: rawNumber(raw?.joinedAt) ?? eventCreatedAt,
+				joinedAt: rawNumber(raw?.joinedAt) ?? peer.createdAt ?? eventCreatedAt,
+				memberCreatedAt: peer.createdAt,
 				source: "chat-member",
 			});
 		}
@@ -520,7 +524,8 @@ async function memberActivityEventsFromSquareEvent(
 				squareChatMid,
 				memberMid: member.memberMid,
 				displayName: member.displayName,
-				joinedAt: eventCreatedAt,
+				joinedAt: member.createdAt ?? eventCreatedAt,
+				memberCreatedAt: member.createdAt,
 				source: "chat-member",
 			});
 		}
@@ -593,6 +598,29 @@ async function memberActivityEventsFromSquareEvent(
 				source: "square-member",
 			});
 		}
+	}
+
+	if (joins.length > 0 || leaves.length > 0) {
+		console.log("[oc-member-event] parsed", {
+			type: String(event.type),
+			createdAt: eventCreatedAt,
+			joins: joins.map((join) => ({
+				source: join.source,
+				squareMid: join.squareMid,
+				squareChatMid: join.squareChatMid,
+				memberMid: join.memberMid,
+				joinedAt: join.joinedAt,
+				memberCreatedAt: join.memberCreatedAt,
+			})),
+			leaves: leaves.map((leave) => ({
+				source: leave.source,
+				squareMid: leave.squareMid,
+				squareChatMid: leave.squareChatMid,
+				memberMid: leave.memberMid,
+				leftAt: leave.leftAt,
+				clearAllChats: leave.clearAllChats,
+			})),
+		});
 	}
 
 	return { joins, leaves };
@@ -1482,8 +1510,11 @@ async function handleRawSquareEvent(
 ): Promise<void> {
 	const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
 	for (const joinEvent of memberEvents.joins) {
-		void handleOpenChatMemberJoin(joinEvent)
-			.catch((error) => handlePollingError("square", error, onFatal));
+		try {
+			await handleOpenChatMemberJoin(joinEvent);
+		} catch (error) {
+			handlePollingError("square", error, onFatal);
+		}
 		if (
 			joinEvent.squareChatMid &&
 			ocModerationSettingsStore.joinMessage(joinEvent.squareChatMid) &&
@@ -1502,8 +1533,11 @@ async function handleRawSquareEvent(
 		}
 	}
 	for (const leaveEvent of memberEvents.leaves) {
-		void handleOpenChatMemberLeave(leaveEvent)
-			.catch((error) => handlePollingError("square", error, onFatal));
+		try {
+			await handleOpenChatMemberLeave(leaveEvent);
+		} catch (error) {
+			handlePollingError("square", error, onFatal);
+		}
 		if (
 			leaveEvent.squareChatMid &&
 			ocModerationSettingsStore.leaveMessage(leaveEvent.squareChatMid) &&

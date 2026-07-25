@@ -57,6 +57,7 @@ export interface OpenChatMemberJoinEvent {
 	memberMid: string;
 	displayName?: string;
 	joinedAt?: number;
+	memberCreatedAt?: number;
 	source: "square-member" | "chat-member";
 }
 
@@ -199,6 +200,15 @@ function formatDuration(ms: number | undefined): string {
 	const minutes = Math.floor(seconds / 60);
 	const rest = seconds % 60;
 	return rest === 0 ? `${minutes}分` : `${minutes}分${rest}秒`;
+}
+
+function formatParticipationDuration(ms: number | undefined): string {
+	if (ms === undefined || !Number.isFinite(ms) || ms < 0) return "不明";
+	const totalSeconds = Math.floor(ms / 1_000);
+	const hours = Math.floor(totalSeconds / 3_600);
+	const minutes = Math.floor((totalSeconds % 3_600) / 60);
+	const seconds = totalSeconds % 60;
+	return hours > 0 ? `${hours}時間${minutes}分${seconds}秒` : `${minutes}分${seconds}秒`;
 }
 
 function displayNameText(name: string | undefined): string {
@@ -973,6 +983,94 @@ function memberLine(name: string | undefined, mid: string): string {
 	return `${displayNameText(name)} (${mid})`;
 }
 
+function lastMessageLine(info: OcLeaveDecisionInfo): string {
+	const text = info.lastMessageText?.replace(/\s+/g, " ").trim();
+	return text ? text.slice(0, 300) : "(発言なし)";
+}
+
+async function resolveLeftSoonNoticeChatMid(
+	client: Client,
+	squareMid: string,
+	fallbackChatMid: string | undefined,
+): Promise<string | undefined> {
+	if (fallbackChatMid) {
+		try {
+			const response = await client.base.livetalk.getSquareInfoByChatMid({
+				request: { squareChatMid: fallbackChatMid },
+			});
+			const defaultChatMid = stringValue((response as { defaultChatMid?: unknown }).defaultChatMid);
+			if (defaultChatMid) return defaultChatMid;
+		} catch (error) {
+			console.warn("[oc-left-soon] failed to resolve default chat from fallback", {
+				squareMid,
+				fallbackChatMid,
+				error: compactError(error),
+			});
+		}
+	}
+
+	try {
+		let continuationToken = "";
+		for (let page = 0; page < 10; page++) {
+			const response = await client.base.square.getJoinedSquareChats({
+				request: { continuationToken, limit: 100 },
+			});
+			const raw = response as { chats?: unknown[]; continuationToken?: unknown };
+			for (const entry of raw.chats ?? []) {
+				const chat = entry as { squareMid?: unknown; squareChatMid?: unknown; type?: unknown };
+				if (stringValue(chat.squareMid) !== squareMid) continue;
+				if (chat.type === 4 || chat.type === "SQUARE_DEFAULT") {
+					const chatMid = stringValue(chat.squareChatMid);
+					if (chatMid) return chatMid;
+				}
+			}
+			continuationToken = stringValue(raw.continuationToken) ?? "";
+			if (!continuationToken) break;
+		}
+	} catch (error) {
+		console.warn("[oc-left-soon] failed to list joined square chats", {
+			squareMid,
+			error: compactError(error),
+		});
+	}
+	return fallbackChatMid;
+}
+
+async function sendLeftSoonMainNotice(
+	event: OpenChatMemberLeaveEvent,
+	info: OcLeaveDecisionInfo,
+	modRoomChatMid: string | undefined,
+): Promise<void> {
+	const squareChatMid = await resolveLeftSoonNoticeChatMid(
+		event.client,
+		event.squareMid,
+		event.squareChatMid ?? modRoomChatMid,
+	);
+	if (!squareChatMid) {
+		console.warn("[oc-left-soon] automatic ban notice skipped; no target chat", {
+			squareMid: event.squareMid,
+			memberMid: event.memberMid,
+		});
+		return;
+	}
+	try {
+		await event.client.base.square.sendMessage({
+			squareChatMid,
+			text: [
+				"自動強制退会が実行されました。",
+				"判断理由: 参加から5分以内の即抜け",
+				`参加時間: ${formatParticipationDuration(info.stayMs)}`,
+			].join("\n"),
+		});
+	} catch (error) {
+		console.warn("[oc-left-soon] automatic ban notice send failed", {
+			squareMid: event.squareMid,
+			squareChatMid,
+			error: compactError(error),
+		});
+	}
+}
+
 async function sendDangerWordMainNotice(
 	message: OpenChatModerationMessage,
 	word: string,
@@ -1154,6 +1252,18 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 	const settings = ocModerationSettingsStore.snapshot(event.squareMid);
 	if (!settings.leftSoonMonitoringEnabled) return;
 	const mode = leftSoonMode(info);
+	console.log("[oc-left-soon] decision", {
+		squareMid: event.squareMid,
+		squareChatMid: event.squareChatMid,
+		memberMid: event.memberMid,
+		mode,
+		stayMs: info.stayMs,
+		isFirstJoin: info.isFirstJoin,
+		remainingChatCount: info.remainingChatMids.length,
+		messageCount: info.messageCount,
+		joinedAt: info.joinedAt,
+		lastMessageAt: info.lastMessageAt,
+	});
 	if (mode === "none") return;
 
 	const targetName = info.activity.displayName ?? event.displayName;
@@ -1168,8 +1278,9 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 					: "【監視ログ】再参加者の短時間退会",
 				"",
 				`対象: ${memberLine(targetName, event.memberMid)}`,
-				`滞在: ${formatDuration(info.stayMs)}`,
+				`参加時間: ${formatParticipationDuration(info.stayMs)}`,
 				`発言数: ${info.messageCount}`,
+				`最後の発言: ${lastMessageLine(info)}`,
 				`サブトーク残存: ${hasRemainingChats ? "あり" : "なし"}`,
 				"処分: 未実行",
 				"",
@@ -1186,6 +1297,9 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 				payload: {
 					stayMs: info.stayMs,
 					messageCount: info.messageCount,
+					joinedAt: info.joinedAt,
+					lastMessageAt: info.lastMessageAt,
+					lastMessageText: info.lastMessageText,
 					remainingChatMids: info.remainingChatMids,
 				},
 			},
@@ -1201,8 +1315,9 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 				"【確認待ち】参加後30分以内の退会",
 				"",
 				`対象: ${memberLine(targetName, event.memberMid)}`,
-				`滞在: ${formatDuration(info.stayMs)}`,
+				`参加時間: ${formatParticipationDuration(info.stayMs)}`,
 				`発言数: ${info.messageCount}`,
+				`最後の発言: ${lastMessageLine(info)}`,
 				"サブトーク残存: なし",
 				"処分: 未実行",
 				"",
@@ -1218,6 +1333,9 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 				payload: {
 					stayMs: info.stayMs,
 					messageCount: info.messageCount,
+					joinedAt: info.joinedAt,
+					lastMessageAt: info.lastMessageAt,
+					lastMessageText: info.lastMessageText,
 				},
 			},
 		);
@@ -1231,6 +1349,9 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 		targetName,
 		"即抜け: 参加後5分以内の退会",
 	);
+	if (banResult.ok) {
+		await sendLeftSoonMainNotice(event, info, settings.modRoomChatMid);
+	}
 	await sendModRoomLog(
 		event.client,
 		event.squareMid,
@@ -1238,8 +1359,9 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 			"【自動処分】参加後5分以内の退会",
 			"",
 			`対象: ${memberLine(targetName, event.memberMid)}`,
-			`滞在: ${formatDuration(info.stayMs)}`,
+			`参加時間: ${formatParticipationDuration(info.stayMs)}`,
 			`発言数: ${info.messageCount}`,
+			`最後の発言: ${lastMessageLine(info)}`,
 			"サブトーク残存: なし",
 			`処分: ${banResult.ok ? "再参加禁止" : "再参加禁止失敗"}`,
 			banResult.error ? `エラー: ${banResult.error}` : "",
@@ -1259,6 +1381,9 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 			payload: {
 				stayMs: info.stayMs,
 				messageCount: info.messageCount,
+				joinedAt: info.joinedAt,
+				lastMessageAt: info.lastMessageAt,
+				lastMessageText: info.lastMessageText,
 				error: banResult.error,
 			},
 		},
@@ -1391,15 +1516,31 @@ export async function handleOpenChatMemberJoin(event: OpenChatMemberJoinEvent): 
 	if (!isSquareMemberMid(event.memberMid)) return;
 	if (isSquareBotStopped(event.squareChatMid)) return;
 	if (event.source === "square-member") {
-		ocMemberActivityStore.recordSquareJoin({
+		const result = ocMemberActivityStore.recordSquareJoin({
 			squareMid: event.squareMid,
 			squareChatMid: event.squareChatMid,
 			memberMid: event.memberMid,
 			displayName: event.displayName,
-			at: event.joinedAt,
+			at: event.memberCreatedAt ?? event.joinedAt,
 		});
-		await maybeStartJoinCohortWatch(event);
+		if (result.recorded) await maybeStartJoinCohortWatch(event);
 		return;
+	}
+
+	// 本OC参加イベントが届かない環境でも、SquareMember.createdAt を参加時刻として補完する。
+	// 既存メンバーがサブトークへ入っただけの場合はcreatedAtが過去になるため、即抜け判定には該当しない。
+	if (event.memberCreatedAt !== undefined) {
+		const result = ocMemberActivityStore.recordSquareJoin({
+			squareMid: event.squareMid,
+			squareChatMid: event.squareChatMid,
+			memberMid: event.memberMid,
+			displayName: event.displayName,
+			at: event.memberCreatedAt,
+		});
+		if (result.recorded) await maybeStartJoinCohortWatch({
+			...event,
+			joinedAt: event.memberCreatedAt,
+		});
 	}
 	ocMemberActivityStore.recordChatJoin({
 		squareMid: event.squareMid,
