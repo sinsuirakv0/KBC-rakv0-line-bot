@@ -11,6 +11,14 @@ import { appConfig, getPasswordCredentials } from "./config.js";
 import type { SyncedLineStorage } from "./storage/lineStorage.js";
 
 const STORAGE_AUTH_KEY = ".auth";
+const STORAGE_REFRESH_TOKEN_KEY = "refreshToken";
+const V3_SUPPORTED_DEVICES = new Set([
+	"DESKTOPWIN",
+	"DESKTOPMAC",
+	"IOS",
+	"ANDROID",
+	"ANDROIDSECONDARY",
+]);
 
 async function writeQrCode(url: string): Promise<void> {
 	const logsDir = path.resolve("logs");
@@ -33,9 +41,24 @@ export function isAuthenticationError(error: unknown): boolean {
 	return /NOT_AUTHORIZED|AUTHENTICATION_DIVESTED|INVALID_AUTH|EXPIRED_AUTH/i.test(detail);
 }
 
+export function isExpiredAuthenticationError(error: unknown): boolean {
+	let detail = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+	try {
+		detail += ` ${JSON.stringify(error)}`;
+	} catch { /* best-effort error inspection */ }
+	return /NOT_AUTHORIZED_DEVICE/i.test(detail) && /\bEXPIRED\b/i.test(detail);
+}
+
 export async function createLineClient(storage: SyncedLineStorage): Promise<Client> {
 	const storedToken = await storage.get(STORAGE_AUTH_KEY);
+	const storedRefreshToken = await storage.get(STORAGE_REFRESH_TOKEN_KEY);
 	const envToken = appConfig.authToken.trim();
+	const canUsePassword = Boolean(appConfig.email && appConfig.password);
+	const passwordLoginUsesV3 = appConfig.loginV3 ??
+		V3_SUPPORTED_DEVICES.has(appConfig.device.toUpperCase());
+	const shouldUpgradeStoredLogin = canUsePassword &&
+		passwordLoginUsesV3 &&
+		!(typeof storedRefreshToken === "string" && storedRefreshToken.trim());
 
 	const init = {
 		device: appConfig.device as never,
@@ -56,9 +79,12 @@ export async function createLineClient(storage: SyncedLineStorage): Promise<Clie
 	if (appConfig.forceLogin) {
 		console.log("[line] LINE_FORCE_LOGIN=true; skipping stored auth token for this login");
 	}
+	if (!appConfig.forceLogin && shouldUpgradeStoredLogin) {
+		console.log("[line] refresh token is missing; upgrading stored login to password V3");
+	}
 	if (!appConfig.forceLogin) {
 		const candidates = [
-			typeof storedToken === "string" && storedToken.trim()
+			!shouldUpgradeStoredLogin && typeof storedToken === "string" && storedToken.trim()
 				? { source: "stored auth token", token: storedToken.trim() }
 				: null,
 			envToken ? { source: "LINE_AUTH_TOKEN", token: envToken } : null,
@@ -78,12 +104,12 @@ export async function createLineClient(storage: SyncedLineStorage): Promise<Clie
 		}
 	}
 
-	const canUsePassword = Boolean(appConfig.email && appConfig.password);
 	if (!client && (appConfig.loginMethod === "password" || canUsePassword)) {
 		const credentials = getPasswordCredentials();
 		console.log("[line] logging in with email/password");
 		console.log(`[line] login PIN: ${appConfig.loginPin}`);
 		console.log(`[line] password E2EE login: ${appConfig.e2eeLogin ? "enabled" : "disabled"}`);
+		console.log(`[line] password login protocol: ${passwordLoginUsesV3 ? "V3" : "legacy"}`);
 		const base = new BaseClient(init);
 		base.on("pincall", (pin) => {
 			console.log(`[line] enter this pincode in LINE app: ${pin}`);
@@ -91,7 +117,7 @@ export async function createLineClient(storage: SyncedLineStorage): Promise<Clie
 		base.on("update:authtoken", saveToken);
 		await base.loginProcess.withPassword({
 			...credentials,
-			v3: false,
+			v3: appConfig.loginV3,
 			e2ee: appConfig.e2eeLogin,
 			pincode: appConfig.loginPin,
 		});

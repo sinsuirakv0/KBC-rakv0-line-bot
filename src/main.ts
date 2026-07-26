@@ -11,7 +11,11 @@ import {
 import { handleSearchPageReply } from "./commands/searchPages.js";
 import { handleLogTargetSelectionReply } from "./commands/log.js";
 import { handlePing } from "./handlers/ping.js";
-import { createLineClient, isAuthenticationError } from "./lineClient.js";
+import {
+	createLineClient,
+	isAuthenticationError,
+	isExpiredAuthenticationError,
+} from "./lineClient.js";
 import { startEventPushScheduler } from "./eventPush/scheduler.js";
 import { eventPushStore } from "./eventPush/store.js";
 import { startPushReminderScheduler } from "./reminders/scheduler.js";
@@ -1800,7 +1804,11 @@ async function runSession(
 	const profile = await client.getMyProfile();
 	console.log(`[line] logged in as ${profile.displayName} (${profile.mid})`);
 	const sessionStartedAt = Date.now();
-	lineHealth.startSession(sessionStartedAt);
+	const storedRefreshToken = await storage.get("refreshToken");
+	const refreshTokenAvailable = typeof storedRefreshToken === "string" &&
+		Boolean(storedRefreshToken.trim());
+	lineHealth.startSession(sessionStartedAt, refreshTokenAvailable);
+	console.log(`[line] refresh token: ${refreshTokenAvailable ? "available" : "not available"}`);
 	void runtimeStore.startSession(sessionStartedAt).catch((error) => {
 		console.warn("[runtime] session start save failed", error);
 	});
@@ -1835,6 +1843,8 @@ async function runSession(
 	let authFailureCount = 0;
 	let authRetryTimer: NodeJS.Timeout | undefined;
 	let lastAuthCheckAt = 0;
+	let refreshAttemptedForFailure = false;
+	let missingRefreshTokenLogged = false;
 	const requestAuthenticationVerification = (
 		trigger: string,
 		triggerError?: unknown,
@@ -1851,8 +1861,33 @@ async function runSession(
 				error: compactError(triggerError),
 			});
 		}
-		void client.getMyProfile()
-			.then(() => {
+		void (async () => {
+			if (
+				triggerError !== undefined &&
+				isExpiredAuthenticationError(triggerError) &&
+				!refreshAttemptedForFailure
+			) {
+				const refreshToken = await storage.get("refreshToken");
+				if (typeof refreshToken === "string" && refreshToken) {
+					refreshAttemptedForFailure = true;
+					console.warn("[line] access token expired; attempting refresh token recovery", { trigger });
+					try {
+						await client.base.auth.tryRefreshToken();
+						lineHealth.markTokenRefresh(true);
+						console.log("[line] access token refresh succeeded");
+					} catch (refreshError) {
+						lineHealth.markTokenRefresh(false, refreshError);
+						console.warn("[line] access token refresh failed", {
+							error: compactError(refreshError),
+						});
+					}
+				} else if (!missingRefreshTokenLogged) {
+					missingRefreshTokenLogged = true;
+					console.warn("[line] access token expired, but no refresh token is stored");
+				}
+			}
+			try {
+				await client.getMyProfile();
 				if (authFailureCount > 0 || triggerError !== undefined) {
 					console.log("[line] authentication verification succeeded; session restart was skipped", {
 						trigger,
@@ -1860,8 +1895,9 @@ async function runSession(
 					});
 				}
 				authFailureCount = 0;
-			})
-			.catch((error) => {
+				refreshAttemptedForFailure = false;
+				missingRefreshTokenLogged = false;
+			} catch (error) {
 				if (!isAuthenticationError(error)) {
 					authFailureCount = 0;
 					console.warn("[line] authentication verification request failed without an auth error", {
@@ -1883,8 +1919,12 @@ async function runSession(
 				}
 				authRetryTimer = setTimeout(() => {
 					authRetryTimer = undefined;
-					requestAuthenticationVerification("authentication-retry", undefined, true);
+					requestAuthenticationVerification("authentication-retry", error, true);
 				}, appConfig.authFailureRetryMs);
+			}
+		})()
+			.catch((error) => {
+				console.error("[line] authentication verification task crashed", error);
 			})
 			.finally(() => {
 				authCheckRunning = false;

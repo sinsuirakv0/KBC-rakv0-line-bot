@@ -694,6 +694,14 @@ export const botCommand: LineCommand = {
 			`前回再接続理由: ${sessionEndSourceLabel(lastSessionEnd.source)}`,
 			`前回再接続詳細: ${lastSessionEnd.reason}`,
 		] : [];
+		const authRefreshLines = [
+			`認証更新: ${receiverHealth.refreshTokenAvailable
+				? `refreshTokenあり / 成功 ${receiverHealth.tokenRefreshSuccesses}/${receiverHealth.tokenRefreshAttempts}`
+				: "refreshTokenなし（期限切れ時は再ログイン）"}`,
+			...(receiverHealth.lastTokenRefreshError
+				? [`直近の認証更新エラー: ${receiverHealth.lastTokenRefreshError}`]
+				: []),
+		];
 		await message.send([
 			"bot status",
 			`動作状態: ${stopStatus.stopped ? "停止中" : "稼働中"}`,
@@ -708,6 +716,7 @@ export const botCommand: LineCommand = {
 			`OC受信: ${formatReceiverHealth(receiverHealth.square)}`,
 			`参加/退出通知監視: ${formatMemberMessageHealth(receiverHealth.memberMessage)}`,
 			`このプロセスの再ログイン回数: ${Math.max(0, receiverHealth.sessionStarts - 1)}`,
+			...authRefreshLines,
 			...lastSessionLines,
 			`コマンド処理: ${workload.activeForeground}/${workload.maxForeground} / 待機 ${workload.queuedForeground}`,
 			`背景処理: ${workload.activeBackground ?? "なし"} / 待機 ${workload.queuedBackground}`,

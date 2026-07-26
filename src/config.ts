@@ -11,6 +11,14 @@ function boolEnv(name: string, fallback: boolean): boolean {
 	return ["1", "true", "yes", "on"].includes(value.toLowerCase());
 }
 
+function optionalBoolEnv(name: string): boolean | undefined {
+	const raw = process.env[name]?.trim().toLowerCase();
+	if (!raw || raw === "auto") return undefined;
+	if (["1", "true", "yes", "on"].includes(raw)) return true;
+	if (["0", "false", "no", "off"].includes(raw)) return false;
+	throw new Error(`${name} must be auto, true, or false`);
+}
+
 function numberEnv(
 	name: string,
 	fallback: number,
@@ -56,6 +64,7 @@ export const appConfig = {
 	authToken: process.env.LINE_AUTH_TOKEN || "",
 	loginPin: loginPin(),
 	device: process.env.LINE_DEVICE || "DESKTOPWIN",
+	loginV3: optionalBoolEnv("LINE_LOGIN_V3"),
 	storageFile: path.resolve(process.env.LINE_STORAGE_FILE || "./storage/storage.json"),
 	forceLogin: boolEnv("LINE_FORCE_LOGIN", false),
 	e2eeLogin: boolEnv("LINE_E2EE_LOGIN", true),

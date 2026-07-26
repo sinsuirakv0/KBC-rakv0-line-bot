@@ -25,6 +25,11 @@ export interface LineHealthSnapshot {
 	sessionStartedAt?: number;
 	sessionStarts: number;
 	lastSessionEnd?: LineSessionEndSnapshot;
+	refreshTokenAvailable: boolean;
+	tokenRefreshAttempts: number;
+	tokenRefreshSuccesses: number;
+	lastTokenRefreshAt?: number;
+	lastTokenRefreshError?: string;
 	talk: LineHealthChannelSnapshot;
 	square: LineHealthChannelSnapshot;
 	memberMessage: LineHealthChannelSnapshot;
@@ -45,15 +50,21 @@ class LineHealth {
 	private sessionStartedAt: number | undefined;
 	private sessionStarts = 0;
 	private lastSessionEnd: LineSessionEndSnapshot | undefined;
+	private refreshTokenAvailable = false;
+	private tokenRefreshAttempts = 0;
+	private tokenRefreshSuccesses = 0;
+	private lastTokenRefreshAt: number | undefined;
+	private lastTokenRefreshError: string | undefined;
 	private readonly channels: Record<LineHealthChannel, ChannelHealth> = {
 		talk: newChannelHealth(),
 		square: newChannelHealth(),
 		"member-message": newChannelHealth(),
 	};
 
-	startSession(now = Date.now()): void {
+	startSession(now = Date.now(), refreshTokenAvailable = false): void {
 		this.sessionStartedAt = now;
 		this.sessionStarts += 1;
+		this.refreshTokenAvailable = refreshTokenAvailable;
 		for (const channel of CHANNELS) {
 			this.channels[channel] = {
 				startedAt: now,
@@ -72,6 +83,18 @@ class LineHealth {
 			durationMs: startedAt === undefined ? 0 : Math.max(0, now - startedAt),
 		};
 		this.sessionStartedAt = undefined;
+	}
+
+	markTokenRefresh(success: boolean, error?: unknown, now = Date.now()): void {
+		this.tokenRefreshAttempts += 1;
+		this.lastTokenRefreshAt = now;
+		if (success) {
+			this.tokenRefreshSuccesses += 1;
+			this.lastTokenRefreshError = undefined;
+			this.refreshTokenAvailable = true;
+			return;
+		}
+		this.lastTokenRefreshError = error === undefined ? "不明なエラー" : compactError(error);
 	}
 
 	markSuccess(channel: LineHealthChannel, eventCount = 0, now = Date.now()): void {
@@ -125,6 +148,11 @@ class LineHealth {
 			sessionStartedAt: this.sessionStartedAt,
 			sessionStarts: this.sessionStarts,
 			lastSessionEnd: this.lastSessionEnd,
+			refreshTokenAvailable: this.refreshTokenAvailable,
+			tokenRefreshAttempts: this.tokenRefreshAttempts,
+			tokenRefreshSuccesses: this.tokenRefreshSuccesses,
+			lastTokenRefreshAt: this.lastTokenRefreshAt,
+			lastTokenRefreshError: this.lastTokenRefreshError,
 			talk: snapshotChannel("talk"),
 			square: snapshotChannel("square"),
 			memberMessage: snapshotChannel("member-message"),
