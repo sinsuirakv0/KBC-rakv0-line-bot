@@ -88,11 +88,12 @@ function formatDuration(ms: number): string {
 }
 
 function formatReceiverHealth(health: LineHealthChannelSnapshot, now = Date.now()): string {
-	const responded = health.lastSuccessAt === undefined
+	const lastActivityAt = Math.max(health.lastSuccessAt ?? 0, health.lastHeartbeatAt ?? 0);
+	const responded = lastActivityAt === 0
 		? "未確認"
-		: `${formatDuration(Math.max(0, now - health.lastSuccessAt))}前`;
+		: `${formatDuration(Math.max(0, now - lastActivityAt))}前`;
 	const error = health.consecutiveFailures > 0 ? ` / 連続失敗 ${health.consecutiveFailures}` : "";
-	return `最終応答 ${responded}${error}`;
+	return `最終通信 ${responded}${error}`;
 }
 
 function formatMemberMessageHealth(health: LineHealthChannelSnapshot, now = Date.now()): string {

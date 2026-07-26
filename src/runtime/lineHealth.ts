@@ -67,8 +67,13 @@ class LineHealth {
 		if (eventCount > 0) state.lastEventAt = now;
 	}
 
-	markHeartbeat(channel: LineHealthChannel, now = Date.now()): void {
-		this.channels[channel].lastHeartbeatAt = now;
+	markHeartbeat(channel: LineHealthChannel, now = Date.now(), clearFailures = false): void {
+		const state = this.channels[channel];
+		state.lastHeartbeatAt = now;
+		if (clearFailures) {
+			state.consecutiveFailures = 0;
+			state.lastError = undefined;
+		}
 	}
 
 	markError(channel: LineHealthChannel, error: unknown, now = Date.now()): void {
@@ -81,7 +86,12 @@ class LineHealth {
 	isStale(channel: Exclude<LineHealthChannel, "member-message">, staleMs: number, now = Date.now()): boolean {
 		if (!this.sessionStartedAt || staleMs <= 0) return false;
 		const state = this.channels[channel];
-		const lastActivityAt = state.lastSuccessAt ?? state.startedAt ?? this.sessionStartedAt;
+		const lastActivityAt = Math.max(
+			state.lastSuccessAt ?? 0,
+			state.lastHeartbeatAt ?? 0,
+			state.startedAt ?? 0,
+			this.sessionStartedAt,
+		);
 		return now - lastActivityAt > staleMs;
 	}
 

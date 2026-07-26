@@ -1514,6 +1514,12 @@ async function listenRawTalkEvents(
 					.catch((error) => handlePollingError("talk", error, onFatal));
 			}
 		} catch (error) {
+			if (!signal.aborted && isTimeoutError(error)) {
+				// Talk syncは新着がない場合も待機期限で終了する。受信障害として数えない。
+				lineHealth.markHeartbeat("talk", Date.now(), true);
+				await sleepUntilRetry(appConfig.talkPollIntervalMs, signal);
+				continue;
+			}
 			lineHealth.markError("talk", error);
 			if (!signal.aborted && isTalkSyncGoneError(error)) {
 				console.warn("[talk:event] sync cursor was rejected with HTTP 410; resetting revisions");
@@ -1523,7 +1529,7 @@ async function listenRawTalkEvents(
 				await sleepUntilRetry(1_000, signal);
 				continue;
 			}
-			if (!signal.aborted && !isTimeoutError(error)) {
+			if (!signal.aborted) {
 				handlePollingError("talk", error, onFatal);
 			}
 		}
