@@ -2,6 +2,7 @@
 
 const COMMAND_LINES = [
 	"!ping/応答確認",
+	"!intro/Muninの自己紹介",
 	"!gatya/ガチャスケジュール検索",
 	"!sale/セールスケジュール検索",
 	"!event/イベント開催予定",

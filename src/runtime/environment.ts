@@ -24,7 +24,7 @@ export interface RuntimeEnvironmentSnapshot {
 	diskFreeBytes?: number;
 }
 
-function formatBytes(bytes: number): string {
+export function formatRuntimeBytes(bytes: number): string {
 	const mib = bytes / 1024 / 1024;
 	return `${mib.toFixed(1)}MiB`;
 }
@@ -121,7 +121,7 @@ async function isContainerized(): Promise<boolean> {
 }
 
 export async function collectRuntimeEnvironment(): Promise<RuntimeEnvironmentSnapshot> {
-	const [cgroup, disk, containerDetected] = await Promise.all([
+	const [cgroup, disk, detectedByRuntime] = await Promise.all([
 		collectCgroupLimits(),
 		collectDiskSpace(),
 		isContainerized(),
@@ -139,7 +139,9 @@ export async function collectRuntimeEnvironment(): Promise<RuntimeEnvironmentSna
 		hostCpuCount: cpus.length,
 		systemMemoryTotalBytes: os.totalmem(),
 		systemMemoryFreeBytes: os.freemem(),
-		containerDetected,
+		containerDetected: detectedByRuntime || Boolean(
+			cgroup.memoryLimitBytes || cgroup.cpuLimitCores || cgroup.pidsLimit,
+		),
 		northflankDetected: Object.keys(process.env).some((key) => key.startsWith("NF_")),
 		cgroupMemoryLimitBytes: cgroup.memoryLimitBytes,
 		cgroupMemoryCurrentBytes: cgroup.memoryCurrentBytes,
@@ -153,13 +155,13 @@ export async function collectRuntimeEnvironment(): Promise<RuntimeEnvironmentSna
 export function formatRuntimeEnvironment(snapshot: RuntimeEnvironmentSnapshot): string {
 	const systemUsedBytes = snapshot.systemMemoryTotalBytes - snapshot.systemMemoryFreeBytes;
 	const cgroupMemory = snapshot.cgroupMemoryLimitBytes
-		? `${formatBytes(snapshot.cgroupMemoryCurrentBytes ?? 0)} / ${formatBytes(snapshot.cgroupMemoryLimitBytes)}`
+		? `${formatRuntimeBytes(snapshot.cgroupMemoryCurrentBytes ?? 0)} / ${formatRuntimeBytes(snapshot.cgroupMemoryLimitBytes)}`
 		: "取得できませんでした";
 	const cpuLimit = snapshot.cgroupCpuLimitCores
 		? `${snapshot.cgroupCpuLimitCores.toFixed(2)} core`
 		: "取得できませんでした";
 	const disk = snapshot.diskTotalBytes && snapshot.diskFreeBytes !== undefined
-		? `${formatBytes(snapshot.diskTotalBytes - snapshot.diskFreeBytes)} / ${formatBytes(snapshot.diskTotalBytes)}`
+		? `${formatRuntimeBytes(snapshot.diskTotalBytes - snapshot.diskFreeBytes)} / ${formatRuntimeBytes(snapshot.diskTotalBytes)}`
 		: "取得できませんでした";
 	return [
 		"bot environment test",
@@ -175,7 +177,7 @@ export function formatRuntimeEnvironment(snapshot: RuntimeEnvironmentSnapshot): 
 		`CPU: ${snapshot.visibleCpuCount} core / ${snapshot.cpuModel}`,
 		`CPU制限(cgroup): ${cpuLimit}`,
 		`メモリ(cgroup): ${cgroupMemory}`,
-		`システムメモリ: ${formatBytes(systemUsedBytes)} / ${formatBytes(snapshot.systemMemoryTotalBytes)}`,
+		`システムメモリ: ${formatRuntimeBytes(systemUsedBytes)} / ${formatRuntimeBytes(snapshot.systemMemoryTotalBytes)}`,
 		`PID上限(cgroup): ${snapshot.cgroupPidsLimit?.toLocaleString("ja-JP") ?? "取得できませんでした"}`,
 		`ディスク: ${disk}`,
 		"",
