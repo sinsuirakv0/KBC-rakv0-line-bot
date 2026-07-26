@@ -43,6 +43,11 @@ export async function createLineClient(storage: SyncedLineStorage): Promise<Clie
 	};
 
 	const saveToken = async (authToken: string) => {
+		const currentToken = await storage.get(STORAGE_AUTH_KEY);
+		if (currentToken === authToken) {
+			console.log("[line] auth token is unchanged; storage backup was skipped");
+			return;
+		}
 		await storage.set(STORAGE_AUTH_KEY, authToken);
 		console.log("[line] auth token updated and saved to FileStorage");
 	};

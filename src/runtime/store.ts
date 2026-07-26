@@ -8,6 +8,14 @@ interface BotStatusFile {
 	version: 1;
 	totalUptimeMs: number;
 	updatedAt?: string;
+	lastSessionEnd?: BotStatusSessionEnd;
+}
+
+export interface BotStatusSessionEnd {
+	endedAt: string;
+	source: string;
+	reason: string;
+	durationMs: number;
 }
 
 export interface BotStatusSnapshot {
@@ -17,6 +25,7 @@ export interface BotStatusSnapshot {
 	heapUsedBytes: number;
 	heapTotalBytes: number;
 	systemUsedRatio: number;
+	lastSessionEnd?: BotStatusSessionEnd;
 }
 
 const EMPTY: BotStatusFile = { version: 1, totalUptimeMs: 0 };
@@ -24,12 +33,25 @@ const EMPTY: BotStatusFile = { version: 1, totalUptimeMs: 0 };
 function parseStatus(value: unknown): BotStatusFile {
 	if (!value || typeof value !== "object") return { ...EMPTY };
 	const raw = value as Partial<BotStatusFile>;
+	const sessionEnd = raw.lastSessionEnd;
 	return {
 		version: 1,
 		totalUptimeMs: Number.isFinite(raw.totalUptimeMs) && (raw.totalUptimeMs ?? 0) >= 0
 			? raw.totalUptimeMs as number
 			: 0,
 		updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : undefined,
+		lastSessionEnd: (
+			sessionEnd &&
+			typeof sessionEnd.endedAt === "string" &&
+			typeof sessionEnd.source === "string" &&
+			typeof sessionEnd.reason === "string" &&
+			Number.isFinite(sessionEnd.durationMs)
+		) ? {
+				endedAt: sessionEnd.endedAt,
+				source: sessionEnd.source,
+				reason: sessionEnd.reason,
+				durationMs: Math.max(0, sessionEnd.durationMs),
+			} : undefined,
 	};
 }
 
@@ -69,9 +91,22 @@ class RuntimeStore {
 		await this.save();
 	}
 
-	async endSession(now = Date.now()): Promise<void> {
+	async endSession(
+		detail?: { source: string; reason: string },
+		now = Date.now(),
+	): Promise<void> {
 		if (this.accountedAt === undefined) return;
 		this.data.totalUptimeMs += Math.max(0, now - this.accountedAt);
+		if (detail) {
+			this.data.lastSessionEnd = {
+				endedAt: new Date(now).toISOString(),
+				source: detail.source,
+				reason: detail.reason,
+				durationMs: this.sessionStartedAt === undefined
+					? 0
+					: Math.max(0, now - this.sessionStartedAt),
+			};
+		}
 		this.sessionStartedAt = undefined;
 		this.accountedAt = undefined;
 		await this.save();
@@ -100,6 +135,7 @@ class RuntimeStore {
 			heapUsedBytes: memory.heapUsed,
 			heapTotalBytes: memory.heapTotal,
 			systemUsedRatio: total > 0 ? (total - free) / total : 0,
+			lastSessionEnd: this.data.lastSessionEnd,
 		};
 	}
 

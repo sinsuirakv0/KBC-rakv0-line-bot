@@ -104,6 +104,19 @@ function formatMemberMessageHealth(health: LineHealthChannelSnapshot, now = Date
 	return `最終監視 ${active}${error}`;
 }
 
+function sessionEndSourceLabel(source: string): string {
+	const labels: Record<string, string> = {
+		"authentication-verification": "認証確認が連続失敗",
+		"event-polling-stale": "受信停止を連続検知",
+		"talk-supervisor-crash": "Talk受信監視の異常終了",
+		"square-supervisor-crash": "OC受信監視の異常終了",
+		"member-message-supervisor-crash": "参加・退出監視の異常終了",
+		shutdown: "プロセス終了",
+		"session-ended": "セッション終了",
+	};
+	return labels[source] ?? source;
+}
+
 function formatBytes(bytes: number): string {
 	const mib = bytes / 1024 / 1024;
 	return `${mib.toFixed(1)}MiB`;
@@ -670,6 +683,17 @@ export const botCommand: LineCommand = {
 		const workload = runtimeWorkload.snapshot();
 		const stopTarget = botStopTargetFromDestination(message.destination);
 		const stopStatus = permissionStore.botStopStatus(stopTarget);
+		const lastSessionEnd = status.lastSessionEnd;
+		const lastSessionEndedAt = lastSessionEnd ? Date.parse(lastSessionEnd.endedAt) : Number.NaN;
+		const lastSessionLines = lastSessionEnd ? [
+			`前回セッション終了: ${
+				Number.isFinite(lastSessionEndedAt)
+					? `${formatDuration(Math.max(0, Date.now() - lastSessionEndedAt))}前`
+					: lastSessionEnd.endedAt
+			} / 継続 ${formatDuration(lastSessionEnd.durationMs)}`,
+			`前回再接続理由: ${sessionEndSourceLabel(lastSessionEnd.source)}`,
+			`前回再接続詳細: ${lastSessionEnd.reason}`,
+		] : [];
 		await message.send([
 			"bot status",
 			`動作状態: ${stopStatus.stopped ? "停止中" : "稼働中"}`,
@@ -684,6 +708,7 @@ export const botCommand: LineCommand = {
 			`OC受信: ${formatReceiverHealth(receiverHealth.square)}`,
 			`参加/退出通知監視: ${formatMemberMessageHealth(receiverHealth.memberMessage)}`,
 			`このプロセスの再ログイン回数: ${Math.max(0, receiverHealth.sessionStarts - 1)}`,
+			...lastSessionLines,
 			`コマンド処理: ${workload.activeForeground}/${workload.maxForeground} / 待機 ${workload.queuedForeground}`,
 			`背景処理: ${workload.activeBackground ?? "なし"} / 待機 ${workload.queuedBackground}`,
 			`直近イベントループ遅延: ${Math.round(workload.lastEventLoopLagMs)}ms`,

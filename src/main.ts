@@ -1464,16 +1464,28 @@ function recordTalkMessage(
 	messageLogStore.record(record);
 }
 
-function handlePollingError(
-	channel: "talk" | "square",
+type ReceiverChannel = "talk" | "square";
+type AuthenticationErrorReporter = (channel: ReceiverChannel, error: unknown) => void;
+
+function handleReceiverPollingError(
+	channel: ReceiverChannel,
 	error: unknown,
-	onFatal: (error: unknown) => void,
+	onAuthenticationError: AuthenticationErrorReporter,
 ): void {
 	if (isAuthenticationError(error)) {
-		onFatal(error);
+		onAuthenticationError(channel, error);
 		return;
 	}
 	console.error(`[${channel}:event] polling error`, error);
+}
+
+function handleEventProcessingError(
+	channel: ReceiverChannel,
+	context: string,
+	error: unknown,
+): void {
+	// 権限不足など個別イベントの失敗でLINEセッション全体を巻き込まない。
+	console.error(`[${channel}:event] ${context} failed`, error);
 }
 
 function isTimeoutError(error: unknown): boolean {
@@ -1489,7 +1501,7 @@ async function listenRawTalkEvents(
 	client: Client,
 	ownMid: string,
 	signal: AbortSignal,
-	onFatal: (error: unknown) => void,
+	onAuthenticationError: AuthenticationErrorReporter,
 ): Promise<void> {
 	let revision: number | bigint = 0;
 	let globalRev: number | bigint = 0;
@@ -1520,7 +1532,7 @@ async function listenRawTalkEvents(
 			for (const event of operations) {
 				if (event.revision !== undefined) revision = event.revision;
 				void handleRawTalkEvent(client, ownMid, event)
-					.catch((error) => handlePollingError("talk", error, onFatal));
+					.catch((error) => handleEventProcessingError("talk", "message handler", error));
 			}
 		} catch (error) {
 			if (!signal.aborted && isTimeoutError(error)) {
@@ -1539,7 +1551,7 @@ async function listenRawTalkEvents(
 				continue;
 			}
 			if (!signal.aborted) {
-				handlePollingError("talk", error, onFatal);
+				handleReceiverPollingError("talk", error, onAuthenticationError);
 			}
 		}
 		await sleepUntilRetry(appConfig.talkPollIntervalMs, signal);
@@ -1549,7 +1561,6 @@ async function listenRawTalkEvents(
 async function handleRawSquareEvent(
 	client: Client,
 	event: RawSquareEvent,
-	onFatal: (error: unknown) => void,
 	sessionStartedAt: number,
 ): Promise<void> {
 	const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
@@ -1557,7 +1568,7 @@ async function handleRawSquareEvent(
 		try {
 			await handleOpenChatMemberJoin(joinEvent);
 		} catch (error) {
-			handlePollingError("square", error, onFatal);
+			handleEventProcessingError("square", "member join handler", error);
 		}
 		if (
 			joinEvent.squareChatMid &&
@@ -1573,14 +1584,14 @@ async function handleRawSquareEvent(
 			}))
 		) {
 			void handleOpenChatJoinEventMessage(joinEvent, { ignoreBefore: sessionStartedAt })
-				.catch((error) => handlePollingError("square", error, onFatal));
+				.catch((error) => handleEventProcessingError("square", "join message handler", error));
 		}
 	}
 	for (const leaveEvent of memberEvents.leaves) {
 		try {
 			await handleOpenChatMemberLeave(leaveEvent);
 		} catch (error) {
-			handlePollingError("square", error, onFatal);
+			handleEventProcessingError("square", "member leave handler", error);
 		}
 		if (
 			leaveEvent.squareChatMid &&
@@ -1596,46 +1607,45 @@ async function handleRawSquareEvent(
 			}))
 		) {
 			void handleOpenChatLeaveEventMessage(leaveEvent, { ignoreBefore: sessionStartedAt })
-				.catch((error) => handlePollingError("square", error, onFatal));
+				.catch((error) => handleEventProcessingError("square", "leave message handler", error));
 		}
 	}
 	const postModerationEvent = postModerationEventFromSquareEvent(client, event);
 	if (postModerationEvent) {
 		void handleOpenChatPostModeration(postModerationEvent)
-			.catch((error) => handlePollingError("square", error, onFatal));
+			.catch((error) => handleEventProcessingError("square", "post moderation handler", error));
 	}
 	const noteStatusModerationEvent = noteStatusModerationEventFromSquareEvent(client, event);
 	if (noteStatusModerationEvent) {
 		void handleOpenChatNoteStatusModeration(noteStatusModerationEvent)
-			.catch((error) => handlePollingError("square", error, onFatal));
+			.catch((error) => handleEventProcessingError("square", "note moderation handler", error));
 	}
 	for (const eventMessage of squareMessagesFromEvent(event)) {
 		void handleSquareMessage(client, new SquareMessage({
 			client,
 			raw: eventMessage.raw as never,
 		}), eventMessage.threadMid, eventMessage.chatMid)
-			.catch((error) => handlePollingError("square", error, onFatal));
+			.catch((error) => handleEventProcessingError("square", "message handler", error));
 	}
 }
 
 async function restoreReplayedSquareMemberActivity(
 	client: Client,
 	event: RawSquareEvent,
-	onFatal: (error: unknown) => void,
 ): Promise<number> {
 	const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
 	for (const joinEvent of memberEvents.joins) {
 		try {
 			await handleOpenChatMemberJoin(joinEvent, { suppressActions: true });
 		} catch (error) {
-			handlePollingError("square", error, onFatal);
+			handleEventProcessingError("square", "replayed member join restore", error);
 		}
 	}
 	for (const leaveEvent of memberEvents.leaves) {
 		try {
 			await handleOpenChatMemberLeave(leaveEvent, { suppressActions: true });
 		} catch (error) {
-			handlePollingError("square", error, onFatal);
+			handleEventProcessingError("square", "replayed member leave restore", error);
 		}
 	}
 	return memberEvents.joins.length + memberEvents.leaves.length;
@@ -1645,7 +1655,7 @@ async function listenRawSquareEvents(
 	client: Client,
 	storage: SyncedLineStorage,
 	signal: AbortSignal,
-	onFatal: (error: unknown) => void,
+	onAuthenticationError: AuthenticationErrorReporter,
 	sessionStartedAt: number,
 ): Promise<void> {
 	let syncToken = await storage.getSquareSyncToken();
@@ -1667,18 +1677,18 @@ async function listenRawSquareEvents(
 			let replayedCount = 0;
 			let restoredMemberEventCount = 0;
 			for (const event of events) {
-				recordSquareEventDebug(event);
-				const createdAt = squareEventCreatedAt(event);
-				if (createdAt !== undefined && createdAt < sessionStartedAt) {
-					replayedCount++;
-					restoredMemberEventCount += await restoreReplayedSquareMemberActivity(
-						client,
-						event,
-						onFatal,
-					);
-					continue;
+				try {
+					recordSquareEventDebug(event);
+					const createdAt = squareEventCreatedAt(event);
+					if (createdAt !== undefined && createdAt < sessionStartedAt) {
+						replayedCount++;
+						restoredMemberEventCount += await restoreReplayedSquareMemberActivity(client, event);
+						continue;
+					}
+					await handleRawSquareEvent(client, event, sessionStartedAt);
+				} catch (error) {
+					handleEventProcessingError("square", "event handler", error);
 				}
-				await handleRawSquareEvent(client, event, onFatal, sessionStartedAt);
 			}
 			if (replayedCount > 0) {
 				console.log("[square:event] skipped replayed events", {
@@ -1712,7 +1722,9 @@ async function listenRawSquareEvents(
 				loadedPersistedToken = false;
 				continue;
 			}
-			if (!signal.aborted) handlePollingError("square", error, onFatal);
+			if (!signal.aborted) {
+				handleReceiverPollingError("square", error, onAuthenticationError);
+			}
 			await sleepUntilRetry(1_000, signal);
 			continue;
 		}
@@ -1756,6 +1768,30 @@ async function superviseOpenChatMemberMessageEvents(
 	}
 }
 
+async function superviseEventReceiver(
+	channel: ReceiverChannel,
+	signal: AbortSignal,
+	run: () => Promise<void>,
+): Promise<void> {
+	let restartCount = 0;
+	while (!signal.aborted) {
+		try {
+			await run();
+			if (signal.aborted) break;
+			throw new Error(`${channel} receiver stopped unexpectedly`);
+		} catch (error) {
+			if (signal.aborted) break;
+			restartCount += 1;
+			lineHealth.markError(channel, error);
+			console.error(`[${channel}:event] receiver stopped; restarting locally`, {
+				restartCount,
+				error: compactError(error),
+			});
+			await sleepUntilRetry(1_000, signal);
+		}
+	}
+}
+
 async function runSession(
 	client: Client,
 	storage: SyncedLineStorage,
@@ -1765,7 +1801,9 @@ async function runSession(
 	console.log(`[line] logged in as ${profile.displayName} (${profile.mid})`);
 	const sessionStartedAt = Date.now();
 	lineHealth.startSession(sessionStartedAt);
-	await runtimeStore.startSession(sessionStartedAt);
+	void runtimeStore.startSession(sessionStartedAt).catch((error) => {
+		console.warn("[runtime] session start save failed", error);
+	});
 	try {
 		await client.base.e2ee.getE2EESelfKeyData(profile.mid);
 		console.log("[line] E2EE self key is available");
@@ -1779,25 +1817,109 @@ async function runSession(
 	shutdownSignal.addEventListener("abort", relayShutdown, { once: true });
 	let rejectSession!: (error: unknown) => void;
 	let failed = false;
+	let sessionStop: { source: string; error?: unknown } | undefined;
 	const sessionFailure = new Promise<never>((_resolve, reject) => {
 		rejectSession = reject;
 	});
-	const onFatal = (error: unknown) => {
+	const onFatal = (source: string, error: unknown) => {
 		if (failed || controller.signal.aborted) return;
 		failed = true;
+		sessionStop = { source, error };
 		controller.abort();
-		rejectSession(error);
+		const sessionError = new Error(`[${source}] ${compactError(error)}`);
+		sessionError.name = "LineSessionRestartError";
+		rejectSession(sessionError);
+	};
+
+	let authCheckRunning = false;
+	let authFailureCount = 0;
+	let authRetryTimer: NodeJS.Timeout | undefined;
+	let lastAuthCheckAt = 0;
+	const requestAuthenticationVerification = (
+		trigger: string,
+		triggerError?: unknown,
+		force = false,
+	): void => {
+		if (controller.signal.aborted || authCheckRunning) return;
+		const now = Date.now();
+		if (!force && now - lastAuthCheckAt < appConfig.authFailureRetryMs) return;
+		lastAuthCheckAt = now;
+		authCheckRunning = true;
+		if (triggerError !== undefined) {
+			console.warn("[line] receiver reported a possible authentication error; verifying session", {
+				trigger,
+				error: compactError(triggerError),
+			});
+		}
+		void client.getMyProfile()
+			.then(() => {
+				if (authFailureCount > 0 || triggerError !== undefined) {
+					console.log("[line] authentication verification succeeded; session restart was skipped", {
+						trigger,
+						previousFailures: authFailureCount,
+					});
+				}
+				authFailureCount = 0;
+			})
+			.catch((error) => {
+				if (!isAuthenticationError(error)) {
+					authFailureCount = 0;
+					console.warn("[line] authentication verification request failed without an auth error", {
+						trigger,
+						error: compactError(error),
+					});
+					return;
+				}
+				authFailureCount += 1;
+				console.warn("[line] authentication verification failed", {
+					trigger,
+					failures: authFailureCount,
+					threshold: appConfig.authFailureThreshold,
+					error: compactError(error),
+				});
+				if (authFailureCount >= appConfig.authFailureThreshold) {
+					onFatal("authentication-verification", error);
+					return;
+				}
+				authRetryTimer = setTimeout(() => {
+					authRetryTimer = undefined;
+					requestAuthenticationVerification("authentication-retry", undefined, true);
+				}, appConfig.authFailureRetryMs);
+			})
+			.finally(() => {
+				authCheckRunning = false;
+			});
+	};
+	const onAuthenticationError: AuthenticationErrorReporter = (channel, error) => {
+		requestAuthenticationVerification(`${channel}-poll`, error);
 	};
 
 	if (appConfig.enableTalk) {
-		void listenRawTalkEvents(client, profile.mid, controller.signal, onFatal)
-			.catch(onFatal);
+		void superviseEventReceiver(
+			"talk",
+			controller.signal,
+			() => listenRawTalkEvents(
+				client,
+				profile.mid,
+				controller.signal,
+				onAuthenticationError,
+			),
+		).catch((error) => onFatal("talk-supervisor-crash", error));
 	}
 	if (appConfig.enableSquare) {
-		void listenRawSquareEvents(client, storage, controller.signal, onFatal, sessionStartedAt)
-			.catch(onFatal);
+		void superviseEventReceiver(
+			"square",
+			controller.signal,
+			() => listenRawSquareEvents(
+				client,
+				storage,
+				controller.signal,
+				onAuthenticationError,
+				sessionStartedAt,
+			),
+		).catch((error) => onFatal("square-supervisor-crash", error));
 		void superviseOpenChatMemberMessageEvents(client, storage, controller.signal, sessionStartedAt)
-			.catch(onFatal);
+			.catch((error) => onFatal("member-message-supervisor-crash", error));
 	}
 
 	console.log("[app] bot is listening");
@@ -1809,33 +1931,29 @@ async function runSession(
 		if (lagMs >= 1_000) console.warn(`[perf] event-loop lag=${lagMs}ms`);
 		eventLoopCheckedAt = now;
 	}, 10_000);
-	let watchdogRunning = false;
+	let staleWatchdogFailures = 0;
 	const watchdog = setInterval(() => {
-		if (watchdogRunning || controller.signal.aborted) return;
-		watchdogRunning = true;
+		if (controller.signal.aborted) return;
 		const staleChannels = [
 			...(appConfig.enableTalk && lineHealth.isStale("talk", appConfig.talkPollStaleMs) ? ["talk"] : []),
 			...(appConfig.enableSquare && lineHealth.isStale("square", appConfig.squarePollStaleMs) ? ["square"] : []),
 		];
 		if (staleChannels.length > 0) {
+			staleWatchdogFailures += 1;
 			const error = new Error(`LINE event polling became stale: ${staleChannels.join(", ")}`);
-			console.error("[line] event polling watchdog restarting session", {
+			console.warn("[line] event polling watchdog detected stale receiver", {
 				staleChannels,
+				failures: staleWatchdogFailures,
+				threshold: appConfig.staleRestartThreshold,
 				talkStaleMs: appConfig.talkPollStaleMs,
 				squareStaleMs: appConfig.squarePollStaleMs,
 			});
-			onFatal(error);
-			watchdogRunning = false;
+			if (staleWatchdogFailures >= appConfig.staleRestartThreshold) {
+				onFatal("event-polling-stale", error);
+			}
 			return;
 		}
-		void client.getMyProfile()
-			.catch((error) => {
-				if (isAuthenticationError(error)) onFatal(error);
-				else console.warn("[line] authentication watchdog request failed", error);
-			})
-			.finally(() => {
-				watchdogRunning = false;
-			});
+		staleWatchdogFailures = 0;
 	}, appConfig.authWatchdogMs);
 	const runtimeCheckpoint = setInterval(() => {
 		void runtimeStore.checkpoint().catch((error) => {
@@ -1869,10 +1987,20 @@ async function runSession(
 		clearInterval(runtimeCheckpoint);
 		clearInterval(nameScan);
 		clearInterval(eventLoopMonitor);
+		if (authRetryTimer) clearTimeout(authRetryTimer);
 		controller.abort();
-		lineHealth.endSession();
+		const endedAt = Date.now();
+		const finalStop = sessionStop ?? {
+			source: shutdownSignal.aborted ? "shutdown" : "session-ended",
+			error: undefined,
+		};
+		const finalReason = finalStop.error === undefined ? "正常終了" : compactError(finalStop.error);
+		lineHealth.endSession(finalStop.source, finalStop.error, endedAt);
 		shutdownSignal.removeEventListener("abort", relayShutdown);
-		await runtimeStore.endSession().catch((error) => {
+		void runtimeStore.endSession({
+			source: finalStop.source,
+			reason: finalReason,
+		}, endedAt).catch((error) => {
 			console.warn("[runtime] session uptime save failed", error);
 		});
 	}

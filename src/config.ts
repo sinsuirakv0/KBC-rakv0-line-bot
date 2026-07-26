@@ -91,10 +91,25 @@ export const appConfig = {
 	lineStorageBackupIntervalMs: Number(process.env.LINE_STORAGE_BACKUP_INTERVAL_MS || 30_000),
 	loginRetryMs: Number(process.env.LINE_LOGIN_RETRY_MS || 15_000),
 	authWatchdogMs: Number(process.env.LINE_AUTH_WATCHDOG_MS || 60_000),
+	authFailureThreshold: numberEnv("LINE_AUTH_FAILURE_THRESHOLD", 2, {
+		min: 2,
+		max: 5,
+		integer: true,
+	}),
+	authFailureRetryMs: numberEnv("LINE_AUTH_FAILURE_RETRY_MS", 5_000, {
+		min: 1_000,
+		max: 60_000,
+		integer: true,
+	}),
 	talkPollTimeoutMs: Number(process.env.LINE_TALK_POLL_TIMEOUT_MS || 5_000),
 	talkPollIntervalMs: Number(process.env.LINE_TALK_POLL_INTERVAL_MS || 250),
 	talkPollStaleMs: Number(process.env.LINE_TALK_POLL_STALE_MS || 90_000),
 	squarePollStaleMs: Number(process.env.LINE_SQUARE_POLL_STALE_MS || 120_000),
+	staleRestartThreshold: numberEnv("LINE_STALE_RESTART_THRESHOLD", 2, {
+		min: 2,
+		max: 5,
+		integer: true,
+	}),
 	ocMemberMessageRetryMs: Number(process.env.OC_MEMBER_MESSAGE_RETRY_MS || 5_000),
 	eventPushSubscriptionsFile: path.resolve(
 		process.env.EVENT_PUSH_SUBSCRIPTIONS_FILE || "./storage/event-push-subscriptions.json",

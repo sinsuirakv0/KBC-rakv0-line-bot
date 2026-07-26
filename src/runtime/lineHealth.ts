@@ -14,9 +14,17 @@ export interface LineHealthChannelSnapshot extends ChannelHealth {
 	stale: boolean;
 }
 
+export interface LineSessionEndSnapshot {
+	endedAt: number;
+	source: string;
+	reason: string;
+	durationMs: number;
+}
+
 export interface LineHealthSnapshot {
 	sessionStartedAt?: number;
 	sessionStarts: number;
+	lastSessionEnd?: LineSessionEndSnapshot;
 	talk: LineHealthChannelSnapshot;
 	square: LineHealthChannelSnapshot;
 	memberMessage: LineHealthChannelSnapshot;
@@ -36,6 +44,7 @@ function compactError(error: unknown): string {
 class LineHealth {
 	private sessionStartedAt: number | undefined;
 	private sessionStarts = 0;
+	private lastSessionEnd: LineSessionEndSnapshot | undefined;
 	private readonly channels: Record<LineHealthChannel, ChannelHealth> = {
 		talk: newChannelHealth(),
 		square: newChannelHealth(),
@@ -54,7 +63,14 @@ class LineHealth {
 		}
 	}
 
-	endSession(): void {
+	endSession(source: string, error?: unknown, now = Date.now()): void {
+		const startedAt = this.sessionStartedAt;
+		this.lastSessionEnd = {
+			endedAt: now,
+			source,
+			reason: error === undefined ? "正常終了" : compactError(error),
+			durationMs: startedAt === undefined ? 0 : Math.max(0, now - startedAt),
+		};
 		this.sessionStartedAt = undefined;
 	}
 
@@ -108,6 +124,7 @@ class LineHealth {
 		return {
 			sessionStartedAt: this.sessionStartedAt,
 			sessionStarts: this.sessionStarts,
+			lastSessionEnd: this.lastSessionEnd,
 			talk: snapshotChannel("talk"),
 			square: snapshotChannel("square"),
 			memberMessage: snapshotChannel("member-message"),
