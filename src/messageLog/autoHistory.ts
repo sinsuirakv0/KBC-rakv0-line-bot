@@ -1,5 +1,6 @@
 ﻿import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
+import { runtimeWorkload } from "../runtime/workload.js";
 import { memberNameHistoryStore } from "../nameHistory/store.js";
 import {
 	messageLogStore,
@@ -497,10 +498,16 @@ export function startMessageLogAutoHistoryScheduler(
 	let running = false;
 	const run = () => {
 		if (running || signal.aborted) return;
+		if (!runtimeWorkload.canRunBackground()) return;
 		const client = getClient();
 		if (!client) return;
 		running = true;
-		void runAutoHistoryOnce(client)
+		void runtimeWorkload.runBackground("message-log-auto-history", async () => {
+			if (signal.aborted) return;
+			const activeClient = getClient();
+			if (!activeClient) return;
+			await runAutoHistoryOnce(activeClient);
+		})
 			.catch((error) => {
 				console.warn("[message-log:auto-history] failed", error);
 			})

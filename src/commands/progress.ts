@@ -1,4 +1,4 @@
-import type { CommandProgress, ReplyableLineMessage } from "./shared.js";
+﻿import type { CommandProgress, ReplyableLineMessage } from "./shared.js";
 
 const CLEANUP_DELAY_MS = 250;
 

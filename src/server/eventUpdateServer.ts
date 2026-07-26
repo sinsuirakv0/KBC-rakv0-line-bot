@@ -1,7 +1,8 @@
-import http from "node:http";
+﻿import http from "node:http";
 import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
 import { notifyScheduleUpdate, type EventUpdatePayload } from "../notifications/eventUpdates.js";
+import { lineHealth } from "../runtime/lineHealth.js";
 
 const MAX_BODY_BYTES = 128 * 1024;
 
@@ -34,8 +35,14 @@ export function startEventUpdateServer(
 		: () => clientOrProvider;
 	const server = http.createServer(async (req, res) => {
 		if (req.method === "GET" && req.url === "/health") {
-			res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-			res.end(JSON.stringify({ ok: true, lineReady: Boolean(getClient()) }));
+			const health = lineHealth.snapshot();
+			const staleChannels = [
+				...(appConfig.enableTalk && lineHealth.isStale("talk", appConfig.talkPollStaleMs) ? ["talk"] : []),
+				...(appConfig.enableSquare && lineHealth.isStale("square", appConfig.squarePollStaleMs) ? ["square"] : []),
+			];
+			const ok = Boolean(getClient()) && staleChannels.length === 0;
+			res.writeHead(ok ? 200 : 503, { "Content-Type": "application/json; charset=utf-8" });
+			res.end(JSON.stringify({ ok, lineReady: Boolean(getClient()), staleChannels, health }));
 			return;
 		}
 

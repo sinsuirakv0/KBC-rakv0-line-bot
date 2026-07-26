@@ -1,4 +1,4 @@
-import type { Client } from "@evex/linejs";
+﻿import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
 import { getActiveHistoryJob, tryStartHistoryJob, finishHistoryJob } from "../messageLog/historyJobs.js";
 import {

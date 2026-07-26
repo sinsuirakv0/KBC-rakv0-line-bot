@@ -21,6 +21,8 @@ import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineSto
 import { pushSubscriptionStore } from "./subscriptions/store.js";
 import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
+import { lineHealth } from "./runtime/lineHealth.js";
+import { ForegroundQueueFullError, runtimeWorkload } from "./runtime/workload.js";
 import { recordSquareEventDebug, recordSquareHandlerDebug } from "./runtime/squareEventDebug.js";
 import { ocIdentitySnapshotsStore } from "./moderation/ocIdentitySnapshots.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
@@ -162,6 +164,18 @@ const senderNames = new Map<string, string>();
 const senderNameRequests = new Map<string, Promise<string | undefined>>();
 const squareScopeRequests = new Map<string, Promise<string>>();
 const squareSelfMemberRequests = new Map<string, Promise<string | undefined>>();
+const SENDER_NAME_CACHE_MAX = 5_000;
+const SENDER_NAME_CACHE_RETAIN = 4_000;
+
+function rememberSenderName(key: string, name: string): void {
+	senderNames.set(key, name);
+	if (senderNames.size <= SENDER_NAME_CACHE_MAX) return;
+	while (senderNames.size > SENDER_NAME_CACHE_RETAIN) {
+		const oldestKey = senderNames.keys().next().value as string | undefined;
+		if (!oldestKey) break;
+		senderNames.delete(oldestKey);
+	}
+}
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -244,34 +258,47 @@ async function dispatchText(
 	messageText: string,
 	message: ReplyableLineMessage,
 ): Promise<void> {
-	const startedAt = Date.now();
-	activeHandlers += 1;
 	try {
-		if (
-			messageText.startsWith(appConfig.commandPrefix) &&
-			!isBotPermissionBypassCommand(messageText) &&
-			!permissionStore.canExecute(message.destination)
-		) {
-			await message.send("実行権限がありません。");
+		const command = messageText.slice(appConfig.commandPrefix.length).trim().split(/\s+/, 1)[0] || "unknown";
+		const highPriority = command === "ping" ||
+			/^bot\s+(?:status|start)(?:\s|$)/i.test(messageText.slice(appConfig.commandPrefix.length).trim());
+		await runtimeWorkload.runForeground(`${channel}:!${command}`, async () => {
+			const startedAt = Date.now();
+			activeHandlers += 1;
+			try {
+				if (
+					messageText.startsWith(appConfig.commandPrefix) &&
+					!isBotPermissionBypassCommand(messageText) &&
+					!permissionStore.canExecute(message.destination)
+				) {
+					await message.send("実行権限がありません。");
+					return;
+				}
+				if (messageText === `${appConfig.commandPrefix}ping` || messageText === `${appConfig.commandPrefix}ping help`) {
+					rankingStore.record(message.destination);
+					if (await handlePing(messageText, message)) return;
+				}
+				if (await handleLineCommand(messageText, message)) return;
+			} catch (error) {
+				if (channel === "square") {
+					recordSquareHandlerDebug(`dispatch error text=${shortDebugText(messageText)} error=${compactError(error)}`);
+				}
+				console.error(`[${channel}:message] handler failed`, error);
+			} finally {
+				const elapsedMs = Date.now() - startedAt;
+				if (elapsedMs >= 1_000 || messageText === `${appConfig.commandPrefix}ping`) {
+					console.log(`[perf] ${channel} !${command} handler=${elapsedMs}ms concurrent=${activeHandlers}`);
+				}
+				activeHandlers -= 1;
+			}
+		}, highPriority ? "high" : "normal");
+	} catch (error) {
+		if (error instanceof ForegroundQueueFullError) {
+			console.warn(`[workload] command queue full channel=${channel} queue=${error.queueLength}`);
+			await message.send("現在BOTが混み合っています。少し待ってからもう一度実行してください。");
 			return;
 		}
-		if (messageText === `${appConfig.commandPrefix}ping` || messageText === `${appConfig.commandPrefix}ping help`) {
-			rankingStore.record(message.destination);
-			if (await handlePing(messageText, message)) return;
-		}
-		if (await handleLineCommand(messageText, message)) return;
-	} catch (error) {
-		if (channel === "square") {
-			recordSquareHandlerDebug(`dispatch error text=${shortDebugText(messageText)} error=${compactError(error)}`);
-		}
-		console.error(`[${channel}:message] handler failed`, error);
-	} finally {
-		const elapsedMs = Date.now() - startedAt;
-		if (elapsedMs >= 1_000 || messageText === `${appConfig.commandPrefix}ping`) {
-			const command = messageText.slice(appConfig.commandPrefix.length).trim().split(/\s+/, 1)[0] || "unknown";
-			console.log(`[perf] ${channel} !${command} handler=${elapsedMs}ms concurrent=${activeHandlers}`);
-		}
-		activeHandlers -= 1;
+		throw error;
 	}
 }
 
@@ -795,7 +822,7 @@ function resolveSquareScope(client: Client, squareChatMid: string, senderMid: st
 			.then((response) => {
 				const member = response.squareMember;
 				if (member.displayName) {
-					senderNames.set(`square:${senderMid}`, member.displayName);
+					rememberSenderName(`square:${senderMid}`, member.displayName);
 					memberNameHistoryStore.record("square", member.squareMid, senderMid, member.displayName);
 					messageLogStore.recordMember({
 						kind: "square",
@@ -865,7 +892,7 @@ function resolveSenderName(
 				.then((response) => response.squareMember.displayName)
 			: client.getUser(mid).then((user) => user.raw.targetProfileDetail.profileName)
 		).then((name) => {
-			if (name) senderNames.set(key, name);
+			if (name) rememberSenderName(key, name);
 			return name || undefined;
 		}).catch((error) => {
 			console.warn(`[ranking] failed to resolve ${kind} name for ${mid}`, error);
@@ -1477,6 +1504,7 @@ async function listenRawTalkEvents(
 			if (nextIndividualRev !== undefined) individualRev = nextIndividualRev;
 
 			const operations = response.operationResponse?.operations ?? [];
+			lineHealth.markSuccess("talk", operations.length);
 			if (operations.length > 0) {
 				console.log(`[perf] talk poll=${Date.now() - pollStartedAt}ms events=${operations.length}`);
 			}
@@ -1486,6 +1514,7 @@ async function listenRawTalkEvents(
 					.catch((error) => handlePollingError("talk", error, onFatal));
 			}
 		} catch (error) {
+			lineHealth.markError("talk", error);
 			if (!signal.aborted && isTalkSyncGoneError(error)) {
 				console.warn("[talk:event] sync cursor was rejected with HTTP 410; resetting revisions");
 				revision = 0;
@@ -1623,9 +1652,13 @@ async function listenRawSquareEvents(
 				continuationToken = undefined;
 			}
 			if (!continuationToken && syncToken) storage.scheduleSquareSyncToken(syncToken);
+			lineHealth.markSuccess("square", events.length);
 		} catch (error) {
-			if (loadedPersistedToken && /ILLEGAL_ARGUMENT|INVALID_ARGUMENT/i.test(compactError(error))) {
-				console.warn("[square:event] persisted sync token was rejected; restarting initial sync");
+			lineHealth.markError("square", error);
+			if (syncToken && /ILLEGAL_ARGUMENT|INVALID_ARGUMENT/i.test(compactError(error))) {
+				console.warn("[square:event] sync token was rejected; restarting initial sync", {
+					persistedOnStartup: loadedPersistedToken,
+				});
 				await storage.clearSquareSyncToken().catch((clearError) => {
 					console.warn("[square:event] failed to clear rejected sync token", clearError);
 				});
@@ -1651,6 +1684,33 @@ async function sleepUntilRetry(ms: number, signal: AbortSignal): Promise<void> {
 	await Promise.race([sleep(ms), waitForAbort(signal)]);
 }
 
+async function superviseOpenChatMemberMessageEvents(
+	client: Client,
+	storage: SyncedLineStorage,
+	signal: AbortSignal,
+	sessionStartedAt: number,
+): Promise<void> {
+	let restartCount = 0;
+	while (!signal.aborted) {
+		try {
+			console.log("[oc-member-message:chat-poll] supervisor started", { restartCount });
+			lineHealth.markHeartbeat("member-message");
+			await listenOpenChatJoinMessageEvents(client, storage, signal, sessionStartedAt);
+			if (signal.aborted) break;
+			throw new Error("OpenChat member-message watcher stopped unexpectedly");
+		} catch (error) {
+			if (signal.aborted) break;
+			restartCount += 1;
+			lineHealth.markError("member-message", error);
+			console.error("[oc-member-message:chat-poll] stopped; restarting", {
+				restartCount,
+				error: compactError(error),
+			});
+			await sleepUntilRetry(appConfig.ocMemberMessageRetryMs, signal);
+		}
+	}
+}
+
 async function runSession(
 	client: Client,
 	storage: SyncedLineStorage,
@@ -1659,6 +1719,7 @@ async function runSession(
 	const profile = await client.getMyProfile();
 	console.log(`[line] logged in as ${profile.displayName} (${profile.mid})`);
 	const sessionStartedAt = Date.now();
+	lineHealth.startSession(sessionStartedAt);
 	await runtimeStore.startSession(sessionStartedAt);
 	try {
 		await client.base.e2ee.getE2EESelfKeyData(profile.mid);
@@ -1690,8 +1751,8 @@ async function runSession(
 	if (appConfig.enableSquare) {
 		void listenRawSquareEvents(client, storage, controller.signal, onFatal, sessionStartedAt)
 			.catch(onFatal);
-		void listenOpenChatJoinMessageEvents(client, storage, controller.signal, sessionStartedAt)
-			.catch((error) => console.error("[oc-member-message:chat-poll] stopped", error));
+		void superviseOpenChatMemberMessageEvents(client, storage, controller.signal, sessionStartedAt)
+			.catch(onFatal);
 	}
 
 	console.log("[app] bot is listening");
@@ -1699,6 +1760,7 @@ async function runSession(
 	const eventLoopMonitor = setInterval(() => {
 		const now = Date.now();
 		const lagMs = Math.max(0, now - eventLoopCheckedAt - 10_000);
+		runtimeWorkload.observeEventLoopLag(lagMs, now);
 		if (lagMs >= 1_000) console.warn(`[perf] event-loop lag=${lagMs}ms`);
 		eventLoopCheckedAt = now;
 	}, 10_000);
@@ -1706,6 +1768,21 @@ async function runSession(
 	const watchdog = setInterval(() => {
 		if (watchdogRunning || controller.signal.aborted) return;
 		watchdogRunning = true;
+		const staleChannels = [
+			...(appConfig.enableTalk && lineHealth.isStale("talk", appConfig.talkPollStaleMs) ? ["talk"] : []),
+			...(appConfig.enableSquare && lineHealth.isStale("square", appConfig.squarePollStaleMs) ? ["square"] : []),
+		];
+		if (staleChannels.length > 0) {
+			const error = new Error(`LINE event polling became stale: ${staleChannels.join(", ")}`);
+			console.error("[line] event polling watchdog restarting session", {
+				staleChannels,
+				talkStaleMs: appConfig.talkPollStaleMs,
+				squareStaleMs: appConfig.squarePollStaleMs,
+			});
+			onFatal(error);
+			watchdogRunning = false;
+			return;
+		}
 		void client.getMyProfile()
 			.catch((error) => {
 				if (isAuthenticationError(error)) onFatal(error);
@@ -1723,8 +1800,15 @@ async function runSession(
 	let nameScanRunning = false;
 	const nameScan = setInterval(() => {
 		if (nameScanRunning || controller.signal.aborted) return;
+		if (!runtimeWorkload.canRunBackground()) {
+			console.log("[name-history] periodic scan deferred for foreground activity");
+			return;
+		}
 		nameScanRunning = true;
-		void memberNameHistoryStore.scanKnownSquareNames(client)
+		void runtimeWorkload.runBackground("member-name-scan", async () => {
+			if (controller.signal.aborted) return;
+			await memberNameHistoryStore.scanKnownSquareNames(client);
+		})
 			.catch((error) => {
 				console.warn("[name-history] periodic scan failed", error);
 			})
@@ -1741,6 +1825,7 @@ async function runSession(
 		clearInterval(nameScan);
 		clearInterval(eventLoopMonitor);
 		controller.abort();
+		lineHealth.endSession();
 		shutdownSignal.removeEventListener("abort", relayShutdown);
 		await runtimeStore.endSession().catch((error) => {
 			console.warn("[runtime] session uptime save failed", error);

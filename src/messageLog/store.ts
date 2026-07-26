@@ -3,6 +3,7 @@ import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import type { LineDestination } from "../commands/shared.js";
 import { appConfig } from "../config.js";
+import { runtimeWorkload, yieldToEventLoop } from "../runtime/workload.js";
 import { githubContentsClient } from "../storage/githubContents.js";
 
 export interface StoredMessageLog {
@@ -1053,10 +1054,12 @@ class MessageLogStore {
 			const manifestChat = this.getOrCreateManifestChat(chat);
 			let part = Math.max(0, ...manifestChat.parts.filter((item) => item.date === date).map((item) => item.part)) + 1;
 			let current: StoredMessageLog[] = [];
+			let currentBytes = bytesOfJson(partFile(chat, date, part, []));
 			const flushPart = async () => {
 				if (current.length === 0) return;
 				const relativePath = relativePartPath(chat, date, part);
 				const file = partFile(chat, date, part, sortMessages(current));
+				const fileBytes = currentBytes;
 				await this.writeLocalJson(relativePath, file);
 				const meta: MessageLogPartMeta = {
 					path: relativePath,
@@ -1065,19 +1068,23 @@ class MessageLogStore {
 					count: file.messages.length,
 					firstCreatedAt: file.messages.at(0)?.createdAt,
 					lastCreatedAt: file.messages.at(-1)?.createdAt,
-					bytes: bytesOfJson(file),
+					bytes: fileBytes,
 				};
 				manifestChat.parts.push(meta);
 				this.pendingRemotePaths.add(relativePath);
 				written += 1;
 				part += 1;
 				current = [];
+				currentBytes = bytesOfJson(partFile(chat, date, part, []));
+				await yieldToEventLoop();
 			};
 			for (const message of sortMessages([...messagesById.values()])) {
-				const candidate = [...current, message];
-				if (current.length > 0 && bytesOfJson(partFile(chat, date, part, candidate)) > appConfig.messageLogPartMaxBytes) {
+				const serializedMessageBytes = bytesOfJson(message);
+				const candidateBytes = serializedMessageBytes + (current.length > 0 ? 1 : 0);
+				if (current.length > 0 && currentBytes + candidateBytes > appConfig.messageLogPartMaxBytes) {
 					await flushPart();
 				}
+				currentBytes += serializedMessageBytes + (current.length > 0 ? 1 : 0);
 				current.push(message);
 			}
 			await flushPart();
@@ -1327,12 +1334,21 @@ class MessageLogStore {
 		this.dirty = true;
 		if (this.autoFlushSuspendCount > 0) return;
 		if (this.saveTimer) return;
-		this.saveTimer = setTimeout(() => {
+		let allowRecentForeground = false;
+		const runAutoFlush = () => {
+			if (!runtimeWorkload.canRunBackground(allowRecentForeground ? 0 : appConfig.backgroundQuietMs)) {
+				allowRecentForeground = true;
+				this.saveTimer = setTimeout(runAutoFlush, appConfig.backgroundRetryMs);
+				return;
+			}
 			this.saveTimer = undefined;
-			void this.flushLocalOnly().catch((error) => {
+			void runtimeWorkload.runBackground("message-log-local-save", async () => {
+				await this.flushLocalOnly();
+			}).catch((error) => {
 				console.error("[message-log] scheduled save failed", error);
 			});
-		}, appConfig.messageLogAutoFlushMs);
+		};
+		this.saveTimer = setTimeout(runAutoFlush, appConfig.messageLogAutoFlushMs);
 	}
 }
 

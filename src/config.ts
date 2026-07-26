@@ -1,4 +1,4 @@
-import path from "node:path";
+﻿import path from "node:path";
 import { config as loadEnv } from "dotenv";
 
 loadEnv();
@@ -9,6 +9,20 @@ function boolEnv(name: string, fallback: boolean): boolean {
 	const value = process.env[name];
 	if (value === undefined || value === "") return fallback;
 	return ["1", "true", "yes", "on"].includes(value.toLowerCase());
+}
+
+function numberEnv(
+	name: string,
+	fallback: number,
+	options: { min?: number; max?: number; integer?: boolean } = {},
+): number {
+	const raw = process.env[name];
+	const parsed = raw === undefined || raw.trim() === "" ? Number.NaN : Number(raw);
+	let value = Number.isFinite(parsed) ? parsed : fallback;
+	if (options.integer) value = Math.floor(value);
+	if (options.min !== undefined) value = Math.max(options.min, value);
+	if (options.max !== undefined) value = Math.min(options.max, value);
+	return value;
 }
 
 function requiredEnv(name: string): string {
@@ -46,6 +60,18 @@ export const appConfig = {
 	forceLogin: boolEnv("LINE_FORCE_LOGIN", false),
 	e2eeLogin: boolEnv("LINE_E2EE_LOGIN", true),
 	commandPrefix: process.env.COMMAND_PREFIX || "!",
+	commandMaxConcurrency: numberEnv("COMMAND_MAX_CONCURRENCY", 2, { min: 1, max: 4, integer: true }),
+	commandQueueLimit: numberEnv("COMMAND_QUEUE_LIMIT", 30, { min: 5, max: 100, integer: true }),
+	backgroundQuietMs: numberEnv("BACKGROUND_QUIET_MS", 15_000, { min: 0, integer: true }),
+	backgroundRetryMs: numberEnv("BACKGROUND_RETRY_MS", 10_000, { min: 1_000, integer: true }),
+	backgroundMaxEventLoopLagMs: numberEnv("BACKGROUND_MAX_EVENT_LOOP_LAG_MS", 250, {
+		min: 50,
+		integer: true,
+	}),
+	backgroundLagCooldownMs: numberEnv("BACKGROUND_LAG_COOLDOWN_MS", 30_000, {
+		min: 5_000,
+		integer: true,
+	}),
 	enableTalk: boolEnv("ENABLE_TALK", true),
 	enableSquare: boolEnv("ENABLE_SQUARE", true),
 	port: Number(process.env.PORT || process.env.EVENT_UPDATE_PORT || 3000),
@@ -67,6 +93,9 @@ export const appConfig = {
 	authWatchdogMs: Number(process.env.LINE_AUTH_WATCHDOG_MS || 60_000),
 	talkPollTimeoutMs: Number(process.env.LINE_TALK_POLL_TIMEOUT_MS || 5_000),
 	talkPollIntervalMs: Number(process.env.LINE_TALK_POLL_INTERVAL_MS || 250),
+	talkPollStaleMs: Number(process.env.LINE_TALK_POLL_STALE_MS || 90_000),
+	squarePollStaleMs: Number(process.env.LINE_SQUARE_POLL_STALE_MS || 120_000),
+	ocMemberMessageRetryMs: Number(process.env.OC_MEMBER_MESSAGE_RETRY_MS || 5_000),
 	eventPushSubscriptionsFile: path.resolve(
 		process.env.EVENT_PUSH_SUBSCRIPTIONS_FILE || "./storage/event-push-subscriptions.json",
 	),
@@ -87,6 +116,7 @@ export const appConfig = {
 	pushReminderIntervalMs: Number(process.env.PUSH_REMINDER_INTERVAL_MS || 10_000),
 	rankingFile: path.resolve(process.env.RANKING_FILE || "./storage/ranking.json"),
 	rankingGithubPath: process.env.RANKING_GITHUB_PATH || "stats/ranking.json",
+	rankingSaveDelayMs: numberEnv("RANKING_SAVE_DELAY_MS", 60_000, { min: 5_000, integer: true }),
 	botStatusFile: path.resolve(process.env.BOT_STATUS_FILE || "./storage/bot-status.json"),
 	botStatusGithubPath: process.env.BOT_STATUS_GITHUB_PATH || "stats/bot-status.json",
 	permissionsFile: path.resolve(process.env.PERMISSIONS_FILE || "./storage/permissions.json"),
@@ -103,6 +133,10 @@ export const appConfig = {
 	),
 	ocMemberActivityGithubPath:
 		process.env.OC_MEMBER_ACTIVITY_GITHUB_PATH || "moderation/oc-member-activity.json",
+	ocMemberActivitySaveDelayMs: numberEnv("OC_MEMBER_ACTIVITY_SAVE_DELAY_MS", 30_000, {
+		min: 5_000,
+		integer: true,
+	}),
 	ocModerationCasesFile: path.resolve(
 		process.env.OC_MODERATION_CASES_FILE || "./storage/oc-moderation-cases.json",
 	),
@@ -117,6 +151,10 @@ export const appConfig = {
 	ocMediaBurstLimit: Number(process.env.OC_MEDIA_BURST_LIMIT || 7),
 	memberNameHistoryFile: path.resolve(process.env.MEMBER_NAME_HISTORY_FILE || "./storage/member-name-history.json"),
 	memberNameHistoryGithubPath: process.env.MEMBER_NAME_HISTORY_GITHUB_PATH || "logs/member-name-history.json",
+	memberNameHistorySaveDelayMs: numberEnv("MEMBER_NAME_HISTORY_SAVE_DELAY_MS", 60_000, {
+		min: 5_000,
+		integer: true,
+	}),
 	memberNameScanIntervalMs: Number(process.env.MEMBER_NAME_SCAN_INTERVAL_MS || 30 * 60_000),
 	messageLogFile: path.resolve(process.env.MESSAGE_LOG_FILE || "./storage/message-log.json"),
 	messageLogDir: path.resolve(process.env.MESSAGE_LOG_DIR || "./storage/message-log"),

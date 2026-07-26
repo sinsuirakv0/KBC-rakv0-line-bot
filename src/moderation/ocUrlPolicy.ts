@@ -1,4 +1,4 @@
-export type OcUrlRuleScope = "exact" | "path" | "prefix" | "domain";
+﻿export type OcUrlRuleScope = "exact" | "path" | "prefix" | "domain";
 export type OcUrlBlockedComponent = "scheme" | "domain" | "path" | "parameter";
 
 export interface ParsedOcUrl {

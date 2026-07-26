@@ -1,8 +1,9 @@
-import fs from "node:fs/promises";
+﻿import fs from "node:fs/promises";
 import path from "node:path";
 import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
 import { githubContentsClient } from "../storage/githubContents.js";
+import { runtimeWorkload, yieldToEventLoop } from "../runtime/workload.js";
 
 type NameHistoryKind = "talk" | "square";
 
@@ -33,7 +34,6 @@ export interface NameHistoryEntry {
 }
 
 const EMPTY_HISTORY: NameHistoryFile = { version: 1, users: [] };
-const SAVE_DELAY_MS = 10_000;
 let lastParseDroppedEntries = 0;
 
 function keyOf(value: Pick<StoredUser, "kind" | "scopeMid" | "mid">): string {
@@ -90,6 +90,7 @@ function parseHistory(value: unknown): NameHistoryFile {
 
 class MemberNameHistoryStore {
 	private data: NameHistoryFile = structuredClone(EMPTY_HISTORY);
+	private readonly usersByKey = new Map<string, StoredUser>();
 	private githubSha: string | undefined;
 	private saveTimer: NodeJS.Timeout | undefined;
 	private saveQueue: Promise<void> = Promise.resolve();
@@ -102,6 +103,7 @@ class MemberNameHistoryStore {
 				const remote = await githubContentsClient.read(appConfig.memberNameHistoryGithubPath);
 				if (remote) {
 					this.data = parseHistory(JSON.parse(remote.content));
+					this.rebuildUserIndex();
 					this.githubSha = remote.sha;
 					if (lastParseDroppedEntries > 0) this.dirty = true;
 					await this.writeLocal();
@@ -114,6 +116,7 @@ class MemberNameHistoryStore {
 		}
 		try {
 			this.data = parseHistory(JSON.parse(await fs.readFile(appConfig.memberNameHistoryFile, "utf8")));
+			this.rebuildUserIndex();
 			if (lastParseDroppedEntries > 0) this.dirty = true;
 		} catch {
 			await this.writeLocal();
@@ -131,10 +134,12 @@ class MemberNameHistoryStore {
 		const normalizedName = cleanStoredName(name);
 		if (!normalizedName || !mid || !scopeMid) return;
 		const seenIso = nowIso(seenAt);
-		let user = this.data.users.find((item) => keyOf(item) === `${kind}:${scopeMid}:${mid}`);
+		const userKey = `${kind}:${scopeMid}:${mid}`;
+		let user = this.usersByKey.get(userKey);
 		if (!user) {
 			user = { kind, scopeMid, mid, names: [] };
 			this.data.users.push(user);
+			this.usersByKey.set(userKey, user);
 		}
 		const entry = user.names.find((item) => item.name === normalizedName);
 		if (entry) {
@@ -153,7 +158,7 @@ class MemberNameHistoryStore {
 	}
 
 	get(kind: NameHistoryKind, scopeMid: string, mid: string): NameHistoryEntry[] {
-		const user = this.data.users.find((item) => keyOf(item) === `${kind}:${scopeMid}:${mid}`);
+		const user = this.usersByKey.get(`${kind}:${scopeMid}:${mid}`);
 		return [...(user?.names ?? [])]
 			.sort((left, right) => right.lastSeenAt.localeCompare(left.lastSeenAt))
 			.map((entry) => ({ ...entry }));
@@ -169,6 +174,10 @@ class MemberNameHistoryStore {
 		for (const squareMid of this.squareScopeMids()) {
 			let continuationToken: string | undefined;
 			for (let page = 0; page < 20; page++) {
+				if (!runtimeWorkload.canRunBackground()) {
+					console.log("[name-history] scan paused for foreground activity", { squareMid, page });
+					return;
+				}
 				const response = await client.base.square.searchSquareMembers({
 					request: {
 						squareMid,
@@ -192,6 +201,7 @@ class MemberNameHistoryStore {
 				}
 				continuationToken = response.continuationToken || undefined;
 				if (!continuationToken || response.members.length === 0) break;
+				await yieldToEventLoop();
 			}
 		}
 	}
@@ -227,15 +237,24 @@ class MemberNameHistoryStore {
 		await operation;
 	}
 
-	private scheduleSave(): void {
+	private scheduleSave(
+		delayMs = appConfig.memberNameHistorySaveDelayMs,
+		allowRecentForeground = false,
+	): void {
 		this.dirty = true;
 		if (this.saveTimer) return;
 		this.saveTimer = setTimeout(() => {
 			this.saveTimer = undefined;
-			void this.flush().catch((error) => {
+			if (!runtimeWorkload.canRunBackground(allowRecentForeground ? 0 : appConfig.backgroundQuietMs)) {
+				this.scheduleSave(appConfig.backgroundRetryMs, true);
+				return;
+			}
+			void runtimeWorkload.runBackground("member-name-save", async () => {
+				await this.flush();
+			}).catch((error) => {
 				console.error("[name-history] scheduled save failed", error);
 			});
-		}, SAVE_DELAY_MS);
+		}, delayMs);
 	}
 
 	private normalizeData(): number {
@@ -275,8 +294,16 @@ class MemberNameHistoryStore {
 			}
 			normalizedUsers.push({ ...user, names: [...namesByName.values()] });
 		}
-		if (changed > 0) this.data.users = normalizedUsers;
+		if (changed > 0) {
+			this.data.users = normalizedUsers;
+			this.rebuildUserIndex();
+		}
 		return changed;
+	}
+
+	private rebuildUserIndex(): void {
+		this.usersByKey.clear();
+		for (const user of this.data.users) this.usersByKey.set(keyOf(user), user);
 	}
 
 	private async writeLocal(value: NameHistoryFile = this.data): Promise<void> {

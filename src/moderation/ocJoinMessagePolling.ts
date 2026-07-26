@@ -1,6 +1,7 @@
 ﻿import type { Client } from "@evex/linejs";
 import type { SyncedLineStorage } from "../storage/lineStorage.js";
 import { permissionStore } from "../permissions/store.js";
+import { lineHealth } from "../runtime/lineHealth.js";
 import { handleOpenChatJoinEventMessage, handleOpenChatLeaveEventMessage } from "./ocJoinMessage.js";
 import { ocModerationSettingsStore, type OcMemberMessageSetting } from "./ocModerationSettings.js";
 
@@ -24,7 +25,8 @@ interface WatchedMemberMessageChat {
 
 const POLLING_INTERVAL_MS = 1_000;
 const ERROR_RETRY_MS = 30_000;
-const MAX_CATCH_UP_PAGES = 100;
+// 1つのOCの過去イベント取得で、他のOCの参加通知監視を止めない。
+const MAX_CATCH_UP_PAGES_PER_TURN = 3;
 
 function rawObject(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value)
@@ -54,11 +56,11 @@ function isChatMemberUpdateEvent(event: RawSquareEvent): boolean {
 }
 
 function isJoinedState(value: unknown): boolean {
-	return value === 1 || value === "JOINED";
+	return Number(value) === 1 || String(value ?? "").trim().toUpperCase() === "JOINED";
 }
 
 function isLeftState(value: unknown): boolean {
-	return value === 4 || value === "LEFT";
+	return Number(value) === 4 || String(value ?? "").trim().toUpperCase() === "LEFT";
 }
 
 function compactError(error: unknown): string {
@@ -211,7 +213,7 @@ async function pollChat(
 	state: ChatPollingState,
 ): Promise<void> {
 	if (Date.now() < state.retryAfter) return;
-	for (let page = 0; page < MAX_CATCH_UP_PAGES; page++) {
+	for (let page = 0; page < MAX_CATCH_UP_PAGES_PER_TURN; page++) {
 		const previousSyncToken = state.syncToken;
 		try {
 			const response = await client.base.square.fetchSquareChatEvents({
@@ -223,6 +225,7 @@ async function pollChat(
 			} as never);
 			state.syncToken = response.syncToken || state.syncToken;
 			const events = (response.events ?? []) as unknown as RawSquareEvent[];
+			lineHealth.markSuccess("member-message", events.length);
 			for (const event of events) {
 				await handleMemberMessageEvent(client, setting, event, state.ignoreBefore);
 			}
@@ -231,6 +234,7 @@ async function pollChat(
 				return;
 			}
 		} catch (error) {
+			lineHealth.markError("member-message", error);
 			const detail = compactError(error);
 			if (state.syncToken && /ILLEGAL_ARGUMENT|INVALID_ARGUMENT/i.test(detail)) {
 				console.warn("[oc-member-message:chat-poll] saved sync token rejected", {
@@ -248,8 +252,9 @@ async function pollChat(
 			return;
 		}
 	}
-	console.warn("[oc-member-message:chat-poll] catch-up page limit reached", {
+	console.log("[oc-member-message:chat-poll] catch-up will continue on the next turn", {
 		squareChatMid: setting.squareChatMid,
+		pages: MAX_CATCH_UP_PAGES_PER_TURN,
 	});
 }
 
@@ -282,6 +287,7 @@ export async function listenOpenChatJoinMessageEvents(
 ): Promise<void> {
 	const states = new Map<string, ChatPollingState>();
 	while (!signal.aborted) {
+		lineHealth.markHeartbeat("member-message");
 		const settings = mergeMemberMessageSettings();
 		const activeChatMids = new Set(settings.map((setting) => setting.squareChatMid));
 		for (const [squareChatMid] of states) {

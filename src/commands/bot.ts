@@ -16,6 +16,9 @@ import {
 	type PermissionRole,
 } from "../permissions/store.js";
 import { runtimeStore } from "../runtime/store.js";
+import { lineHealth, type LineHealthChannelSnapshot } from "../runtime/lineHealth.js";
+import { runtimeWorkload } from "../runtime/workload.js";
+import { githubContentsClient } from "../storage/githubContents.js";
 import { argValue, parseTarget, targetLabel } from "./permissionArgs.js";
 import type { LineCommand, LineDestination } from "./shared.js";
 
@@ -82,6 +85,22 @@ function formatDuration(ms: number): string {
 	if (minutes > 0) parts.push(`${minutes}分`);
 	if (seconds > 0 || parts.length === 0) parts.push(`${seconds}秒`);
 	return parts.join("");
+}
+
+function formatReceiverHealth(health: LineHealthChannelSnapshot, now = Date.now()): string {
+	const responded = health.lastSuccessAt === undefined
+		? "未確認"
+		: `${formatDuration(Math.max(0, now - health.lastSuccessAt))}前`;
+	const error = health.consecutiveFailures > 0 ? ` / 連続失敗 ${health.consecutiveFailures}` : "";
+	return `最終応答 ${responded}${error}`;
+}
+
+function formatMemberMessageHealth(health: LineHealthChannelSnapshot, now = Date.now()): string {
+	const active = health.lastHeartbeatAt === undefined
+		? "未確認"
+		: `${formatDuration(Math.max(0, now - health.lastHeartbeatAt))}前`;
+	const error = health.consecutiveFailures > 0 ? ` / 連続失敗 ${health.consecutiveFailures}` : "";
+	return `最終監視 ${active}${error}`;
 }
 
 function formatBytes(bytes: number): string {
@@ -646,6 +665,8 @@ export const botCommand: LineCommand = {
 		}
 
 		const status = runtimeStore.snapshot();
+		const receiverHealth = lineHealth.snapshot();
+		const workload = runtimeWorkload.snapshot();
 		const stopTarget = botStopTargetFromDestination(message.destination);
 		const stopStatus = permissionStore.botStopStatus(stopTarget);
 		await message.send([
@@ -658,6 +679,14 @@ export const botCommand: LineCommand = {
 			`メモリ使用率: ${(status.systemUsedRatio * 100).toFixed(1)}%`,
 			`プロセスRSS: ${formatBytes(status.rssBytes)}`,
 			`ヒープ: ${formatBytes(status.heapUsedBytes)} / ${formatBytes(status.heapTotalBytes)}`,
+			`Talk受信: ${formatReceiverHealth(receiverHealth.talk)}`,
+			`OC受信: ${formatReceiverHealth(receiverHealth.square)}`,
+			`参加/退出通知監視: ${formatMemberMessageHealth(receiverHealth.memberMessage)}`,
+			`このプロセスの再ログイン回数: ${Math.max(0, receiverHealth.sessionStarts - 1)}`,
+			`コマンド処理: ${workload.activeForeground}/${workload.maxForeground} / 待機 ${workload.queuedForeground}`,
+			`背景処理: ${workload.activeBackground ?? "なし"} / 待機 ${workload.queuedBackground}`,
+			`直近イベントループ遅延: ${Math.round(workload.lastEventLoopLagMs)}ms`,
+			`GitHub書き込み待機: ${githubContentsClient.pendingMutationCount}`,
 		].join("\n"));
 	},
 };

@@ -1,6 +1,7 @@
 ﻿import fs from "node:fs/promises";
 import path from "node:path";
 import { appConfig } from "../config.js";
+import { runtimeWorkload } from "../runtime/workload.js";
 import { githubContentsClient } from "../storage/githubContents.js";
 
 export interface OcMemberActivity {
@@ -62,8 +63,8 @@ interface OcMemberActivityFile {
 }
 
 const EMPTY_ACTIVITY: OcMemberActivityFile = { version: 1, activities: [] };
-const SAVE_DELAY_MS = 5_000;
 const MAX_ACTIVITIES = 10_000;
+const ACTIVITY_TRIM_BUFFER = 100;
 
 function nowIso(): string {
 	return new Date().toISOString();
@@ -144,6 +145,7 @@ function removeValue(list: string[], value: string | undefined): string[] {
 
 class OcMemberActivityStore {
 	private data: OcMemberActivityFile = structuredClone(EMPTY_ACTIVITY);
+	private readonly activitiesByKey = new Map<string, OcMemberActivity>();
 	private githubSha: string | undefined;
 	private saveTimer: NodeJS.Timeout | undefined;
 	private saveQueue: Promise<void> = Promise.resolve();
@@ -156,6 +158,7 @@ class OcMemberActivityStore {
 				const remote = await githubContentsClient.read(appConfig.ocMemberActivityGithubPath);
 				if (remote) {
 					this.data = parseActivity(JSON.parse(remote.content));
+					this.rebuildIndex();
 					this.githubSha = remote.sha;
 					await this.writeLocal();
 					console.log(`[oc-activity] loaded ${this.data.activities.length} activity record(s) from GitHub`);
@@ -170,11 +173,12 @@ class OcMemberActivityStore {
 		} catch {
 			await this.writeLocal();
 		}
+		this.rebuildIndex();
 		console.log(`[oc-activity] loaded ${this.data.activities.length} activity record(s)`);
 	}
 
 	snapshot(squareMid: string, memberMid: string): OcMemberActivity | undefined {
-		const activity = this.data.activities.find((item) => item.squareMid === squareMid && item.memberMid === memberMid);
+		const activity = this.activitiesByKey.get(activityKey(squareMid, memberMid));
 		return activity ? structuredClone(activity) : undefined;
 	}
 
@@ -285,7 +289,7 @@ class OcMemberActivityStore {
 
 	markCohort(squareMid: string, memberMids: string[], cohortId: string, watchUntil: string): void {
 		for (const memberMid of memberMids) {
-			const activity = this.data.activities.find((item) => item.squareMid === squareMid && item.memberMid === memberMid);
+			const activity = this.activitiesByKey.get(activityKey(squareMid, memberMid));
 			if (!activity) continue;
 			activity.watchCohortId = cohortId;
 			activity.watchUntil = watchUntil;
@@ -295,14 +299,14 @@ class OcMemberActivityStore {
 	}
 
 	cohortWatch(squareMid: string, memberMid: string): { cohortId: string; watchUntil: string } | undefined {
-		const activity = this.data.activities.find((item) => item.squareMid === squareMid && item.memberMid === memberMid);
+		const activity = this.activitiesByKey.get(activityKey(squareMid, memberMid));
 		if (!activity?.watchCohortId || !activity.watchUntil) return undefined;
 		if ((millisFromIso(activity.watchUntil) ?? 0) <= Date.now()) return undefined;
 		return { cohortId: activity.watchCohortId, watchUntil: activity.watchUntil };
 	}
 
 	rememberCohortReason(squareMid: string, memberMid: string, reason: string): boolean {
-		const activity = this.data.activities.find((item) => item.squareMid === squareMid && item.memberMid === memberMid);
+		const activity = this.activitiesByKey.get(activityKey(squareMid, memberMid));
 		if (!activity) return false;
 		if (activity.loggedCohortReasons.includes(reason)) return false;
 		activity.loggedCohortReasons.push(reason);
@@ -342,9 +346,8 @@ class OcMemberActivityStore {
 	}
 
 	private ensureActivity(squareMid: string, memberMid: string, at: string): OcMemberActivity {
-		let activity = this.data.activities.find((item) =>
-			item.squareMid === squareMid && item.memberMid === memberMid
-		);
+		const key = activityKey(squareMid, memberMid);
+		let activity = this.activitiesByKey.get(key);
 		if (!activity) {
 			activity = {
 				squareMid,
@@ -359,25 +362,44 @@ class OcMemberActivityStore {
 				updatedAt: nowIso(),
 			};
 			this.data.activities.push(activity);
+			this.activitiesByKey.set(key, activity);
+			this.trim();
 		}
 		return activity;
 	}
 
 	private trim(): void {
-		if (this.data.activities.length <= MAX_ACTIVITIES) return;
+		if (this.data.activities.length <= MAX_ACTIVITIES + ACTIVITY_TRIM_BUFFER) return;
 		this.data.activities.sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
 		this.data.activities = this.data.activities.slice(-MAX_ACTIVITIES);
+		this.rebuildIndex();
 	}
 
-	private scheduleSave(): void {
+	private rebuildIndex(): void {
+		this.activitiesByKey.clear();
+		for (const activity of this.data.activities) {
+			this.activitiesByKey.set(activityKey(activity.squareMid, activity.memberMid), activity);
+		}
+	}
+
+	private scheduleSave(
+		delayMs = appConfig.ocMemberActivitySaveDelayMs,
+		allowRecentForeground = false,
+	): void {
 		this.dirty = true;
 		if (this.saveTimer) return;
 		this.saveTimer = setTimeout(() => {
 			this.saveTimer = undefined;
-			void this.flush().catch((error) => {
+			if (!runtimeWorkload.canRunBackground(allowRecentForeground ? 0 : appConfig.backgroundQuietMs)) {
+				this.scheduleSave(appConfig.backgroundRetryMs, true);
+				return;
+			}
+			void runtimeWorkload.runBackground("oc-member-activity-save", async () => {
+				await this.flush();
+			}).catch((error) => {
 				console.error("[oc-activity] scheduled save failed", error);
 			});
-		}, SAVE_DELAY_MS);
+		}, delayMs);
 	}
 
 	private async writeLocal(value: OcMemberActivityFile = this.data): Promise<void> {

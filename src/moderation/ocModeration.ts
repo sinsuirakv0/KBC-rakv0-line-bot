@@ -109,6 +109,9 @@ const COHORT_JOIN_WINDOW_MS = 2 * 60_000;
 const COHORT_MIN_MEMBERS = 3;
 const COHORT_WATCH_MS = 30 * 60_000;
 const ROLE_CACHE_MS = 5 * 60_000;
+const MEMBER_CACHE_MAX = 5_000;
+const MEMBER_CACHE_RETAIN = 4_000;
+const LOGGED_COHORTS_MAX = 2_000;
 const POST_NOTIFICATION_SKIP_TYPES = new Set<string>([
 	"3",
 	"4",
@@ -625,6 +628,18 @@ function cleanDisplayName(value: string | undefined): string | undefined {
 	return trimmed.slice(0, 40);
 }
 
+function pruneMemberCache(now = Date.now()): void {
+	if (memberCache.size <= MEMBER_CACHE_MAX) return;
+	for (const [mid, cached] of memberCache) {
+		if (cached.expiresAt <= now) memberCache.delete(mid);
+	}
+	while (memberCache.size > MEMBER_CACHE_RETAIN) {
+		const oldestMid = memberCache.keys().next().value as string | undefined;
+		if (!oldestMid) break;
+		memberCache.delete(oldestMid);
+	}
+}
+
 async function getSquareMemberSummary(client: Client, senderMid: string): Promise<SquareMemberSummary> {
 	const cached = memberCache.get(senderMid);
 	if (cached && cached.expiresAt > Date.now()) return cached.summary;
@@ -634,6 +649,7 @@ async function getSquareMemberSummary(client: Client, senderMid: string): Promis
 		displayName: cleanDisplayName(response.squareMember.displayName),
 	};
 	memberCache.set(senderMid, { summary, expiresAt: Date.now() + ROLE_CACHE_MS });
+	pruneMemberCache();
 	return summary;
 }
 
@@ -1207,6 +1223,10 @@ async function maybeStartJoinCohortWatch(event: OpenChatMemberJoinEvent): Promis
 	const cohortKey = `${event.squareMid}:${bucket}`;
 	if (loggedCohorts.has(cohortKey)) return;
 	loggedCohorts.add(cohortKey);
+	if (loggedCohorts.size > LOGGED_COHORTS_MAX) {
+		const oldestKey = loggedCohorts.values().next().value as string | undefined;
+		if (oldestKey) loggedCohorts.delete(oldestKey);
+	}
 	const cohortId = `${bucket.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 	const watchUntil = new Date(now + COHORT_WATCH_MS).toISOString();
 	ocMemberActivityStore.markCohort(event.squareMid, recent.map((item) => item.memberMid), cohortId, watchUntil);

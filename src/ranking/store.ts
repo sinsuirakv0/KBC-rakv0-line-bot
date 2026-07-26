@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { LineDestination } from "../commands/shared.js";
 import { appConfig } from "../config.js";
+import { runtimeWorkload } from "../runtime/workload.js";
 import { githubContentsClient } from "../storage/githubContents.js";
 
 interface RankingUser {
@@ -30,7 +31,6 @@ export interface RankingSnapshot {
 }
 
 const EMPTY_RANKING: RankingFile = { version: 1, totalCommands: 0, scopes: [] };
-const SAVE_DELAY_MS = 10_000;
 
 function scopeKey(value: Pick<LineDestination, "kind" | "scopeMid">): string {
 	return `${value.kind}:${value.scopeMid}`;
@@ -183,15 +183,24 @@ class RankingStore {
 		return scope;
 	}
 
-	private scheduleSave(): void {
+	private scheduleSave(
+		delayMs = appConfig.rankingSaveDelayMs,
+		allowRecentForeground = false,
+	): void {
 		this.dirty = true;
 		if (this.saveTimer) return;
 		this.saveTimer = setTimeout(() => {
 			this.saveTimer = undefined;
-			void this.flush().catch((error) => {
+			if (!runtimeWorkload.canRunBackground(allowRecentForeground ? 0 : appConfig.backgroundQuietMs)) {
+				this.scheduleSave(appConfig.backgroundRetryMs, true);
+				return;
+			}
+			void runtimeWorkload.runBackground("ranking-save", async () => {
+				await this.flush();
+			}).catch((error) => {
 				console.error("[ranking] scheduled save failed", error);
 			});
-		}, SAVE_DELAY_MS);
+		}, delayMs);
 	}
 
 	private async writeLocal(value: RankingFile = this.data): Promise<void> {
