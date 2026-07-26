@@ -1,58 +1,20 @@
 ﻿import type { Client } from "@evex/linejs";
 import type { LineCommand, LineDestination } from "./shared.js";
 import { sendLong } from "./shared.js";
+import { startMemberEventBackfill } from "../memberEventLog/backfill.js";
+import { memberEventLogStore } from "../memberEventLog/store.js";
+import {
+	permissionDeniedText,
+	permissionStore,
+	targetFromDestination,
+} from "../permissions/store.js";
 
 interface MemberInfo {
 	mid: string;
 	name: string;
 }
 
-interface OldSearchEvent {
-	type?: string | number;
-	payload?: {
-		receiveMessage?: OldSearchMessagePayload;
-		sendMessage?: OldSearchMessagePayload;
-		notifiedCreateSquareMember?: { squareMember?: OldSearchSquareMember };
-		notifiedCreateSquareChatMember?: {
-			chatMember?: { squareMemberMid?: string };
-			peerSquareMember?: OldSearchSquareMember;
-		};
-		notifiedJoinSquareChat?: { joinedMember?: OldSearchSquareMember };
-		notifiedLeaveSquareChat?: { squareMember?: OldSearchSquareMember; squareMemberMid?: string };
-		notifiedKickoutFromSquare?: { kickees?: OldSearchSquareMember[] };
-		notifiedUpdateSquareMemberProfile?: { squareMember?: OldSearchSquareMember };
-		notifiedUpdateSquareMember?: { squareMember?: OldSearchSquareMember };
-		notificationMessage?: OldSearchMessagePayload;
-	};
-}
-
 type OldSearchMembershipState = "LEFT" | "KICK_OUT" | "BANNED" | "JOINED";
-
-interface OldSearchSquareMember {
-	squareMemberMid?: string;
-	displayName?: string;
-}
-
-interface OldSearchMessagePayload {
-	senderDisplayName?: string;
-	squareMessage?: {
-		message?: {
-			from?: string;
-			text?: string;
-		};
-	};
-}
-
-interface FetchSquareChatEventsOptions {
-	squareChatMid: string;
-	threadMid?: string;
-	syncToken?: string;
-	continuationToken?: string;
-	limit?: number;
-	direction?: "FORWARD" | "BACKWARD";
-	inclusive?: "NONE" | "ON" | "OFF";
-	fetchType?: "DEFAULT" | "PREFETCH_BY_SERVER" | "PREFETCH_BY_CLIENT";
-}
 
 class DebugLog {
 	private readonly lines: string[] = [];
@@ -86,25 +48,6 @@ class DebugLog {
 	}
 }
 
-function eventTypeName(event: OldSearchEvent): string {
-	if (typeof event.type === "string" || typeof event.type === "number") return String(event.type);
-	const payload = event.payload ?? {};
-	const keys = Object.keys(payload).filter((key) => (payload as Record<string, unknown>)[key] !== undefined);
-	return keys.join("+") || "(typeなし)";
-}
-
-function eventTypeSummary(events: OldSearchEvent[]): string {
-	const counts = new Map<string, number>();
-	for (const event of events) {
-		const type = eventTypeName(event);
-		counts.set(type, (counts.get(type) ?? 0) + 1);
-	}
-	return [...counts.entries()]
-		.sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
-		.map(([type, count]) => `${type}:${count}`)
-		.join(", ") || "(イベントなし)";
-}
-
 function normalizeText(value: string): string {
 	return value.normalize("NFKC").toLowerCase();
 }
@@ -115,29 +58,6 @@ function cleanDisplayName(value: string | undefined): string | undefined {
 	if (["(名前なし)", "名前なし", "名前不明", "(取得失敗)", "取得失敗"].includes(trimmed)) return undefined;
 	if (/^[\p{C}\s]+$/u.test(trimmed)) return undefined;
 	return trimmed;
-}
-
-function eventMessagePayload(event: OldSearchEvent): OldSearchMessagePayload | undefined {
-	return event.payload?.receiveMessage ?? event.payload?.sendMessage ?? event.payload?.notificationMessage;
-}
-
-function notificationTextFromEvent(event: OldSearchEvent): string | undefined {
-	return event.payload?.notificationMessage?.squareMessage?.message?.text?.replace(/\s+/g, " ").trim();
-}
-
-function nameFromLeaveNotification(event: OldSearchEvent): string | undefined {
-	const text = notificationTextFromEvent(event);
-	if (!text) return undefined;
-	for (const pattern of [
-		/^(.+?)(?:さん)?が(?:退会|退出|退室)しました[。.]?$/,
-		/^(.+?)(?:さん)?が(?:トーク|OpenChat|オープンチャット)から(?:退会|退出|退室)しました[。.]?$/,
-		/^(.+?) left (?:the )?(?:chat|openchat|open chat)[.]?$/i,
-		/^(.+?) has left (?:the )?(?:chat|openchat|open chat)[.]?$/i,
-	]) {
-		const name = cleanDisplayName(text.match(pattern)?.[1]);
-		if (name) return name;
-	}
-	return undefined;
 }
 
 function compactSearchText(value: string): string {
@@ -166,13 +86,6 @@ function looseNameMatches(name: string, query: string): boolean {
 	if (compactName.includes(compactQuery)) return true;
 	if (compactName.length >= 2 && compactQuery.includes(compactName)) return true;
 	return compactQuery.length >= 2 && isSubsequence(compactQuery, compactName);
-}
-
-async function fetchSquareChatEvents(
-	client: Client,
-	options: FetchSquareChatEventsOptions,
-) {
-	return await client.base.square.fetchSquareChatEvents(options as never);
 }
 
 function userNameFromRaw(raw: unknown): string | undefined {
@@ -370,138 +283,6 @@ async function searchJoinedSquareMembers(
 	return [...found.values()];
 }
 
-function eventMember(event: OldSearchEvent): MemberInfo | undefined {
-	const memberPayload =
-		event.payload?.notifiedCreateSquareMember?.squareMember ??
-		event.payload?.notifiedCreateSquareChatMember?.peerSquareMember ??
-		event.payload?.notifiedJoinSquareChat?.joinedMember ??
-		event.payload?.notifiedLeaveSquareChat?.squareMember ??
-		event.payload?.notifiedKickoutFromSquare?.kickees?.[0] ??
-		event.payload?.notifiedUpdateSquareMemberProfile?.squareMember ??
-		event.payload?.notifiedUpdateSquareMember?.squareMember;
-	if (memberPayload?.squareMemberMid?.startsWith("p")) {
-		return {
-			mid: memberPayload.squareMemberMid,
-			name: cleanDisplayName(memberPayload.displayName) ?? memberPayload.squareMemberMid,
-		};
-	}
-
-	const chatMemberMid = event.payload?.notifiedCreateSquareChatMember?.chatMember?.squareMemberMid;
-	if (chatMemberMid?.startsWith("p")) {
-		return {
-			mid: chatMemberMid,
-			name: cleanDisplayName(memberPayload?.displayName) ?? chatMemberMid,
-		};
-	}
-
-	const leftMemberMid = event.payload?.notifiedLeaveSquareChat?.squareMemberMid;
-	if (leftMemberMid?.startsWith("p")) {
-		return {
-			mid: leftMemberMid,
-			name: nameFromLeaveNotification(event) ?? leftMemberMid,
-		};
-	}
-
-	const payload = eventMessagePayload(event);
-	const mid = payload?.squareMessage?.message?.from;
-	if (!mid?.startsWith("p")) return undefined;
-	return {
-		mid,
-		name: cleanDisplayName(payload?.senderDisplayName) ?? mid,
-	};
-}
-
-async function searchOldSquareHistory(
-	client: Client,
-	destination: LineDestination,
-	query: string,
-	mentionedMid?: string,
-	debug?: DebugLog,
-): Promise<MemberInfo | undefined> {
-	if (destination.kind !== "square") {
-		throw new Error("old検索はOpenChatでのみ使用できます");
-	}
-	const normalizedQuery = normalizeText(query);
-	let continuationToken: string | undefined;
-	let syncToken: string | undefined;
-	const seen = new Set<string>();
-	const maxPages = 40;
-	debug?.add("");
-	debug?.add("[square event history]");
-	debug?.add(`query="${query}" normalized="${normalizedQuery}" compact="${compactSearchText(query)}" mentionedMid=${mentionedMid || "(なし)"}`);
-	debug?.add(`squareChatMid=${destination.chatMid} squareMid=${destination.scopeMid}`);
-	const findInEvents = (events: OldSearchEvent[]): MemberInfo | undefined => {
-		for (const [index, event] of events.entries()) {
-			const member = eventMember(event);
-			if (!member) {
-				debug?.detail(`event#${index} type=${eventTypeName(event)} member=(なし)`);
-				continue;
-			}
-			if (seen.has(member.mid)) {
-				debug?.detail(`event#${index} type=${eventTypeName(event)} member="${member.name}" mid=${member.mid} skipped=seen`);
-				continue;
-			}
-			seen.add(member.mid);
-			const midMatch = Boolean(mentionedMid && member.mid === mentionedMid);
-			const nameMatch = Boolean(!mentionedMid && normalizedQuery && looseNameMatches(member.name, query));
-			debug?.detail(
-				`event#${index} type=${eventTypeName(event)} member="${member.name}" mid=${member.mid} midMatch=${midMatch} nameMatch=${nameMatch}`,
-			);
-			if (midMatch) return member;
-			if (nameMatch) return member;
-		}
-		return undefined;
-	};
-
-	for (let page = 0; page < 10; page++) {
-		debug?.add(`prime page=${page + 1} direction=FORWARD syncToken=${syncToken ? "あり" : "なし"}`);
-		const response = await fetchSquareChatEvents(client, {
-			squareChatMid: destination.chatMid,
-			syncToken,
-			limit: 100,
-			direction: "FORWARD",
-			fetchType: "DEFAULT",
-		});
-		syncToken = response.syncToken;
-		debug?.add(
-			`prime response events=${response.events.length} syncToken=${syncToken ? "あり" : "なし"} types=${eventTypeSummary(response.events as OldSearchEvent[])}`,
-		);
-		const found = findInEvents(response.events as OldSearchEvent[]);
-		if (found) return found;
-		if (response.events.length === 0) break;
-	}
-	debug?.add(`prime end syncToken=${syncToken ? "あり" : "なし"} seen=${seen.size}`);
-	if (!syncToken) return undefined;
-
-	for (let page = 0; page < maxPages; page++) {
-		debug?.add(
-			`backward page=${page + 1} inclusive=${page === 0 ? "ON" : "OFF"} continuation=${continuationToken ? "あり" : "なし"}`,
-		);
-		const response = await fetchSquareChatEvents(client, {
-			squareChatMid: destination.chatMid,
-			syncToken,
-			direction: "BACKWARD",
-			inclusive: page === 0 ? "ON" : "OFF",
-			fetchType: "DEFAULT",
-			limit: 100,
-			...(continuationToken ? { continuationToken } : {}),
-		});
-		syncToken = response.syncToken;
-		continuationToken = response.continuationToken || undefined;
-		debug?.add(
-			`backward response events=${response.events.length} continuation=${continuationToken ? "あり" : "なし"} syncToken=${
-				syncToken ? "あり" : "なし"
-			} types=${eventTypeSummary(response.events as OldSearchEvent[])}`,
-		);
-
-		const found = findInEvents(response.events as OldSearchEvent[]);
-		if (found) return found;
-
-		if (!continuationToken) break;
-	}
-	return undefined;
-}
-
 async function searchSquareMemberDirectory(
 	client: Client,
 	destination: LineDestination,
@@ -604,6 +385,33 @@ function formatMemberList(query: string, members: MemberInfo[]): string {
 	return lines.join("\n");
 }
 
+async function searchMemberEventLog(
+	destination: LineDestination,
+	query: string,
+	mentionedMid?: string,
+	debug?: DebugLog,
+): Promise<MemberInfo | undefined> {
+	if (destination.kind !== "square") return undefined;
+	const searchValue = mentionedMid || query;
+	const matches = await memberEventLogStore.searchMembers(destination, searchValue, 20);
+	debug?.add("");
+	debug?.add("[member event log]");
+	debug?.add(`query="${searchValue}" matches=${matches.length}`);
+	for (const member of matches.slice(0, 20)) {
+		debug?.detail(
+			`candidate name="${member.name ?? "名前不明"}" mid=${member.mid} lastType=${member.lastType} lastAt=${member.lastAt}`,
+		);
+	}
+	const match = mentionedMid
+		? matches.find((member) => member.mid === mentionedMid)
+		: matches[0];
+	if (!match) return undefined;
+	return {
+		mid: match.mid,
+		name: match.name ?? "名前不明",
+	};
+}
+
 export const idCommand: LineCommand = {
 	name: "id",
 	async execute({ message, args }) {
@@ -624,7 +432,23 @@ export const idCommand: LineCommand = {
 				"  退会済みを含むOpenChatメンバー情報から最初に見つかった人のMIDを表示します。",
 				"!id old <メンバー名> log",
 				"  old検索の詳細ログを表示します。",
+				"!id log all",
+				"  OCの参加・退出・強制退会履歴を、遡れる限界まで専用ログへ保存します（管理者のみ）。",
 			].join("\n"));
+			return;
+		}
+
+		if (action === "log") {
+			if (args[1]?.toLowerCase() !== "all") {
+				await message.send("使い方: !id log all");
+				return;
+			}
+			const target = targetFromDestination(message.destination);
+			if (!permissionStore.hasAtLeast(target, message.destination.senderMid, "admin")) {
+				await message.send(permissionDeniedText("admin"));
+				return;
+			}
+			await startMemberEventBackfill(message);
 			return;
 		}
 
@@ -683,10 +507,10 @@ export const idCommand: LineCommand = {
 				debug.add("");
 			}
 			if (oldSearch) {
-				const member = await searchSquareMemberDirectory(message.client, message.destination, query, mentionedMid, debug) ??
-					await searchOldSquareHistory(message.client, message.destination, query, mentionedMid, debug);
+				const member = await searchMemberEventLog(message.destination, query, mentionedMid, debug) ??
+					await searchSquareMemberDirectory(message.client, message.destination, query, mentionedMid, debug);
 				if (!member) {
-					const text = `退会済みメンバー情報から「${query || mentionedMid}」に一致するユーザーは見つかりませんでした。`;
+					const text = `保存済みの参加・退出履歴から「${query || mentionedMid}」に一致するユーザーは見つかりませんでした。`;
 					if (debug) await sendLong(message, `${text}\n\n${debug.text()}`);
 					else await message.send(text);
 					return;

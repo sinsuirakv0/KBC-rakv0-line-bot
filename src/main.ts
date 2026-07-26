@@ -62,6 +62,8 @@ import { memberNameHistoryStore } from "./nameHistory/store.js";
 import { startMessageLogAutoHistoryScheduler } from "./messageLog/autoHistory.js";
 import { startMessageLogRemoteSyncScheduler } from "./messageLog/remoteSync.js";
 import { messageLogStore, type StoredMessageLog } from "./messageLog/store.js";
+import { memberEventLogStore } from "./memberEventLog/store.js";
+import { startMemberEventLogRemoteSyncScheduler } from "./memberEventLog/remoteSync.js";
 
 interface RawTalkMessage {
 	id: string;
@@ -1568,6 +1570,13 @@ async function handleRawSquareEvent(
 	sessionStartedAt: number,
 ): Promise<void> {
 	const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
+	const memberEventContext = memberEvents.joins[0] ?? memberEvents.leaves[0];
+	void memberEventLogStore.recordHistoryEvents([event], {
+		chatMid: memberEventContext?.squareChatMid ?? memberEventContext?.squareMid,
+		scopeMid: memberEventContext?.squareMid,
+	}).catch((error) => {
+		handleEventProcessingError("square", "member event log", error);
+	});
 	for (const joinEvent of memberEvents.joins) {
 		try {
 			await handleOpenChatMemberJoin(joinEvent);
@@ -1638,6 +1647,13 @@ async function restoreReplayedSquareMemberActivity(
 	event: RawSquareEvent,
 ): Promise<number> {
 	const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
+	const memberEventContext = memberEvents.joins[0] ?? memberEvents.leaves[0];
+	void memberEventLogStore.recordHistoryEvents([event], {
+		chatMid: memberEventContext?.squareChatMid ?? memberEventContext?.squareMid,
+		scopeMid: memberEventContext?.squareMid,
+	}).catch((error) => {
+		handleEventProcessingError("square", "replayed member event log", error);
+	});
 	for (const joinEvent of memberEvents.joins) {
 		try {
 			await handleOpenChatMemberJoin(joinEvent, { suppressActions: true });
@@ -2072,11 +2088,13 @@ async function main(): Promise<void> {
 		ocModerationSettingsStore.initialize(),
 		memberNameHistoryStore.initialize(),
 		messageLogStore.initialize(),
+		memberEventLogStore.initialize(),
 	]);
 	startEventPushScheduler(() => activeClient, shutdownController.signal);
 	startPushReminderScheduler(() => activeClient, shutdownController.signal);
 	startMessageLogAutoHistoryScheduler(() => activeClient, shutdownController.signal);
 	startMessageLogRemoteSyncScheduler(shutdownController.signal);
+	startMemberEventLogRemoteSyncScheduler(shutdownController.signal);
 	const storage = await initializeLineStorage();
 	while (!shutdownController.signal.aborted) {
 		try {
@@ -2105,6 +2123,7 @@ async function main(): Promise<void> {
 	await ocModerationSettingsStore.flush().catch(() => {});
 	await memberNameHistoryStore.flush().catch(() => {});
 	await messageLogStore.flush().catch(() => {});
+	await memberEventLogStore.flush().catch(() => {});
 	await new Promise<void>((resolve) => eventUpdateServer.close(() => resolve()));
 }
 

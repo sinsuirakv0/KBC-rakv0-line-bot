@@ -2,6 +2,8 @@ node_modules/
 dist/
 .env
 storage/*.json
+storage/message-log/
+storage/member-event-log/
 logs/
 npm-debug.log*
 

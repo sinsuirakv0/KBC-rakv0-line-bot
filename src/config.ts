@@ -200,6 +200,28 @@ export const appConfig = {
 	messageLogAutoHistoryQuietEndHour: Number(process.env.MESSAGE_LOG_AUTO_HISTORY_QUIET_END_HOUR || 6),
 	messageLogAutoHistoryRecentPages: Number(process.env.MESSAGE_LOG_AUTO_HISTORY_RECENT_PAGES || 2),
 	messageLogAutoHistoryBackfillPages: Number(process.env.MESSAGE_LOG_AUTO_HISTORY_BACKFILL_PAGES || 3),
+	memberEventLogDir: path.resolve(process.env.MEMBER_EVENT_LOG_DIR || "./storage/member-event-log"),
+	memberEventLogGithubPath:
+		process.env.MEMBER_EVENT_LOG_GITHUB_PATH || "logs/member-event-log",
+	memberEventLogSaveDelayMs: numberEnv("MEMBER_EVENT_LOG_SAVE_DELAY_MS", 30_000, {
+		min: 5_000,
+		integer: true,
+	}),
+	memberEventLogRemoteSyncIntervalMs: numberEnv(
+		"MEMBER_EVENT_LOG_REMOTE_SYNC_INTERVAL_MS",
+		60_000,
+		{ min: 10_000, integer: true },
+	),
+	memberEventLogRemoteSyncBacklogMs: numberEnv(
+		"MEMBER_EVENT_LOG_REMOTE_SYNC_BACKLOG_MS",
+		30_000,
+		{ min: 5_000, integer: true },
+	),
+	memberEventLogRemoteFlushMaxFiles: numberEnv(
+		"MEMBER_EVENT_LOG_REMOTE_FLUSH_MAX_FILES",
+		8,
+		{ min: 1, max: 50, integer: true },
+	),
 	githubContentsTimeoutMs: Number(process.env.GITHUB_CONTENTS_TIMEOUT_MS || 60_000),
 	githubContentsWriteIntervalMs: Number(process.env.GITHUB_CONTENTS_WRITE_INTERVAL_MS || 1_000),
 };

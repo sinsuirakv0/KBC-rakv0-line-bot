@@ -2,6 +2,8 @@
 import { appConfig } from "../config.js";
 import { runtimeWorkload } from "../runtime/workload.js";
 import { memberNameHistoryStore } from "../nameHistory/store.js";
+import { memberEventLogStore } from "../memberEventLog/store.js";
+import { extractMemberEvents } from "../memberEventLog/events.js";
 import {
 	messageLogStore,
 	type MessageLogChatSummary,
@@ -282,7 +284,10 @@ function eventMembers(event: SquareHistoryEvent): Array<{
 	return members;
 }
 
-function recordEvents(chat: MessageLogChatSummary, events: SquareHistoryEvent[]): { read: number; added: number; oldestAt?: number } {
+async function recordEvents(
+	chat: MessageLogChatSummary,
+	events: SquareHistoryEvent[],
+): Promise<{ read: number; added: number; oldestAt?: number }> {
 	for (const event of events) {
 		for (const member of eventMembers(event)) {
 			memberNameHistoryStore.record("square", chat.scopeMid, member.mid, member.name, member.seenAt);
@@ -305,6 +310,20 @@ function recordEvents(chat: MessageLogChatSummary, events: SquareHistoryEvent[])
 		const message = messageLogFromEvent(chat, event);
 		return message ? [message] : [];
 	});
+	const parsedMemberEvents = events.flatMap((event) => extractMemberEvents(event, {
+		chatMid: chat.chatMid,
+		scopeMid: chat.scopeMid,
+	}));
+	const unresolvedMids = [...new Set(
+		parsedMemberEvents.filter((event) => !event.name).map((event) => event.mid),
+	)];
+	const knownNames = unresolvedMids.length > 0
+		? await messageLogStore.getMemberNames(chat, unresolvedMids)
+		: new Map<string, string>();
+	await memberEventLogStore.recordParsedEvents(parsedMemberEvents.map((event) => ({
+		...event,
+		name: event.name ?? knownNames.get(event.mid),
+	})));
 	return {
 		read: messages.length,
 		added: messageLogStore.recordMany(messages),
@@ -363,7 +382,7 @@ async function primeRecent(client: Client, chat: MessageLogChatSummary, pages: n
 			});
 		}
 		syncToken = response.syncToken;
-		recordEvents(chat, response.events as SquareHistoryEvent[]);
+		await recordEvents(chat, response.events as SquareHistoryEvent[]);
 		if (response.events.length === 0) break;
 		await sleep(appConfig.messageLogBackfillDelayMs);
 	}
@@ -420,7 +439,7 @@ async function incrementalBackfill(client: Client, chat: MessageLogChatSummary):
 		}
 		syncToken = response.syncToken;
 		continuationToken = response.continuationToken || undefined;
-		const stats = recordEvents(chat, response.events as SquareHistoryEvent[]);
+		const stats = await recordEvents(chat, response.events as SquareHistoryEvent[]);
 		if (stats.oldestAt !== undefined && (!oldestAt || stats.oldestAt < oldestAt)) {
 			oldestAt = stats.oldestAt;
 		}
