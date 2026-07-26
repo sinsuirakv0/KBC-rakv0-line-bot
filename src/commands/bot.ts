@@ -19,6 +19,7 @@ import { runtimeStore } from "../runtime/store.js";
 import { lineHealth, type LineHealthChannelSnapshot } from "../runtime/lineHealth.js";
 import { runtimeWorkload } from "../runtime/workload.js";
 import { githubContentsClient } from "../storage/githubContents.js";
+import { collectRuntimeEnvironment, formatRuntimeEnvironment } from "../runtime/environment.js";
 import { argValue, parseTarget, targetLabel } from "./permissionArgs.js";
 import type { LineCommand, LineDestination } from "./shared.js";
 
@@ -155,6 +156,8 @@ function helpText(): string {
 		"  稼働状態を表示",
 		"!bot status test [light|normal|heavy]",
 		"  BOT管理者用の性能テスト",
+		"!bot status env",
+		"  BOT管理者用の実行環境確認",
 		"!bot stop",
 		"  このトークでbotを停止",
 		"!bot start",
@@ -393,6 +396,21 @@ async function sendBenchmark(command: Parameters<LineCommand["execute"]>[0]): Pr
 		await message.send(benchmarkText(result));
 	} catch (error) {
 		await message.send(`性能テストに失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
+async function sendEnvironmentTest(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message, progress } = command;
+	const target = targetFromDestination(message.destination);
+	if (!permissionStore.hasAtLeast(target, message.destination.senderMid, "admin")) {
+		await message.send(permissionDeniedText("admin"));
+		return;
+	}
+	await progress.update("実行環境を確認しています。");
+	try {
+		await message.send(formatRuntimeEnvironment(await collectRuntimeEnvironment()));
+	} catch (error) {
+		await message.send(`実行環境の確認に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
 	}
 }
 
@@ -673,7 +691,13 @@ export const botCommand: LineCommand = {
 			return;
 		}
 
-		if (args[1]?.toLowerCase() === "test") {
+		const statusOption = args[1]?.toLowerCase();
+		if (statusOption === "env" || (statusOption === "test" && args[2]?.toLowerCase() === "env")) {
+			await sendEnvironmentTest(command);
+			return;
+		}
+
+		if (statusOption === "test") {
 			await sendBenchmark(command);
 			return;
 		}
