@@ -4,6 +4,10 @@ import { permissionStore } from "../permissions/store.js";
 import { lineHealth } from "../runtime/lineHealth.js";
 import { handleOpenChatJoinEventMessage, handleOpenChatLeaveEventMessage } from "./ocJoinMessage.js";
 import { ocModerationSettingsStore, type OcMemberMessageSetting } from "./ocModerationSettings.js";
+import {
+	isSquareChatMembershipJoined,
+	isSquareChatMembershipLeft,
+} from "./squareMembership.js";
 
 interface RawSquareEvent {
 	createdTime?: number | bigint;
@@ -53,14 +57,6 @@ function isLeaveEvent(event: RawSquareEvent): boolean {
 
 function isChatMemberUpdateEvent(event: RawSquareEvent): boolean {
 	return event.type === 14 || event.type === "NOTIFIED_UPDATE_SQUARE_CHAT_MEMBER";
-}
-
-function isJoinedState(value: unknown): boolean {
-	return Number(value) === 1 || String(value ?? "").trim().toUpperCase() === "JOINED";
-}
-
-function isLeftState(value: unknown): boolean {
-	return Number(value) === 4 || String(value ?? "").trim().toUpperCase() === "LEFT";
 }
 
 function compactError(error: unknown): string {
@@ -171,7 +167,7 @@ async function handleChatMemberUpdateEvent(
 	const eventAt = rawNumber(event.createdTime);
 	if (squareChatMid !== setting.squareChatMid || !memberMid) return;
 	if (permissionStore.isBotStopped({ kind: "square", chatMid: squareChatMid, chatType: "SQUARE" })) return;
-	if (isJoinedState(membershipState) && ocModerationSettingsStore.joinMessage(setting.squareChatMid)) {
+	if (isSquareChatMembershipJoined(membershipState) && ocModerationSettingsStore.joinMessage(setting.squareChatMid)) {
 		await handleOpenChatJoinEventMessage({
 			client,
 			squareMid,
@@ -182,7 +178,7 @@ async function handleChatMemberUpdateEvent(
 			source: "chat-member",
 		}, { ignoreBefore });
 	}
-	if (isLeftState(membershipState) && ocModerationSettingsStore.leaveMessage(setting.squareChatMid)) {
+	if (isSquareChatMembershipLeft(membershipState) && ocModerationSettingsStore.leaveMessage(setting.squareChatMid)) {
 		await handleOpenChatLeaveEventMessage({
 			client,
 			squareMid,

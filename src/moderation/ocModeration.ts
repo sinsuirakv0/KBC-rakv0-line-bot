@@ -22,6 +22,7 @@ import {
 	type OcUrlRuleScope,
 	type ParsedOcUrl,
 } from "./ocUrlPolicy.js";
+import { isSquareMembershipLeft } from "./squareMembership.js";
 
 type SquareRole = string | number | undefined;
 
@@ -1260,6 +1261,7 @@ async function maybeStartJoinCohortWatch(event: OpenChatMemberJoinEvent): Promis
 }
 
 function leftSoonMode(info: OcLeaveDecisionInfo): "auto" | "review" | "log" | "none" {
+	if (!info.recorded) return "none";
 	if (info.stayMs === undefined) return "none";
 	if (info.remainingChatMids.length > 0) return info.stayMs <= LEFT_SOON_REVIEW_MS ? "log" : "none";
 	if (!info.isFirstJoin) return info.stayMs <= LEFT_SOON_REVIEW_MS ? "log" : "none";
@@ -1283,6 +1285,8 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 		messageCount: info.messageCount,
 		joinedAt: info.joinedAt,
 		lastMessageAt: info.lastMessageAt,
+		recorded: info.recorded,
+		ignoreReason: info.ignoreReason,
 	});
 	if (mode === "none") return;
 
@@ -1532,7 +1536,10 @@ export async function handleOpenChatNoteStatusModeration(
 	return await request;
 }
 
-export async function handleOpenChatMemberJoin(event: OpenChatMemberJoinEvent): Promise<void> {
+export async function handleOpenChatMemberJoin(
+	event: OpenChatMemberJoinEvent,
+	options: { suppressActions?: boolean } = {},
+): Promise<void> {
 	if (!isSquareMemberMid(event.memberMid)) return;
 	if (isSquareBotStopped(event.squareChatMid)) return;
 	if (event.source === "square-member") {
@@ -1543,7 +1550,15 @@ export async function handleOpenChatMemberJoin(event: OpenChatMemberJoinEvent): 
 			displayName: event.displayName,
 			at: event.memberCreatedAt ?? event.joinedAt,
 		});
-		if (result.recorded) await maybeStartJoinCohortWatch(event);
+		console.log("[oc-member-event] square join recorded", {
+			squareMid: event.squareMid,
+			memberMid: event.memberMid,
+			joinedAt: event.memberCreatedAt ?? event.joinedAt,
+			recorded: result.recorded,
+			reason: result.reason,
+			suppressActions: options.suppressActions === true,
+		});
+		if (result.recorded && !options.suppressActions) await maybeStartJoinCohortWatch(event);
 		return;
 	}
 
@@ -1557,7 +1572,7 @@ export async function handleOpenChatMemberJoin(event: OpenChatMemberJoinEvent): 
 			displayName: event.displayName,
 			at: event.memberCreatedAt,
 		});
-		if (result.recorded) await maybeStartJoinCohortWatch({
+		if (result.recorded && !options.suppressActions) await maybeStartJoinCohortWatch({
 			...event,
 			joinedAt: event.memberCreatedAt,
 		});
@@ -1571,7 +1586,35 @@ export async function handleOpenChatMemberJoin(event: OpenChatMemberJoinEvent): 
 	});
 }
 
-export async function handleOpenChatMemberLeave(event: OpenChatMemberLeaveEvent): Promise<void> {
+async function processSquareMemberLeave(
+	event: OpenChatMemberLeaveEvent,
+	options: { suppressActions?: boolean },
+): Promise<void> {
+	const info = ocMemberActivityStore.recordSquareLeave({
+		squareMid: event.squareMid,
+		squareChatMid: event.squareChatMid,
+		memberMid: event.memberMid,
+		displayName: event.displayName,
+		at: event.leftAt,
+		clearAllChats: event.clearAllChats,
+	});
+	if (options.suppressActions || !info.recorded) {
+		console.log("[oc-left-soon] decision suppressed", {
+			squareMid: event.squareMid,
+			memberMid: event.memberMid,
+			recorded: info.recorded,
+			ignoreReason: info.ignoreReason,
+			replayed: options.suppressActions === true,
+		});
+		return;
+	}
+	await handleLeftSoonDecision(event, info);
+}
+
+export async function handleOpenChatMemberLeave(
+	event: OpenChatMemberLeaveEvent,
+	options: { suppressActions?: boolean } = {},
+): Promise<void> {
 	if (!isSquareMemberMid(event.memberMid)) return;
 	if (isSquareBotStopped(event.squareChatMid)) return;
 	if (event.source === "chat-member") {
@@ -1583,17 +1626,45 @@ export async function handleOpenChatMemberLeave(event: OpenChatMemberLeaveEvent)
 			at: event.leftAt,
 			clearAllChats: false,
 		});
+		if (options.suppressActions) return;
+		if (!ocModerationSettingsStore.snapshot(event.squareMid).leftSoonMonitoringEnabled) return;
+		try {
+			const response = await event.client.base.square.getSquareMember({
+				squareMemberMid: event.memberMid,
+			});
+			const member = response.squareMember;
+			if (!isSquareMembershipLeft(member.membershipState)) {
+				console.log("[oc-left-soon] chat leave kept as subchat-only", {
+					squareMid: event.squareMid,
+					squareChatMid: event.squareChatMid,
+					memberMid: event.memberMid,
+					membershipState: String(member.membershipState),
+				});
+				return;
+			}
+			console.log("[oc-left-soon] chat leave promoted to square leave", {
+				squareMid: event.squareMid,
+				squareChatMid: event.squareChatMid,
+				memberMid: event.memberMid,
+				membershipState: String(member.membershipState),
+			});
+			await processSquareMemberLeave({
+				...event,
+				displayName: member.displayName || event.displayName,
+				clearAllChats: true,
+				source: "square-member",
+			}, options);
+		} catch (error) {
+			console.warn("[oc-left-soon] failed to verify member state after chat leave", {
+				squareMid: event.squareMid,
+				squareChatMid: event.squareChatMid,
+				memberMid: event.memberMid,
+				error: compactError(error),
+			});
+		}
 		return;
 	}
-	const info = ocMemberActivityStore.recordSquareLeave({
-		squareMid: event.squareMid,
-		squareChatMid: event.squareChatMid,
-		memberMid: event.memberMid,
-		displayName: event.displayName,
-		at: event.leftAt,
-		clearAllChats: event.clearAllChats,
-	});
-	await handleLeftSoonDecision(event, info);
+	await processSquareMemberLeave(event, options);
 }
 
 async function canHandleModerationCaseReply(message: ReplyableLineMessage): Promise<boolean> {

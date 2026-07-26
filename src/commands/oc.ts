@@ -4,6 +4,7 @@ import {
 	type OcIdentityMatch,
 } from "../moderation/ocIdentitySnapshots.js";
 import { ocKickHistoryStore } from "../moderation/ocKickHistory.js";
+import { ocMemberActivityStore } from "../moderation/ocMemberActivity.js";
 import { ocModerationSettingsStore } from "../moderation/ocModerationSettings.js";
 import {
 	createOcUrlAllowRule,
@@ -310,6 +311,7 @@ function isDeleteArgs(args: string[]): boolean {
 
 function setupStatusLines(squareMid: string): string[] {
 	const settings = ocModerationSettingsStore.snapshot(squareMid);
+	const activity = ocMemberActivityStore.diagnostics(squareMid);
 	return [
 		`URL許可制削除: ${enabledText(settings.linkDeleteEnabled)}`,
 		`URL許可ルール: ${settings.urlAllowRules.length}件（HTTPSのみ）`,
@@ -318,6 +320,8 @@ function setupStatusLines(squareMid: string): string[] {
 		`初参加・危険語処分: ${enabledText(settings.dangerWordAutoKickEnabled)}`,
 		`短時間一斉参加監視: ${enabledText(settings.joinCohortWatchEnabled)}`,
 		`副官部屋: ${settings.modRoomChatMid ? `設定済み (${shortId(settings.modRoomChatMid)})` : "未設定"}`,
+		`即抜け記録: 参加 ${activity.lastJoinAt ? formatJst(activity.lastJoinAt) : "未記録"} / 退会 ${activity.lastLeaveAt ? formatJst(activity.lastLeaveAt) : "未記録"}`,
+		`即抜け追跡: ${activity.activeMembers}人 / 記録 ${activity.records}人`,
 	];
 }
 

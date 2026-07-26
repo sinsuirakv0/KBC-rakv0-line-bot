@@ -12,6 +12,7 @@ export interface OcMemberActivity {
 	firstJoinAt?: string;
 	latestJoinAt?: string;
 	latestLeftAt?: string;
+	lastRecordedLeftAt?: string;
 	totalJoinCount: number;
 	messageCount: number;
 	currentSessionMessageCount: number;
@@ -48,6 +49,8 @@ export interface OcLeaveInput extends OcJoinInput {
 
 export interface OcLeaveDecisionInfo {
 	activity: OcMemberActivity;
+	recorded: boolean;
+	ignoreReason?: "duplicate-or-historical-leave" | "leave-before-latest-join";
 	stayMs?: number;
 	messageCount: number;
 	joinedAt?: string;
@@ -55,6 +58,20 @@ export interface OcLeaveDecisionInfo {
 	lastMessageText?: string;
 	remainingChatMids: string[];
 	isFirstJoin: boolean;
+}
+
+export interface OcJoinRecordResult {
+	activity: OcMemberActivity;
+	isFirstJoin: boolean;
+	recorded: boolean;
+	reason: "recorded" | "duplicate-active" | "historical";
+}
+
+export interface OcMemberActivityDiagnostics {
+	records: number;
+	activeMembers: number;
+	lastJoinAt?: string;
+	lastLeaveAt?: string;
 }
 
 interface OcMemberActivityFile {
@@ -113,6 +130,7 @@ function parseActivity(value: unknown): OcMemberActivityFile {
 				firstJoinAt: stringValue(item.firstJoinAt),
 				latestJoinAt: stringValue(item.latestJoinAt),
 				latestLeftAt: stringValue(item.latestLeftAt),
+				lastRecordedLeftAt: stringValue(item.lastRecordedLeftAt) ?? stringValue(item.latestLeftAt),
 				totalJoinCount: Math.max(0, Math.floor(Number(item.totalJoinCount) || 0)),
 				messageCount: Math.max(0, Math.floor(Number(item.messageCount) || 0)),
 				currentSessionMessageCount: Math.max(0, Math.floor(Number(item.currentSessionMessageCount) || 0)),
@@ -182,9 +200,19 @@ class OcMemberActivityStore {
 		return activity ? structuredClone(activity) : undefined;
 	}
 
-	recordSquareJoin(input: OcJoinInput): { activity: OcMemberActivity; isFirstJoin: boolean; recorded: boolean } {
+	recordSquareJoin(input: OcJoinInput): OcJoinRecordResult {
 		const at = isoFromMs(input.at);
 		const activity = this.ensureActivity(input.squareMid, input.memberMid, at);
+		const atMs = millisFromIso(at) ?? Date.now();
+		const latestLeftAtMs = millisFromIso(activity.latestLeftAt);
+		if (latestLeftAtMs !== undefined && atMs <= latestLeftAtMs) {
+			return {
+				activity: structuredClone(activity),
+				isFirstJoin: activity.totalJoinCount <= 1,
+				recorded: false,
+				reason: "historical",
+			};
+		}
 		const hasActiveSquareMembership = Boolean(activity.latestJoinAt && !activity.latestLeftAt);
 		if (hasActiveSquareMembership) {
 			activity.displayName = input.displayName ?? activity.displayName;
@@ -196,6 +224,7 @@ class OcMemberActivityStore {
 				activity: structuredClone(activity),
 				isFirstJoin: activity.totalJoinCount <= 1,
 				recorded: false,
+				reason: "duplicate-active",
 			};
 		}
 		const previousJoinCount = activity.totalJoinCount;
@@ -210,7 +239,12 @@ class OcMemberActivityStore {
 		activity.updatedAt = nowIso();
 		this.trim();
 		this.scheduleSave();
-		return { activity: structuredClone(activity), isFirstJoin: previousJoinCount === 0, recorded: true };
+		return {
+			activity: structuredClone(activity),
+			isFirstJoin: previousJoinCount === 0,
+			recorded: true,
+			reason: "recorded",
+		};
 	}
 
 	recordChatJoin(input: OcJoinInput): OcMemberActivity {
@@ -239,14 +273,34 @@ class OcMemberActivityStore {
 		const leftAt = isoFromMs(input.at);
 		const activity = this.ensureActivity(input.squareMid, input.memberMid, leftAt);
 		activity.displayName = input.displayName ?? activity.displayName;
+		const leftAtMs = millisFromIso(leftAt) ?? Date.now();
+		const latestJoinAtMs = millisFromIso(activity.latestJoinAt);
+		const ignoreReason = latestJoinAtMs !== undefined && leftAtMs < latestJoinAtMs
+			? "leave-before-latest-join"
+			: activity.latestLeftAt !== undefined
+				? "duplicate-or-historical-leave"
+				: undefined;
+		if (ignoreReason) {
+			return {
+				activity: structuredClone(activity),
+				recorded: false,
+				ignoreReason,
+				messageCount: activity.currentSessionMessageCount,
+				joinedAt: activity.latestJoinAt,
+				lastMessageAt: activity.lastMessageAt,
+				lastMessageText: activity.lastMessageText,
+				remainingChatMids: [...activity.activeChatMids],
+				isFirstJoin: activity.totalJoinCount <= 1,
+			};
+		}
 		const remainingChatMids = input.clearAllChats ? [] : removeValue(activity.activeChatMids, input.squareChatMid);
 		const joinAtMs = millisFromIso(activity.latestJoinAt);
-		const leftAtMs = millisFromIso(leftAt);
-		const stayMs = joinAtMs !== undefined && leftAtMs !== undefined && leftAtMs >= joinAtMs
+		const stayMs = joinAtMs !== undefined && leftAtMs >= joinAtMs
 			? leftAtMs - joinAtMs
 			: undefined;
 		const info: OcLeaveDecisionInfo = {
 			activity: structuredClone(activity),
+			recorded: true,
 			stayMs,
 			messageCount: activity.currentSessionMessageCount,
 			joinedAt: activity.latestJoinAt,
@@ -256,10 +310,31 @@ class OcMemberActivityStore {
 			isFirstJoin: activity.totalJoinCount <= 1,
 		};
 		activity.latestLeftAt = leftAt;
+		activity.lastRecordedLeftAt = leftAt;
 		activity.activeChatMids = remainingChatMids;
 		activity.updatedAt = nowIso();
 		this.scheduleSave();
 		return info;
+	}
+
+	diagnostics(squareMid: string): OcMemberActivityDiagnostics {
+		let records = 0;
+		let activeMembers = 0;
+		let lastJoinAt: string | undefined;
+		let lastLeaveAt: string | undefined;
+		for (const activity of this.data.activities) {
+			if (activity.squareMid !== squareMid) continue;
+			records += 1;
+			if (activity.latestJoinAt && !activity.latestLeftAt) activeMembers += 1;
+			if (activity.latestJoinAt && (!lastJoinAt || activity.latestJoinAt > lastJoinAt)) {
+				lastJoinAt = activity.latestJoinAt;
+			}
+			const recordedLeftAt = activity.lastRecordedLeftAt ?? activity.latestLeftAt;
+			if (recordedLeftAt && (!lastLeaveAt || recordedLeftAt > lastLeaveAt)) {
+				lastLeaveAt = recordedLeftAt;
+			}
+		}
+		return { records, activeMembers, lastJoinAt, lastLeaveAt };
 	}
 
 	recordMessage(input: OcMessageInput): OcMemberActivity {

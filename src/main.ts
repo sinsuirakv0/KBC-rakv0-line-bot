@@ -47,6 +47,12 @@ import {
 } from "./moderation/ocJoinMessage.js";
 import { listenOpenChatJoinMessageEvents } from "./moderation/ocJoinMessagePolling.js";
 import { ocModerationSettingsStore } from "./moderation/ocModerationSettings.js";
+import {
+	isSquareChatMembershipJoined,
+	isSquareChatMembershipLeft,
+	isSquareMembershipJoined,
+	isSquareMembershipLeft,
+} from "./moderation/squareMembership.js";
 import { botStopTargetFromDestination, permissionStore } from "./permissions/store.js";
 import { memberNameHistoryStore } from "./nameHistory/store.js";
 import { startMessageLogAutoHistoryScheduler } from "./messageLog/autoHistory.js";
@@ -477,14 +483,6 @@ function rawChatMember(value: unknown): {
 	};
 }
 
-function isJoinedState(value: unknown): boolean {
-	return Number(value) === 1 || String(value ?? "").trim().toUpperCase() === "JOINED";
-}
-
-function isLeftState(value: unknown): boolean {
-	return Number(value) === 4 || String(value ?? "").trim().toUpperCase() === "LEFT";
-}
-
 async function memberActivityEventsFromSquareEvent(
 	client: Client,
 	event: RawSquareEvent,
@@ -587,7 +585,7 @@ async function memberActivityEventsFromSquareEvent(
 		const squareMid = squareChatMid && memberMid
 			? await resolveSquareScope(client, squareChatMid, memberMid)
 			: undefined;
-		if (squareMid && squareChatMid && memberMid && isJoinedState(chatMember.membershipState)) {
+		if (squareMid && squareChatMid && memberMid && isSquareChatMembershipJoined(chatMember.membershipState)) {
 			joins.push({
 				client,
 				squareMid,
@@ -597,7 +595,7 @@ async function memberActivityEventsFromSquareEvent(
 				source: "chat-member",
 			});
 		}
-		if (squareMid && squareChatMid && memberMid && isLeftState(chatMember.membershipState)) {
+		if (squareMid && squareChatMid && memberMid && isSquareChatMembershipLeft(chatMember.membershipState)) {
 			leaves.push({
 				client,
 				squareMid,
@@ -614,7 +612,18 @@ async function memberActivityEventsFromSquareEvent(
 		const member = rawMember(raw?.squareMember);
 		const squareMid = rawString(raw?.squareMid) ?? member.squareMid;
 		const memberMid = rawString(raw?.squareMemberMid) ?? member.memberMid;
-		if (squareMid && memberMid && isLeftState(member.membershipState)) {
+		if (squareMid && memberMid && isSquareMembershipJoined(member.membershipState)) {
+			joins.push({
+				client,
+				squareMid,
+				memberMid,
+				displayName: member.displayName,
+				joinedAt: member.createdAt ?? eventCreatedAt,
+				memberCreatedAt: member.createdAt,
+				source: "square-member",
+			});
+		}
+		if (squareMid && memberMid && isSquareMembershipLeft(member.membershipState)) {
 			leaves.push({
 				client,
 				squareMid,
@@ -1609,6 +1618,29 @@ async function handleRawSquareEvent(
 	}
 }
 
+async function restoreReplayedSquareMemberActivity(
+	client: Client,
+	event: RawSquareEvent,
+	onFatal: (error: unknown) => void,
+): Promise<number> {
+	const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
+	for (const joinEvent of memberEvents.joins) {
+		try {
+			await handleOpenChatMemberJoin(joinEvent, { suppressActions: true });
+		} catch (error) {
+			handlePollingError("square", error, onFatal);
+		}
+	}
+	for (const leaveEvent of memberEvents.leaves) {
+		try {
+			await handleOpenChatMemberLeave(leaveEvent, { suppressActions: true });
+		} catch (error) {
+			handlePollingError("square", error, onFatal);
+		}
+	}
+	return memberEvents.joins.length + memberEvents.leaves.length;
+}
+
 async function listenRawSquareEvents(
 	client: Client,
 	storage: SyncedLineStorage,
@@ -1633,11 +1665,17 @@ async function listenRawSquareEvents(
 			loadedPersistedToken = false;
 			const events = (response.events ?? []) as unknown as RawSquareEvent[];
 			let replayedCount = 0;
+			let restoredMemberEventCount = 0;
 			for (const event of events) {
 				recordSquareEventDebug(event);
 				const createdAt = squareEventCreatedAt(event);
 				if (createdAt !== undefined && createdAt < sessionStartedAt) {
 					replayedCount++;
+					restoredMemberEventCount += await restoreReplayedSquareMemberActivity(
+						client,
+						event,
+						onFatal,
+					);
 					continue;
 				}
 				await handleRawSquareEvent(client, event, onFatal, sessionStartedAt);
@@ -1647,6 +1685,7 @@ async function listenRawSquareEvents(
 					count: replayedCount,
 					total: events.length,
 					continuation: Boolean(continuationToken),
+					restoredMemberEvents: restoredMemberEventCount,
 				});
 			}
 			if (
