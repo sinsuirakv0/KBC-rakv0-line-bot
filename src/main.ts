@@ -31,6 +31,7 @@ import { recordSquareEventDebug, recordSquareHandlerDebug } from "./runtime/squa
 import { ocIdentitySnapshotsStore } from "./moderation/ocIdentitySnapshots.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
 import { ocMemberActivityStore } from "./moderation/ocMemberActivity.js";
+import { ocRecentPresenceStore } from "./moderation/ocRecentPresence.js";
 import { ocModerationCasesStore } from "./moderation/ocModerationCases.js";
 import {
 	handleOpenChatMemberJoin,
@@ -2084,6 +2085,7 @@ async function main(): Promise<void> {
 		ocIdentitySnapshotsStore.initialize(),
 		ocKickHistoryStore.initialize(),
 		ocMemberActivityStore.initialize(),
+		ocRecentPresenceStore.initialize(),
 		ocModerationCasesStore.initialize(),
 		ocModerationSettingsStore.initialize(),
 		memberNameHistoryStore.initialize(),
@@ -2119,6 +2121,7 @@ async function main(): Promise<void> {
 	await ocIdentitySnapshotsStore.flush().catch(() => {});
 	await ocKickHistoryStore.flush().catch(() => {});
 	await ocMemberActivityStore.flush().catch(() => {});
+	await ocRecentPresenceStore.flush().catch(() => {});
 	await ocModerationCasesStore.flush().catch(() => {});
 	await ocModerationSettingsStore.flush().catch(() => {});
 	await memberNameHistoryStore.flush().catch(() => {});

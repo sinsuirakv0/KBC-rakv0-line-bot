@@ -2,7 +2,11 @@
 import { appConfig } from "../config.js";
 import type { ReplyableLineMessage } from "../commands/shared.js";
 import { ocKickHistoryStore } from "./ocKickHistory.js";
-import { ocMemberActivityStore, type OcLeaveDecisionInfo, type OcMemberActivity } from "./ocMemberActivity.js";
+import { ocMemberActivityStore, type OcMemberActivity } from "./ocMemberActivity.js";
+import {
+	ocRecentPresenceStore,
+	type OcRecentLeaveDecisionInfo,
+} from "./ocRecentPresence.js";
 import {
 	ocModerationCasesStore,
 	type OcModerationCase,
@@ -1000,7 +1004,7 @@ function memberLine(name: string | undefined, mid: string): string {
 	return `${displayNameText(name)} (${mid})`;
 }
 
-function lastMessageLine(info: OcLeaveDecisionInfo): string {
+function lastMessageLine(info: OcRecentLeaveDecisionInfo): string {
 	const text = info.lastMessageText?.replace(/\s+/g, " ").trim();
 	return text ? text.slice(0, 300) : "(発言なし)";
 }
@@ -1055,7 +1059,7 @@ async function resolveLeftSoonNoticeChatMid(
 
 async function sendLeftSoonMainNotice(
 	event: OpenChatMemberLeaveEvent,
-	info: OcLeaveDecisionInfo,
+	info: OcRecentLeaveDecisionInfo,
 	modRoomChatMid: string | undefined,
 ): Promise<void> {
 	const squareChatMid = await resolveLeftSoonNoticeChatMid(
@@ -1260,7 +1264,7 @@ async function maybeStartJoinCohortWatch(event: OpenChatMemberJoinEvent): Promis
 	);
 }
 
-function leftSoonMode(info: OcLeaveDecisionInfo): "auto" | "review" | "log" | "none" {
+function leftSoonMode(info: OcRecentLeaveDecisionInfo): "auto" | "review" | "log" | "none" {
 	if (!info.recorded) return "none";
 	if (info.stayMs === undefined) return "none";
 	if (info.remainingChatMids.length > 0) return info.stayMs <= LEFT_SOON_REVIEW_MS ? "log" : "none";
@@ -1270,7 +1274,10 @@ function leftSoonMode(info: OcLeaveDecisionInfo): "auto" | "review" | "log" | "n
 	return "none";
 }
 
-async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcLeaveDecisionInfo): Promise<void> {
+async function handleLeftSoonDecision(
+	event: OpenChatMemberLeaveEvent,
+	info: OcRecentLeaveDecisionInfo,
+): Promise<void> {
 	const settings = ocModerationSettingsStore.snapshot(event.squareMid);
 	if (!settings.leftSoonMonitoringEnabled) return;
 	const mode = leftSoonMode(info);
@@ -1290,7 +1297,7 @@ async function handleLeftSoonDecision(event: OpenChatMemberLeaveEvent, info: OcL
 	});
 	if (mode === "none") return;
 
-	const targetName = info.activity.displayName ?? event.displayName;
+	const targetName = info.displayName ?? event.displayName;
 	if (mode === "log") {
 		const hasRemainingChats = info.remainingChatMids.length > 0;
 		await sendModRoomLog(
@@ -1420,6 +1427,7 @@ export async function handleOpenChatModeration(message: OpenChatModerationMessag
 	if (
 		!settings.linkDeleteEnabled &&
 		!settings.mediaBurstDeleteEnabled &&
+		!settings.leftSoonMonitoringEnabled &&
 		!settings.dangerWordAutoKickEnabled &&
 		!settings.joinCohortWatchEnabled
 	) return false;
@@ -1434,6 +1442,22 @@ export async function handleOpenChatModeration(message: OpenChatModerationMessag
 	} catch {
 		senderName = undefined;
 	}
+	const activity = ocMemberActivityStore.recordMessage({
+		squareMid: message.squareMid,
+		squareChatMid: message.squareChatMid,
+		memberMid: message.senderMid,
+		displayName: senderName,
+		text: message.text,
+		at: message.createdAt,
+	});
+	ocRecentPresenceStore.recordMessage({
+		squareMid: message.squareMid,
+		squareChatMid: message.squareChatMid,
+		memberMid: message.senderMid,
+		displayName: senderName,
+		text: message.text,
+		at: message.createdAt,
+	});
 	const deniedUrls = settings.linkDeleteEnabled
 		? deniedOcUrls(message.squareMid, message.text)
 		: [];
@@ -1457,15 +1481,6 @@ export async function handleOpenChatModeration(message: OpenChatModerationMessag
 		await sendMentionNotice(message, urlDeleteNotice(firstComponent, reviewSent));
 		return true;
 	}
-
-	const activity = ocMemberActivityStore.recordMessage({
-		squareMid: message.squareMid,
-		squareChatMid: message.squareChatMid,
-		memberMid: message.senderMid,
-		displayName: senderName,
-		text: message.text,
-		at: message.createdAt,
-	});
 
 	if (settings.joinCohortWatchEnabled) await handleCohortSuspiciousMessage(message, activity);
 	if (settings.dangerWordAutoKickEnabled && await handleDangerWordAutoKick(message, activity)) return true;
@@ -1541,7 +1556,7 @@ export async function handleOpenChatMemberJoin(
 	options: { suppressActions?: boolean } = {},
 ): Promise<void> {
 	if (!isSquareMemberMid(event.memberMid)) return;
-	if (isSquareBotStopped(event.squareChatMid)) return;
+	const suppressActions = options.suppressActions === true || isSquareBotStopped(event.squareChatMid);
 	if (event.source === "square-member") {
 		const result = ocMemberActivityStore.recordSquareJoin({
 			squareMid: event.squareMid,
@@ -1550,15 +1565,23 @@ export async function handleOpenChatMemberJoin(
 			displayName: event.displayName,
 			at: event.memberCreatedAt ?? event.joinedAt,
 		});
+		ocRecentPresenceStore.recordSquareJoin({
+			squareMid: event.squareMid,
+			squareChatMid: event.squareChatMid,
+			memberMid: event.memberMid,
+			displayName: event.displayName,
+			at: event.memberCreatedAt ?? event.joinedAt,
+			isFirstJoin: result.isFirstJoin,
+		});
 		console.log("[oc-member-event] square join recorded", {
 			squareMid: event.squareMid,
 			memberMid: event.memberMid,
 			joinedAt: event.memberCreatedAt ?? event.joinedAt,
 			recorded: result.recorded,
 			reason: result.reason,
-			suppressActions: options.suppressActions === true,
+			suppressActions,
 		});
-		if (result.recorded && !options.suppressActions) await maybeStartJoinCohortWatch(event);
+		if (result.recorded && !suppressActions) await maybeStartJoinCohortWatch(event);
 		return;
 	}
 
@@ -1572,12 +1595,27 @@ export async function handleOpenChatMemberJoin(
 			displayName: event.displayName,
 			at: event.memberCreatedAt,
 		});
-		if (result.recorded && !options.suppressActions) await maybeStartJoinCohortWatch({
+		ocRecentPresenceStore.recordSquareJoin({
+			squareMid: event.squareMid,
+			squareChatMid: event.squareChatMid,
+			memberMid: event.memberMid,
+			displayName: event.displayName,
+			at: event.memberCreatedAt,
+			isFirstJoin: result.isFirstJoin,
+		});
+		if (result.recorded && !suppressActions) await maybeStartJoinCohortWatch({
 			...event,
 			joinedAt: event.memberCreatedAt,
 		});
 	}
 	ocMemberActivityStore.recordChatJoin({
+		squareMid: event.squareMid,
+		squareChatMid: event.squareChatMid,
+		memberMid: event.memberMid,
+		displayName: event.displayName,
+		at: event.joinedAt,
+	});
+	ocRecentPresenceStore.recordChatJoin({
 		squareMid: event.squareMid,
 		squareChatMid: event.squareChatMid,
 		memberMid: event.memberMid,
@@ -1590,7 +1628,7 @@ async function processSquareMemberLeave(
 	event: OpenChatMemberLeaveEvent,
 	options: { suppressActions?: boolean },
 ): Promise<void> {
-	const info = ocMemberActivityStore.recordSquareLeave({
+	const activityInfo = ocMemberActivityStore.recordSquareLeave({
 		squareMid: event.squareMid,
 		squareChatMid: event.squareChatMid,
 		memberMid: event.memberMid,
@@ -1598,6 +1636,20 @@ async function processSquareMemberLeave(
 		at: event.leftAt,
 		clearAllChats: event.clearAllChats,
 	});
+	const recentInfo = ocRecentPresenceStore.recordSquareLeave({
+		squareMid: event.squareMid,
+		squareChatMid: event.squareChatMid,
+		memberMid: event.memberMid,
+		displayName: event.displayName,
+		at: event.leftAt,
+	});
+	const info: OcRecentLeaveDecisionInfo = {
+		...recentInfo,
+		messageCount: Math.max(recentInfo.messageCount, activityInfo.messageCount),
+		lastMessageAt: recentInfo.lastMessageAt ?? activityInfo.lastMessageAt,
+		lastMessageText: recentInfo.lastMessageText ?? activityInfo.lastMessageText,
+		displayName: recentInfo.displayName ?? activityInfo.activity.displayName,
+	};
 	if (options.suppressActions || !info.recorded) {
 		console.log("[oc-left-soon] decision suppressed", {
 			squareMid: event.squareMid,
@@ -1616,7 +1668,7 @@ export async function handleOpenChatMemberLeave(
 	options: { suppressActions?: boolean } = {},
 ): Promise<void> {
 	if (!isSquareMemberMid(event.memberMid)) return;
-	if (isSquareBotStopped(event.squareChatMid)) return;
+	const suppressActions = options.suppressActions === true || isSquareBotStopped(event.squareChatMid);
 	if (event.source === "chat-member") {
 		ocMemberActivityStore.recordChatLeave({
 			squareMid: event.squareMid,
@@ -1626,8 +1678,35 @@ export async function handleOpenChatMemberLeave(
 			at: event.leftAt,
 			clearAllChats: false,
 		});
-		if (options.suppressActions) return;
+		const recentPresence = ocRecentPresenceStore.recordChatLeave({
+			squareMid: event.squareMid,
+			squareChatMid: event.squareChatMid,
+			memberMid: event.memberMid,
+			displayName: event.displayName,
+			at: event.leftAt,
+		});
+		if (suppressActions) return;
 		if (!ocModerationSettingsStore.snapshot(event.squareMid).leftSoonMonitoringEnabled) return;
+		if (!recentPresence) {
+			console.log("[oc-left-soon] chat leave has no recent presence session", {
+				squareMid: event.squareMid,
+				squareChatMid: event.squareChatMid,
+				memberMid: event.memberMid,
+			});
+			return;
+		}
+		const activeChatMids = recentPresence.chats
+			.filter((chat) => chat.active)
+			.map((chat) => chat.chatMid);
+		if (activeChatMids.length > 0) {
+			console.log("[oc-left-soon] chat leave kept as subchat-only by recent presence", {
+				squareMid: event.squareMid,
+				squareChatMid: event.squareChatMid,
+				memberMid: event.memberMid,
+				activeChatMids,
+			});
+			return;
+		}
 		try {
 			const response = await event.client.base.square.getSquareMember({
 				squareMemberMid: event.memberMid,
@@ -1653,7 +1732,7 @@ export async function handleOpenChatMemberLeave(
 				displayName: member.displayName || event.displayName,
 				clearAllChats: true,
 				source: "square-member",
-			}, options);
+			}, { suppressActions });
 		} catch (error) {
 			console.warn("[oc-left-soon] failed to verify member state after chat leave", {
 				squareMid: event.squareMid,
@@ -1664,7 +1743,7 @@ export async function handleOpenChatMemberLeave(
 		}
 		return;
 	}
-	await processSquareMemberLeave(event, options);
+	await processSquareMemberLeave(event, { suppressActions });
 }
 
 async function canHandleModerationCaseReply(message: ReplyableLineMessage): Promise<boolean> {

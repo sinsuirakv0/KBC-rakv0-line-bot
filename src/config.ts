@@ -161,6 +161,15 @@ export const appConfig = {
 		min: 5_000,
 		integer: true,
 	}),
+	ocRecentPresenceFile: path.resolve(
+		process.env.OC_RECENT_PRESENCE_FILE || "./storage/oc-recent-presence.json",
+	),
+	ocRecentPresenceGithubPath:
+		process.env.OC_RECENT_PRESENCE_GITHUB_PATH || "moderation/oc-recent-presence.json",
+	ocRecentPresenceSaveDelayMs: numberEnv("OC_RECENT_PRESENCE_SAVE_DELAY_MS", 10_000, {
+		min: 1_000,
+		integer: true,
+	}),
 	ocModerationCasesFile: path.resolve(
 		process.env.OC_MODERATION_CASES_FILE || "./storage/oc-moderation-cases.json",
 	),
