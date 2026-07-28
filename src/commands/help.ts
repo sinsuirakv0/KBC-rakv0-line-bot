@@ -17,7 +17,6 @@ const COMMAND_LINES = [
 	"!oc/OpenChat調査",
 	"!push/プッシュ通知",
 	"!bot/bot状態確認",
-	"!botlog/BOT内部ログ転送",
 	"!コマンド helpでそのコマンドの使い方を表示します",
 ];
 

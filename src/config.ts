@@ -143,23 +143,6 @@ export const appConfig = {
 	rankingSaveDelayMs: numberEnv("RANKING_SAVE_DELAY_MS", 60_000, { min: 5_000, integer: true }),
 	botStatusFile: path.resolve(process.env.BOT_STATUS_FILE || "./storage/bot-status.json"),
 	botStatusGithubPath: process.env.BOT_STATUS_GITHUB_PATH || "stats/bot-status.json",
-	botLogRelayFile: path.resolve(process.env.BOT_LOG_RELAY_FILE || "./storage/bot-log-relay.json"),
-	botLogRelayGithubPath:
-		process.env.BOT_LOG_RELAY_GITHUB_PATH || "settings/bot-log-relay.json",
-	botLogRelayTalkMid:
-		process.env.BOT_LOG_RELAY_TALK_MID || "c1b419211a74dbc992a4b597bf69dc20b",
-	botLogRelayForceOff: boolEnv("BOT_LOG_RELAY_FORCE_OFF", false),
-	botLogRelayE2ee: boolEnv("BOT_LOG_RELAY_E2EE", true),
-	botLogRelayBatchMs: numberEnv("BOT_LOG_RELAY_BATCH_MS", 15_000, {
-		min: 5_000,
-		max: 60_000,
-		integer: true,
-	}),
-	botLogRelayMaxQueue: numberEnv("BOT_LOG_RELAY_MAX_QUEUE", 500, {
-		min: 50,
-		max: 5_000,
-		integer: true,
-	}),
 	permissionsFile: path.resolve(process.env.PERMISSIONS_FILE || "./storage/permissions.json"),
 	permissionsGithubPath: process.env.PERMISSIONS_GITHUB_PATH || "settings/permissions.json",
 	ocKickHistoryFile: path.resolve(process.env.OC_KICK_HISTORY_FILE || "./storage/oc-kick-history.json"),

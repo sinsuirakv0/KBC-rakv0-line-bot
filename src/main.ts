@@ -28,7 +28,6 @@ import { runtimeStore } from "./runtime/store.js";
 import { lineHealth } from "./runtime/lineHealth.js";
 import { ForegroundQueueFullError, runtimeWorkload } from "./runtime/workload.js";
 import { recordSquareEventDebug, recordSquareHandlerDebug } from "./runtime/squareEventDebug.js";
-import { botLogRelay } from "./runtime/botLogRelay.js";
 import { ocIdentitySnapshotsStore } from "./moderation/ocIdentitySnapshots.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
 import { ocMemberActivityStore } from "./moderation/ocMemberActivity.js";
@@ -2149,8 +2148,6 @@ async function runSession(
 }
 
 async function main(): Promise<void> {
-	botLogRelay.install();
-	await botLogRelay.initialize();
 	let activeClient: Client | null = null;
 	const shutdownController = new AbortController();
 	const eventUpdateServer = startEventUpdateServer(() => activeClient);
@@ -2189,18 +2186,15 @@ async function main(): Promise<void> {
 		try {
 			const client = await createLineClient(storage);
 			activeClient = client;
-			botLogRelay.setClient(client);
 			await runSession(client, storage, shutdownController.signal);
 		} catch (error) {
 			activeClient = null;
-			botLogRelay.setClient(null);
 			if (shutdownController.signal.aborted) break;
 			console.error("[line] session stopped; automatic login will retry", error);
 			await storage.flushBackup().catch(() => {});
 			await sleepUntilRetry(appConfig.loginRetryMs, shutdownController.signal);
 		} finally {
 			activeClient = null;
-			botLogRelay.setClient(null);
 		}
 	}
 
@@ -2217,7 +2211,6 @@ async function main(): Promise<void> {
 	await memberNameHistoryStore.flush().catch(() => {});
 	await messageLogStore.flush().catch(() => {});
 	await memberEventLogStore.flush().catch(() => {});
-	await botLogRelay.shutdown().catch(() => {});
 	await new Promise<void>((resolve) => eventUpdateServer.close(() => resolve()));
 }
 

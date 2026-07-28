@@ -22,7 +22,6 @@ import { githubContentsClient } from "../storage/githubContents.js";
 import { collectRuntimeEnvironment, formatRuntimeEnvironment } from "../runtime/environment.js";
 import { argValue, parseTarget, targetLabel } from "./permissionArgs.js";
 import type { LineCommand, LineDestination } from "./shared.js";
-import { executeBotLogCommand } from "./botLog.js";
 
 type RoleSnapshot = ReturnType<typeof permissionStore.snapshot>["roles"][number];
 type SquareRole = string | number | undefined;
@@ -159,8 +158,6 @@ function helpText(): string {
 		"  BOT管理者用の性能テスト",
 		"!bot status env",
 		"  BOT管理者用の実行環境確認",
-		"!bot log on/off/status/test",
-		"  BOT管理者用の内部ログ転送",
 		"!bot stop",
 		"  このトークでbotを停止",
 		"!bot start",
@@ -681,11 +678,6 @@ export const botCommand: LineCommand = {
 
 		if (action === "setting") {
 			await executeSetting(command);
-			return;
-		}
-
-		if (action === "log") {
-			await executeBotLogCommand(command, args.slice(1));
 			return;
 		}
 
