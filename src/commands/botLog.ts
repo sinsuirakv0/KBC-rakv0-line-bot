@@ -27,10 +27,12 @@ function statusText(): string {
 	return [
 		"BOTログ転送",
 		`状態: ${status.enabled ? "ON" : "OFF"}`,
+		`環境変数による緊急停止: ${status.forcedOff ? "有効" : "無効"}`,
 		`送信先: ${status.targetTalkMid}`,
 		`LINE接続: ${status.clientReady ? "接続済み" : "未接続"}`,
 		`送信待ち: ${status.queued}件`,
 		`破棄: ${status.dropped}件`,
+		`循環防止で除外: ${status.suppressed}件`,
 		`最終送信: ${status.lastSentAt ?? "なし"}`,
 		`最終エラー: ${status.lastError ?? "なし"}`,
 	].join("\n");
@@ -58,7 +60,14 @@ export async function executeBotLogCommand(
 	}
 	if (action === "on" || action === "off") {
 		const enabled = action === "on";
-		const result = await botLogRelay.setEnabled(enabled, message.destination.senderMid);
+		let result: Awaited<ReturnType<typeof botLogRelay.setEnabled>>;
+		try {
+			result = await botLogRelay.setEnabled(enabled, message.destination.senderMid);
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			await message.send(`BOTログ転送の設定保存に失敗しました。\n状態は変更していません。\n${detail.slice(0, 500)}`);
+			return;
+		}
 		await message.send(result === "unchanged"
 			? `BOTログ転送はすでに${enabled ? "ON" : "OFF"}です。\n${statusText()}`
 			: `BOTログ転送を${enabled ? "ON" : "OFF"}にしました。\n${statusText()}`);

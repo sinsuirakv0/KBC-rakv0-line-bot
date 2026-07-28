@@ -8,7 +8,7 @@ import { githubContentsClient } from "../storage/githubContents.js";
 type BotLogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 
 interface BotLogRelayFile {
-	version: 1;
+	version: 2;
 	enabled: boolean;
 	updatedAt?: string;
 	updatedBy?: string;
@@ -22,27 +22,47 @@ interface QueuedLog {
 
 export interface BotLogRelaySnapshot {
 	enabled: boolean;
+	forcedOff: boolean;
 	targetTalkMid: string;
 	clientReady: boolean;
 	queued: number;
 	dropped: number;
+	suppressed: number;
 	lastSentAt?: string;
 	lastError?: string;
 	updatedAt?: string;
 	updatedBy?: string;
 }
 
-const EMPTY_SETTINGS: BotLogRelayFile = { version: 1, enabled: false };
+const EMPTY_SETTINGS: BotLogRelayFile = { version: 2, enabled: false };
 const MESSAGE_MAX_CHARS = 4_300;
 const ENTRY_MAX_CHARS = 3_000;
-const MAX_BATCHES_PER_FLUSH = 4;
+const MAX_BATCHES_PER_FLUSH = 1;
 const SEND_RETRY_MS = 15_000;
+const MIN_SEND_INTERVAL_MS = 15_000;
+
+// LINEへのログ送信自身が生成するログは、再送すると無限循環になるため転送しない。
+const INTERNAL_LOG_PREFIXES = [
+	"[bot-log-relay]",
+	"[line-storage]",
+	"[github]",
+	"[talk:event] NOTIFIED_READ_MESSAGE",
+	"[perf] talk poll=",
+] as const;
 
 function parseSettings(value: unknown): BotLogRelayFile {
 	if (!value || typeof value !== "object") return { ...EMPTY_SETTINGS };
 	const raw = value as Partial<BotLogRelayFile>;
+	// v1は転送の自己循環を防げなかったため、安全のため一度OFFへ移行する。
+	if (raw.version !== 2) {
+		return {
+			...EMPTY_SETTINGS,
+			updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : undefined,
+			updatedBy: typeof raw.updatedBy === "string" ? raw.updatedBy : undefined,
+		};
+	}
 	return {
-		version: 1,
+		version: 2,
 		enabled: raw.enabled === true,
 		updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : undefined,
 		updatedBy: typeof raw.updatedBy === "string" ? raw.updatedBy : undefined,
@@ -71,11 +91,13 @@ class BotLogRelay {
 	private client: Client | null = null;
 	private queue: QueuedLog[] = [];
 	private dropped = 0;
+	private suppressed = 0;
 	private flushTimer: NodeJS.Timeout | undefined;
 	private flushing = false;
 	private installed = false;
 	private saveQueue: Promise<void> = Promise.resolve();
 	private lastSentAt: string | undefined;
+	private lastSendAttemptAt = 0;
 	private lastError: string | undefined;
 	private sensitiveValues: string[] = [];
 	private readonly original = {
@@ -147,16 +169,18 @@ class BotLogRelay {
 
 	setClient(client: Client | null): void {
 		this.client = client;
-		if (client && this.data.enabled && this.queue.length > 0) this.scheduleFlush(250);
+		if (client && this.isEnabled() && this.queue.length > 0) this.scheduleFlush(250);
 	}
 
 	snapshot(): BotLogRelaySnapshot {
 		return {
-			enabled: this.data.enabled,
+			enabled: this.isEnabled(),
+			forcedOff: appConfig.botLogRelayForceOff,
 			targetTalkMid: appConfig.botLogRelayTalkMid,
 			clientReady: this.client !== null,
 			queued: this.queue.length,
 			dropped: this.dropped,
+			suppressed: this.suppressed,
 			lastSentAt: this.lastSentAt,
 			lastError: this.lastError,
 			updatedAt: this.data.updatedAt,
@@ -165,20 +189,32 @@ class BotLogRelay {
 	}
 
 	async setEnabled(enabled: boolean, updatedBy: string): Promise<"enabled" | "disabled" | "unchanged"> {
+		if (enabled && appConfig.botLogRelayForceOff) {
+			throw new Error("BOT_LOG_RELAY_FORCE_OFF=true のため、環境変数側で停止されています。");
+		}
 		if (this.data.enabled === enabled) return "unchanged";
-		this.data = {
-			version: 1,
+		const previous = { ...this.data };
+		const next: BotLogRelayFile = {
+			version: 2,
 			enabled,
 			updatedAt: new Date().toISOString(),
 			updatedBy,
 		};
+		this.data = next;
+		try {
+			await this.save();
+		} catch (error) {
+			this.data = previous;
+			await this.writeLocal(previous).catch(() => {});
+			throw error;
+		}
 		if (!enabled) {
 			if (this.flushTimer) clearTimeout(this.flushTimer);
 			this.flushTimer = undefined;
 			this.queue = [];
 			this.dropped = 0;
+			this.suppressed = 0;
 		}
-		await this.save();
 		if (enabled) {
 			this.capture("INFO", ["[bot-log-relay] LINEログ転送を有効化しました"]);
 		}
@@ -195,14 +231,14 @@ class BotLogRelay {
 	async shutdown(): Promise<void> {
 		if (this.flushTimer) clearTimeout(this.flushTimer);
 		this.flushTimer = undefined;
-		if (this.client && this.data.enabled && this.queue.length > 0) {
+		if (this.client && this.isEnabled() && this.queue.length > 0) {
 			await this.flush().catch(() => {});
 		}
 		await this.saveQueue.catch(() => {});
 	}
 
 	private capture(level: BotLogLevel, args: unknown[]): void {
-		if (!this.data.enabled) return;
+		if (!this.isEnabled()) return;
 		try {
 			const formatted = formatWithOptions({
 				colors: false,
@@ -214,6 +250,10 @@ class BotLogRelay {
 			}, ...args);
 			const text = this.redact(formatted).replace(/\u001b\[[0-9;]*m/g, "").slice(0, ENTRY_MAX_CHARS);
 			if (!text) return;
+			if (INTERNAL_LOG_PREFIXES.some((prefix) => text.startsWith(prefix))) {
+				this.suppressed++;
+				return;
+			}
 			this.queue.push({ at: Date.now(), level, text });
 			while (this.queue.length > appConfig.botLogRelayMaxQueue) {
 				this.queue.shift();
@@ -243,21 +283,27 @@ class BotLogRelay {
 	}
 
 	private scheduleFlush(delayMs = appConfig.botLogRelayBatchMs): void {
-		if (!this.data.enabled || this.flushTimer || this.flushing) return;
+		if (!this.isEnabled() || this.flushTimer || this.flushing) return;
+		const sendIntervalRemaining = Math.max(
+			0,
+			MIN_SEND_INTERVAL_MS - (Date.now() - this.lastSendAttemptAt),
+		);
+		const safeDelayMs = Math.max(delayMs, sendIntervalRemaining);
 		this.flushTimer = setTimeout(() => {
 			this.flushTimer = undefined;
 			void this.flush();
-		}, delayMs);
+		}, safeDelayMs);
 	}
 
 	private async flush(): Promise<void> {
-		if (this.flushing || !this.data.enabled || !this.client || this.queue.length === 0) return;
+		if (this.flushing || !this.isEnabled() || !this.client || this.queue.length === 0) return;
 		this.flushing = true;
 		let retry = false;
 		try {
 			for (let sent = 0; sent < MAX_BATCHES_PER_FLUSH && this.queue.length > 0; sent++) {
 				const batch = this.takeBatch();
 				try {
+					this.lastSendAttemptAt = Date.now();
 					await this.client.base.talk.sendMessage({
 						to: appConfig.botLogRelayTalkMid,
 						text: this.batchText(batch),
@@ -330,6 +376,10 @@ class BotLogRelay {
 		const temporary = `${appConfig.botLogRelayFile}.tmp`;
 		await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 		await fs.rename(temporary, appConfig.botLogRelayFile);
+	}
+
+	private isEnabled(): boolean {
+		return this.data.enabled && !appConfig.botLogRelayForceOff;
 	}
 }
 

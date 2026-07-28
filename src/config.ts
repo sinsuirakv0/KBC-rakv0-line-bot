@@ -148,9 +148,10 @@ export const appConfig = {
 		process.env.BOT_LOG_RELAY_GITHUB_PATH || "settings/bot-log-relay.json",
 	botLogRelayTalkMid:
 		process.env.BOT_LOG_RELAY_TALK_MID || "c1b419211a74dbc992a4b597bf69dc20b",
+	botLogRelayForceOff: boolEnv("BOT_LOG_RELAY_FORCE_OFF", false),
 	botLogRelayE2ee: boolEnv("BOT_LOG_RELAY_E2EE", true),
-	botLogRelayBatchMs: numberEnv("BOT_LOG_RELAY_BATCH_MS", 3_000, {
-		min: 1_000,
+	botLogRelayBatchMs: numberEnv("BOT_LOG_RELAY_BATCH_MS", 15_000, {
+		min: 5_000,
 		max: 60_000,
 		integer: true,
 	}),
