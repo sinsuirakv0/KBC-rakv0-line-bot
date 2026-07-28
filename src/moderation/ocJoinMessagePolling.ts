@@ -30,8 +30,6 @@ interface WatchedMemberMessageChat {
 
 const POLLING_INTERVAL_MS = 1_000;
 const ERROR_RETRY_MS = 30_000;
-const JOINED_CHAT_PAGE_SIZE = 100;
-const MAX_JOINED_CHAT_PAGES = 50;
 // 1つのOCの過去イベント取得で、他のOCの参加通知監視を止めない。
 const MAX_CATCH_UP_PAGES_PER_TURN = 3;
 
@@ -69,6 +67,11 @@ function compactError(error: unknown): string {
 	} catch {
 		return String(error);
 	}
+}
+
+function isNotJoinedSquareChatError(error: unknown): boolean {
+	const detail = compactError(error);
+	return /NOT_FOUND|NOT_A_MEMBER|not a member|メンバーではありません|status=404/i.test(detail);
 }
 
 function wait(ms: number, signal: AbortSignal): Promise<void> {
@@ -352,23 +355,30 @@ function mergeMemberMessageSettings(
 	return [...byChatMid.values()];
 }
 
-async function fetchJoinedSquareChatMids(client: Client): Promise<Set<string>> {
+async function confirmJoinedSquareChatMids(
+	client: Client,
+	settings: WatchedMemberMessageChat[],
+): Promise<Set<string>> {
 	const squareChatMids = new Set<string>();
-	let continuationToken: string | undefined;
-	for (let page = 0; page < MAX_JOINED_CHAT_PAGES; page++) {
-		const response = await client.base.square.getJoinedSquareChats({
-			request: {
-				limit: JOINED_CHAT_PAGE_SIZE,
-				...(continuationToken ? { continuationToken } : {}),
-			},
-		});
-		for (const chat of response.chats ?? []) {
-			const squareChatMid = rawString(chat.squareChatMid);
-			if (squareChatMid) squareChatMids.add(squareChatMid);
+	for (const setting of settings) {
+		try {
+			const response = await client.base.square.getSquareChat({
+				squareChatMid: setting.squareChatMid,
+			});
+			if (response.squareChat.squareChatMid !== setting.squareChatMid) {
+				throw new Error("getSquareChat returned a different squareChatMid");
+			}
+			squareChatMids.add(setting.squareChatMid);
+		} catch (error) {
+			if (!isNotJoinedSquareChatError(error)) {
+				throw new Error(
+					`OpenChat membership confirmation failed for ${setting.squareChatMid}: ${compactError(error)}`,
+				);
+			}
+			console.log("[oc-member-message:chat-poll] configured chat skipped because this bot is not a member", {
+				squareChatMid: setting.squareChatMid,
+			});
 		}
-		const nextContinuationToken = rawString(response.continuationToken);
-		if (!nextContinuationToken || nextContinuationToken === continuationToken) break;
-		continuationToken = nextContinuationToken;
 	}
 	return squareChatMids;
 }
@@ -381,23 +391,18 @@ export async function listenOpenChatJoinMessageEvents(
 ): Promise<void> {
 	const configuredSettings = mergeMemberMessageSettings();
 	const joinedSquareChatMids = configuredSettings.length > 0
-		? await fetchJoinedSquareChatMids(client)
+		? await confirmJoinedSquareChatMids(client, configuredSettings)
 		: new Set<string>();
 	const joinedSettings = mergeMemberMessageSettings(joinedSquareChatMids);
 	const ignoredSettings = configuredSettings.filter(
 		(setting) => !joinedSquareChatMids.has(setting.squareChatMid),
 	);
-	console.log("[oc-member-message:chat-poll] joined OpenChat chats loaded", {
+	console.log("[oc-member-message:chat-poll] configured OpenChat memberships confirmed", {
 		joinedChatCount: joinedSquareChatMids.size,
 		configuredChatCount: configuredSettings.length,
 		watchedChatCount: joinedSettings.length,
 		ignoredChatCount: ignoredSettings.length,
 	});
-	if (ignoredSettings.length > 0) {
-		console.log("[oc-member-message:chat-poll] configured chats skipped because this bot is not a member", {
-			squareChatMids: ignoredSettings.map((setting) => setting.squareChatMid),
-		});
-	}
 	const states = new Map<string, ChatPollingState>();
 	while (!signal.aborted) {
 		lineHealth.markHeartbeat("member-message");
