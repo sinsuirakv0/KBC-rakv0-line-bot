@@ -106,6 +106,14 @@ async function handleJoinEvent(
 		});
 		return;
 	}
+	console.log("[oc-left-soon] chat poll join forwarded", {
+		squareMid,
+		squareChatMid,
+		memberMid,
+		joinedAt,
+		memberCreatedAt,
+		replayed: joinedAt < ignoreBefore,
+	});
 	await handleOpenChatMemberJoin({
 		client,
 		squareMid,
@@ -153,6 +161,15 @@ async function handleLeaveEvent(
 		});
 		return;
 	}
+	console.log("[oc-left-soon] chat poll leave forwarded", {
+		squareMid,
+		squareChatMid,
+		memberMid,
+		leftAt,
+		memberCreatedAt,
+		replayed: leftAt < ignoreBefore,
+		leftSoonMonitoringEnabled: ocModerationSettingsStore.snapshot(squareMid).leftSoonMonitoringEnabled,
+	});
 	await handleOpenChatMemberLeave({
 		client,
 		squareMid,

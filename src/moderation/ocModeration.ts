@@ -1347,7 +1347,14 @@ async function handleLeftSoonDecision(
 	info: OcRecentLeaveDecisionInfo,
 ): Promise<void> {
 	const settings = ocModerationSettingsStore.snapshot(event.squareMid);
-	if (!settings.leftSoonMonitoringEnabled) return;
+	if (!settings.leftSoonMonitoringEnabled) {
+		console.log("[oc-left-soon] decision ignored because monitoring is disabled", {
+			squareMid: event.squareMid,
+			squareChatMid: event.squareChatMid,
+			memberMid: event.memberMid,
+		});
+		return;
+	}
 	const mode = leftSoonMode(info);
 	console.log("[oc-left-soon] decision", {
 		squareMid: event.squareMid,
@@ -1803,8 +1810,22 @@ export async function handleOpenChatMemberLeave(
 			at: event.leftAt,
 			clearAllChats: false,
 		});
-		if (suppressActions) return;
-		if (!ocModerationSettingsStore.snapshot(event.squareMid).leftSoonMonitoringEnabled) return;
+		if (suppressActions) {
+			console.log("[oc-left-soon] chat leave action suppressed", {
+				squareMid: event.squareMid,
+				squareChatMid: event.squareChatMid,
+				memberMid: event.memberMid,
+			});
+			return;
+		}
+		if (!ocModerationSettingsStore.snapshot(event.squareMid).leftSoonMonitoringEnabled) {
+			console.log("[oc-left-soon] chat leave ignored because monitoring is disabled", {
+				squareMid: event.squareMid,
+				squareChatMid: event.squareChatMid,
+				memberMid: event.memberMid,
+			});
+			return;
+		}
 		if (!await isMainSquareChat(event.client, event.squareMid, event.squareChatMid)) {
 			console.log("[oc-left-soon] subchat leave ignored", {
 				squareMid: event.squareMid,

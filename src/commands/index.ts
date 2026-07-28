@@ -3,6 +3,7 @@ import type { LineCommand, ReplyableLineMessage } from "./shared.js";
 import { startCommandProgress } from "./progress.js";
 import { banCommand } from "./ban.js";
 import { botCommand } from "./bot.js";
+import { botLogCommand } from "./botLog.js";
 import { enemyCommand } from "./enemy.js";
 import { eventCommand } from "./event.js";
 import { gatyaCommand } from "./gatya.js";
@@ -39,6 +40,7 @@ for (const command of [
 	banCommand,
 	testCommand,
 	helpCommand,
+	botLogCommand,
 	botCommand,
 ]) {
 	commands.set(command.name, command);
