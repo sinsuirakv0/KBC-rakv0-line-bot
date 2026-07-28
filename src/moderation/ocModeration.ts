@@ -26,7 +26,6 @@ import {
 	type OcUrlRuleScope,
 	type ParsedOcUrl,
 } from "./ocUrlPolicy.js";
-import { isSquareMembershipLeft } from "./squareMembership.js";
 
 type SquareRole = string | number | undefined;
 
@@ -73,6 +72,7 @@ export interface OpenChatMemberLeaveEvent {
 	memberMid: string;
 	displayName?: string;
 	leftAt?: number;
+	memberCreatedAt?: number;
 	clearAllChats?: boolean;
 	source: "square-member" | "chat-member";
 }
@@ -114,6 +114,7 @@ const COHORT_JOIN_WINDOW_MS = 2 * 60_000;
 const COHORT_MIN_MEMBERS = 3;
 const COHORT_WATCH_MS = 30 * 60_000;
 const ROLE_CACHE_MS = 5 * 60_000;
+const MAIN_CHAT_CACHE_MS = 6 * 60 * 60_000;
 const MEMBER_CACHE_MAX = 5_000;
 const MEMBER_CACHE_RETAIN = 4_000;
 const LOGGED_COHORTS_MAX = 2_000;
@@ -147,6 +148,8 @@ const noteScanRequests = new Map<string, Promise<boolean>>();
 const noteScanLastStartedAt = new Map<string, number>();
 const loggedMediaTypes = new Set<string>();
 const loggedCohorts = new Set<string>();
+const mainChatMidCache = new Map<string, { chatMid: string; expiresAt: number }>();
+const mainChatResolutionRequests = new Map<string, Promise<string | undefined>>();
 
 function positiveNumber(value: number, fallback: number, minimum: number): number {
 	if (!Number.isFinite(value)) return fallback;
@@ -191,6 +194,112 @@ function containsDeniedOcUrl(squareMid: string, text: string | undefined): boole
 
 function stringValue(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function cacheMainChatMid(squareMid: string, chatMid: string): string {
+	mainChatMidCache.set(squareMid, {
+		chatMid,
+		expiresAt: Date.now() + MAIN_CHAT_CACHE_MS,
+	});
+	return chatMid;
+}
+
+async function resolveMainSquareChatMid(
+	client: Client,
+	squareMid: string,
+	sourceChatMid?: string,
+): Promise<string | undefined> {
+	const cached = mainChatMidCache.get(squareMid);
+	if (cached && cached.expiresAt > Date.now()) return cached.chatMid;
+
+	const running = mainChatResolutionRequests.get(squareMid);
+	if (running) return await running;
+	const request = (async () => {
+		if (sourceChatMid) {
+			try {
+				const response = await client.base.livetalk.getSquareInfoByChatMid({
+					request: { squareChatMid: sourceChatMid },
+				});
+				const defaultChatMid = stringValue((response as { defaultChatMid?: unknown }).defaultChatMid);
+				if (defaultChatMid) return cacheMainChatMid(squareMid, defaultChatMid);
+			} catch (error) {
+				console.warn("[oc-left-soon] getSquareInfoByChatMid failed while resolving main chat", {
+					squareMid,
+					sourceChatMid,
+					error: compactError(error),
+				});
+			}
+
+			try {
+				const response = await client.base.square.getSquareChat({ squareChatMid: sourceChatMid });
+				const chat = (response as {
+					squareChat?: { squareMid?: unknown; squareChatMid?: unknown; type?: unknown };
+				}).squareChat;
+				const type = chat?.type;
+				if (
+					stringValue(chat?.squareMid) === squareMid &&
+					(type === 4 || type === "SQUARE_DEFAULT")
+				) {
+					return cacheMainChatMid(
+						squareMid,
+						stringValue(chat?.squareChatMid) ?? sourceChatMid,
+					);
+				}
+			} catch (error) {
+				console.warn("[oc-left-soon] getSquareChat failed while resolving main chat", {
+					squareMid,
+					sourceChatMid,
+					error: compactError(error),
+				});
+			}
+		}
+
+		try {
+			let continuationToken = "";
+			for (let page = 0; page < 10; page++) {
+				const response = await client.base.square.getJoinedSquareChats({
+					request: { continuationToken, limit: 100 },
+				});
+				const raw = response as { chats?: unknown[]; continuationToken?: unknown };
+				for (const entry of raw.chats ?? []) {
+					const chat = entry as { squareMid?: unknown; squareChatMid?: unknown; type?: unknown };
+					if (stringValue(chat.squareMid) !== squareMid) continue;
+					if (chat.type !== 4 && chat.type !== "SQUARE_DEFAULT") continue;
+					const chatMid = stringValue(chat.squareChatMid);
+					if (chatMid) return cacheMainChatMid(squareMid, chatMid);
+				}
+				continuationToken = stringValue(raw.continuationToken) ?? "";
+				if (!continuationToken) break;
+			}
+		} catch (error) {
+			console.warn("[oc-left-soon] failed to list chats while resolving main chat", {
+				squareMid,
+				error: compactError(error),
+			});
+		}
+		return undefined;
+	})().finally(() => {
+		mainChatResolutionRequests.delete(squareMid);
+	});
+	mainChatResolutionRequests.set(squareMid, request);
+	return await request;
+}
+
+async function isMainSquareChat(
+	client: Client,
+	squareMid: string,
+	squareChatMid: string | undefined,
+): Promise<boolean> {
+	if (!squareChatMid) return false;
+	const mainChatMid = await resolveMainSquareChatMid(client, squareMid, squareChatMid);
+	if (!mainChatMid) {
+		console.warn("[oc-left-soon] main chat could not be resolved", {
+			squareMid,
+			squareChatMid,
+		});
+		return false;
+	}
+	return mainChatMid === squareChatMid;
 }
 
 function finiteTimestamp(value: number | undefined): number {
@@ -1014,47 +1123,7 @@ async function resolveLeftSoonNoticeChatMid(
 	squareMid: string,
 	fallbackChatMid: string | undefined,
 ): Promise<string | undefined> {
-	if (fallbackChatMid) {
-		try {
-			const response = await client.base.livetalk.getSquareInfoByChatMid({
-				request: { squareChatMid: fallbackChatMid },
-			});
-			const defaultChatMid = stringValue((response as { defaultChatMid?: unknown }).defaultChatMid);
-			if (defaultChatMid) return defaultChatMid;
-		} catch (error) {
-			console.warn("[oc-left-soon] failed to resolve default chat from fallback", {
-				squareMid,
-				fallbackChatMid,
-				error: compactError(error),
-			});
-		}
-	}
-
-	try {
-		let continuationToken = "";
-		for (let page = 0; page < 10; page++) {
-			const response = await client.base.square.getJoinedSquareChats({
-				request: { continuationToken, limit: 100 },
-			});
-			const raw = response as { chats?: unknown[]; continuationToken?: unknown };
-			for (const entry of raw.chats ?? []) {
-				const chat = entry as { squareMid?: unknown; squareChatMid?: unknown; type?: unknown };
-				if (stringValue(chat.squareMid) !== squareMid) continue;
-				if (chat.type === 4 || chat.type === "SQUARE_DEFAULT") {
-					const chatMid = stringValue(chat.squareChatMid);
-					if (chatMid) return chatMid;
-				}
-			}
-			continuationToken = stringValue(raw.continuationToken) ?? "";
-			if (!continuationToken) break;
-		}
-	} catch (error) {
-		console.warn("[oc-left-soon] failed to list joined square chats", {
-			squareMid,
-			error: compactError(error),
-		});
-	}
-	return fallbackChatMid;
+	return await resolveMainSquareChatMid(client, squareMid, fallbackChatMid) ?? fallbackChatMid;
 }
 
 async function sendLeftSoonMainNotice(
@@ -1267,7 +1336,6 @@ async function maybeStartJoinCohortWatch(event: OpenChatMemberJoinEvent): Promis
 function leftSoonMode(info: OcRecentLeaveDecisionInfo): "auto" | "review" | "log" | "none" {
 	if (!info.recorded) return "none";
 	if (info.stayMs === undefined) return "none";
-	if (info.remainingChatMids.length > 0) return info.stayMs <= LEFT_SOON_REVIEW_MS ? "log" : "none";
 	if (!info.isFirstJoin) return info.stayMs <= LEFT_SOON_REVIEW_MS ? "log" : "none";
 	if (info.stayMs <= LEFT_SOON_AUTO_BAN_MS) return "auto";
 	if (info.stayMs <= LEFT_SOON_REVIEW_MS) return "review";
@@ -1288,7 +1356,6 @@ async function handleLeftSoonDecision(
 		mode,
 		stayMs: info.stayMs,
 		isFirstJoin: info.isFirstJoin,
-		remainingChatCount: info.remainingChatMids.length,
 		messageCount: info.messageCount,
 		joinedAt: info.joinedAt,
 		lastMessageAt: info.lastMessageAt,
@@ -1299,39 +1366,32 @@ async function handleLeftSoonDecision(
 
 	const targetName = info.displayName ?? event.displayName;
 	if (mode === "log") {
-		const hasRemainingChats = info.remainingChatMids.length > 0;
 		await sendModRoomLog(
 			event.client,
 			event.squareMid,
 			[
-				hasRemainingChats
-					? "【監視ログ】参加後30分以内の退会（サブトーク残存）"
-					: "【監視ログ】再参加者の短時間退会",
+				"【監視ログ】再参加者の本OC短時間退室",
 				"",
 				`対象: ${memberLine(targetName, event.memberMid)}`,
 				`参加時間: ${formatParticipationDuration(info.stayMs)}`,
 				`発言数: ${info.messageCount}`,
 				`最後の発言: ${lastMessageLine(info)}`,
-				`サブトーク残存: ${hasRemainingChats ? "あり" : "なし"}`,
 				"処分: 未実行",
 				"",
-				hasRemainingChats
-					? "サブトークに残っているため、OC全体からの退会とは扱わず、自動再参加禁止は行いませんでした。"
-					: "初参加ではないため、自動再参加禁止や確認待ち処分は行いませんでした。",
+				"初参加ではないため、自動再参加禁止や確認待ち処分は行いませんでした。",
 			].join("\n"),
 			{
 				type: "left_soon_log",
 				status: "open",
 				targetMid: event.memberMid,
 				targetName,
-				reason: "left-soon-but-chat-remains",
+				reason: "returning-member-left-main-chat-soon",
 				payload: {
 					stayMs: info.stayMs,
 					messageCount: info.messageCount,
 					joinedAt: info.joinedAt,
 					lastMessageAt: info.lastMessageAt,
 					lastMessageText: info.lastMessageText,
-					remainingChatMids: info.remainingChatMids,
 				},
 			},
 		);
@@ -1349,7 +1409,6 @@ async function handleLeftSoonDecision(
 				`参加時間: ${formatParticipationDuration(info.stayMs)}`,
 				`発言数: ${info.messageCount}`,
 				`最後の発言: ${lastMessageLine(info)}`,
-				"サブトーク残存: なし",
 				"処分: 未実行",
 				"",
 				"このログに「再参加禁止」と返信すると、対象を再参加禁止にします。",
@@ -1393,12 +1452,11 @@ async function handleLeftSoonDecision(
 			`参加時間: ${formatParticipationDuration(info.stayMs)}`,
 			`発言数: ${info.messageCount}`,
 			`最後の発言: ${lastMessageLine(info)}`,
-			"サブトーク残存: なし",
 			`処分: ${banResult.ok ? "再参加禁止" : "再参加禁止失敗"}`,
 			banResult.error ? `エラー: ${banResult.error}` : "",
 			"",
 			"理由:",
-			"参加後5分以内にOC全体から退会し、サブトークにも残っていなかったため、",
+			"参加後5分以内に本OCから退室したため、",
 			"即抜け荒らし対策として自動的に再参加禁止にしました。",
 			"",
 			"誤入室だった可能性がある場合は、このログに「解除」と返信してください。",
@@ -1585,29 +1643,6 @@ export async function handleOpenChatMemberJoin(
 		return;
 	}
 
-	// 本OC参加イベントが届かない環境でも、SquareMember.createdAt を参加時刻として補完する。
-	// 既存メンバーがサブトークへ入っただけの場合はcreatedAtが過去になるため、即抜け判定には該当しない。
-	if (event.memberCreatedAt !== undefined) {
-		const result = ocMemberActivityStore.recordSquareJoin({
-			squareMid: event.squareMid,
-			squareChatMid: event.squareChatMid,
-			memberMid: event.memberMid,
-			displayName: event.displayName,
-			at: event.memberCreatedAt,
-		});
-		ocRecentPresenceStore.recordSquareJoin({
-			squareMid: event.squareMid,
-			squareChatMid: event.squareChatMid,
-			memberMid: event.memberMid,
-			displayName: event.displayName,
-			at: event.memberCreatedAt,
-			isFirstJoin: result.isFirstJoin,
-		});
-		if (result.recorded && !suppressActions) await maybeStartJoinCohortWatch({
-			...event,
-			joinedAt: event.memberCreatedAt,
-		});
-	}
 	ocMemberActivityStore.recordChatJoin({
 		squareMid: event.squareMid,
 		squareChatMid: event.squareChatMid,
@@ -1615,13 +1650,103 @@ export async function handleOpenChatMemberJoin(
 		displayName: event.displayName,
 		at: event.joinedAt,
 	});
-	ocRecentPresenceStore.recordChatJoin({
+	if (!await isMainSquareChat(event.client, event.squareMid, event.squareChatMid)) {
+		console.log("[oc-left-soon] subchat join ignored", {
+			squareMid: event.squareMid,
+			squareChatMid: event.squareChatMid,
+			memberMid: event.memberMid,
+		});
+		return;
+	}
+
+	const existingRecent = ocRecentPresenceStore.snapshot(event.squareMid, event.memberMid);
+	const result = ocMemberActivityStore.recordSquareJoin({
 		squareMid: event.squareMid,
 		squareChatMid: event.squareChatMid,
 		memberMid: event.memberMid,
 		displayName: event.displayName,
-		at: event.joinedAt,
+		at: event.memberCreatedAt ?? event.joinedAt,
 	});
+	const joinedAt = event.joinedAt ?? event.memberCreatedAt;
+	const recent = ocRecentPresenceStore.recordSquareJoin({
+		squareMid: event.squareMid,
+		squareChatMid: event.squareChatMid,
+		memberMid: event.memberMid,
+		displayName: event.displayName,
+		at: joinedAt,
+		isFirstJoin: result.recorded ? result.isFirstJoin : existingRecent?.isFirstJoin ?? false,
+	});
+	console.log("[oc-left-soon] main chat join tracked", {
+		squareMid: event.squareMid,
+		squareChatMid: event.squareChatMid,
+		memberMid: event.memberMid,
+		joinedAt,
+		recentRecorded: Boolean(recent),
+		isFirstJoin: recent?.isFirstJoin,
+		activityRecorded: result.recorded,
+		activityReason: result.reason,
+	});
+	if (result.recorded && !suppressActions) await maybeStartJoinCohortWatch({
+		...event,
+		joinedAt,
+	});
+}
+
+async function restoreRecentPresenceForLeave(
+	event: OpenChatMemberLeaveEvent,
+	suppressNetworkLookup: boolean,
+): Promise<OpenChatMemberLeaveEvent> {
+	if (ocRecentPresenceStore.snapshot(event.squareMid, event.memberMid)) return event;
+
+	let memberCreatedAt = event.memberCreatedAt;
+	let displayName = event.displayName;
+	if (memberCreatedAt === undefined && !suppressNetworkLookup) {
+		try {
+			const response = await event.client.base.square.getSquareMember({
+				squareMemberMid: event.memberMid,
+			});
+			memberCreatedAt = Number(response.squareMember.createdAt) || undefined;
+			displayName = response.squareMember.displayName || displayName;
+		} catch (error) {
+			console.warn("[oc-left-soon] failed to restore missing join from member profile", {
+				squareMid: event.squareMid,
+				squareChatMid: event.squareChatMid,
+				memberMid: event.memberMid,
+				error: compactError(error),
+			});
+		}
+	}
+	if (memberCreatedAt === undefined) return event;
+
+	const result = ocMemberActivityStore.recordSquareJoin({
+		squareMid: event.squareMid,
+		squareChatMid: event.squareChatMid,
+		memberMid: event.memberMid,
+		displayName,
+		at: memberCreatedAt,
+	});
+	const restored = ocRecentPresenceStore.recordSquareJoin({
+		squareMid: event.squareMid,
+		squareChatMid: event.squareChatMid,
+		memberMid: event.memberMid,
+		displayName,
+		at: memberCreatedAt,
+		isFirstJoin: result.isFirstJoin,
+	});
+	console.log("[oc-left-soon] missing join session restore attempted", {
+		squareMid: event.squareMid,
+		squareChatMid: event.squareChatMid,
+		memberMid: event.memberMid,
+		memberCreatedAt,
+		restored: Boolean(restored),
+		isFirstJoin: restored?.isFirstJoin,
+		activityReason: result.reason,
+	});
+	return {
+		...event,
+		displayName,
+		memberCreatedAt,
+	};
 }
 
 async function processSquareMemberLeave(
@@ -1678,72 +1803,32 @@ export async function handleOpenChatMemberLeave(
 			at: event.leftAt,
 			clearAllChats: false,
 		});
-		const recentPresence = ocRecentPresenceStore.recordChatLeave({
+		if (suppressActions) return;
+		if (!ocModerationSettingsStore.snapshot(event.squareMid).leftSoonMonitoringEnabled) return;
+		if (!await isMainSquareChat(event.client, event.squareMid, event.squareChatMid)) {
+			console.log("[oc-left-soon] subchat leave ignored", {
+				squareMid: event.squareMid,
+				squareChatMid: event.squareChatMid,
+				memberMid: event.memberMid,
+			});
+			return;
+		}
+		const restoredEvent = await restoreRecentPresenceForLeave(event, false);
+		console.log("[oc-left-soon] main chat leave detected", {
 			squareMid: event.squareMid,
 			squareChatMid: event.squareChatMid,
 			memberMid: event.memberMid,
-			displayName: event.displayName,
-			at: event.leftAt,
+			hasRecentPresence: Boolean(ocRecentPresenceStore.snapshot(event.squareMid, event.memberMid)),
 		});
-		if (suppressActions) return;
-		if (!ocModerationSettingsStore.snapshot(event.squareMid).leftSoonMonitoringEnabled) return;
-		if (!recentPresence) {
-			console.log("[oc-left-soon] chat leave has no recent presence session", {
-				squareMid: event.squareMid,
-				squareChatMid: event.squareChatMid,
-				memberMid: event.memberMid,
-			});
-			return;
-		}
-		const activeChatMids = recentPresence.chats
-			.filter((chat) => chat.active)
-			.map((chat) => chat.chatMid);
-		if (activeChatMids.length > 0) {
-			console.log("[oc-left-soon] chat leave kept as subchat-only by recent presence", {
-				squareMid: event.squareMid,
-				squareChatMid: event.squareChatMid,
-				memberMid: event.memberMid,
-				activeChatMids,
-			});
-			return;
-		}
-		try {
-			const response = await event.client.base.square.getSquareMember({
-				squareMemberMid: event.memberMid,
-			});
-			const member = response.squareMember;
-			if (!isSquareMembershipLeft(member.membershipState)) {
-				console.log("[oc-left-soon] chat leave kept as subchat-only", {
-					squareMid: event.squareMid,
-					squareChatMid: event.squareChatMid,
-					memberMid: event.memberMid,
-					membershipState: String(member.membershipState),
-				});
-				return;
-			}
-			console.log("[oc-left-soon] chat leave promoted to square leave", {
-				squareMid: event.squareMid,
-				squareChatMid: event.squareChatMid,
-				memberMid: event.memberMid,
-				membershipState: String(member.membershipState),
-			});
-			await processSquareMemberLeave({
-				...event,
-				displayName: member.displayName || event.displayName,
-				clearAllChats: true,
-				source: "square-member",
-			}, { suppressActions });
-		} catch (error) {
-			console.warn("[oc-left-soon] failed to verify member state after chat leave", {
-				squareMid: event.squareMid,
-				squareChatMid: event.squareChatMid,
-				memberMid: event.memberMid,
-				error: compactError(error),
-			});
-		}
+		await processSquareMemberLeave({
+			...restoredEvent,
+			clearAllChats: true,
+			source: "square-member",
+		}, { suppressActions });
 		return;
 	}
-	await processSquareMemberLeave(event, { suppressActions });
+	const restoredEvent = await restoreRecentPresenceForLeave(event, suppressActions);
+	await processSquareMemberLeave(restoredEvent, { suppressActions });
 }
 
 async function canHandleModerationCaseReply(message: ReplyableLineMessage): Promise<boolean> {

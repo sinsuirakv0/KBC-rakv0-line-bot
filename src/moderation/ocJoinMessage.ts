@@ -29,7 +29,7 @@ function cleanDisplayName(value: string | undefined): string | undefined {
 	return trimmed;
 }
 
-function nameFromJoinNotificationText(text: string | undefined): string | undefined {
+export function nameFromJoinNotificationText(text: string | undefined): string | undefined {
 	const normalized = text?.replace(/\s+/g, " ").trim();
 	if (!normalized) return undefined;
 	for (const pattern of [

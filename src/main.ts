@@ -49,6 +49,7 @@ import {
 	handleOpenChatJoinEventMessage,
 	handleOpenChatLeaveEventMessage,
 	handleOpenChatJoinSystemMessage,
+	nameFromJoinNotificationText,
 } from "./moderation/ocJoinMessage.js";
 import { listenOpenChatJoinMessageEvents } from "./moderation/ocJoinMessagePolling.js";
 import { ocModerationSettingsStore } from "./moderation/ocModerationSettings.js";
@@ -252,6 +253,80 @@ function nameFromLeaveNotificationText(text: string | undefined): string | undef
 		if (name) return name;
 	}
 	return undefined;
+}
+
+async function handleOpenChatMemberSystemMessage(
+	client: Client,
+	rawMessage: NonNullable<RawSquareMessage["message"]>,
+	destination: SquareReplyTarget["destination"],
+	threadMid?: string,
+): Promise<void> {
+	if (threadMid || !rawMessage.from?.startsWith("p")) return;
+	const createdAt = rawMessage.createdTime === undefined
+		? undefined
+		: Number(rawMessage.createdTime);
+	const joinedName = nameFromJoinNotificationText(rawMessage.text);
+	if (joinedName) {
+		console.log("[oc-left-soon] join system message detected", {
+			squareMid: destination.scopeMid,
+			squareChatMid: destination.chatMid,
+			memberMid: rawMessage.from,
+			createdAt,
+		});
+		await handleOpenChatMemberJoin({
+			client,
+			squareMid: destination.scopeMid,
+			squareChatMid: destination.chatMid,
+			memberMid: rawMessage.from,
+			displayName: joinedName,
+			joinedAt: createdAt,
+			source: "chat-member",
+		});
+		return;
+	}
+
+	const leftName = nameFromLeaveNotificationText(rawMessage.text);
+	if (!leftName) return;
+	try {
+		const response = await client.base.square.getSquareChatMember({
+			request: {
+				squareMemberMid: rawMessage.from,
+				squareChatMid: destination.chatMid,
+			},
+		});
+		if (!isSquareChatMembershipLeft(response.squareChatMember.membershipState)) {
+			console.log("[oc-left-soon] leave-like text ignored because member is still in main chat", {
+				squareMid: destination.scopeMid,
+				squareChatMid: destination.chatMid,
+				memberMid: rawMessage.from,
+				membershipState: String(response.squareChatMember.membershipState),
+			});
+			return;
+		}
+	} catch (error) {
+		console.warn("[oc-left-soon] leave system message verification failed", {
+			squareMid: destination.scopeMid,
+			squareChatMid: destination.chatMid,
+			memberMid: rawMessage.from,
+			error,
+		});
+		return;
+	}
+	console.log("[oc-left-soon] leave system message detected", {
+		squareMid: destination.scopeMid,
+		squareChatMid: destination.chatMid,
+		memberMid: rawMessage.from,
+		createdAt,
+	});
+	await handleOpenChatMemberLeave({
+		client,
+		squareMid: destination.scopeMid,
+		squareChatMid: destination.chatMid,
+		memberMid: rawMessage.from,
+		displayName: leftName,
+		leftAt: createdAt,
+		source: "chat-member",
+	});
 }
 
 function mentionMetadata(mentions: OutgoingMention[]): Record<string, string> {
@@ -556,7 +631,7 @@ async function memberActivityEventsFromSquareEvent(
 				squareChatMid,
 				memberMid: member.memberMid,
 				displayName: member.displayName,
-				joinedAt: member.createdAt ?? eventCreatedAt,
+				joinedAt: eventCreatedAt ?? member.createdAt,
 				memberCreatedAt: member.createdAt,
 				source: "chat-member",
 			});
@@ -579,6 +654,7 @@ async function memberActivityEventsFromSquareEvent(
 				memberMid,
 				displayName: member.displayName,
 				leftAt: eventCreatedAt,
+				memberCreatedAt: member.createdAt,
 				source: "chat-member",
 			});
 		}
@@ -637,6 +713,7 @@ async function memberActivityEventsFromSquareEvent(
 				memberMid,
 				displayName: member.displayName,
 				leftAt: eventCreatedAt,
+				memberCreatedAt: member.createdAt,
 				clearAllChats: true,
 				source: "square-member",
 			});
@@ -661,6 +738,7 @@ async function memberActivityEventsFromSquareEvent(
 				squareChatMid: leave.squareChatMid,
 				memberMid: leave.memberMid,
 				leftAt: leave.leftAt,
+				memberCreatedAt: leave.memberCreatedAt,
 				clearAllChats: leave.clearAllChats,
 			})),
 		});
@@ -710,6 +788,12 @@ async function handleSquareMessage(
 		chatMid,
 	);
 	recordSquareMessage(message, target.destination);
+	if (rawMessage) {
+		await handleOpenChatMemberSystemMessage(client, rawMessage, target.destination, threadMid)
+			.catch((error) => {
+				console.warn("[oc-left-soon] system message processing failed", error);
+			});
+	}
 	if (
 		rawMessage?.id &&
 		!permissionStore.isBotStopped(botStopTargetFromDestination(target.destination)) &&

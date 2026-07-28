@@ -4,17 +4,11 @@ import { appConfig } from "../config.js";
 import { runtimeWorkload } from "../runtime/workload.js";
 import { githubContentsClient } from "../storage/githubContents.js";
 
-export interface OcRecentChatPresence {
-	chatMid: string;
-	joinedAt?: string;
-	leftAt?: string;
-	active: boolean;
-}
-
 export interface OcRecentPresence {
 	squareMid: string;
 	memberMid: string;
 	displayName?: string;
+	mainChatMid?: string;
 	joinedAt: string;
 	leftAt?: string;
 	squareActive: boolean;
@@ -22,7 +16,6 @@ export interface OcRecentPresence {
 	messageCount: number;
 	lastMessageAt?: string;
 	lastMessageText?: string;
-	chats: OcRecentChatPresence[];
 	expiresAt: string;
 	updatedAt: string;
 }
@@ -61,19 +54,18 @@ export interface OcRecentLeaveDecisionInfo {
 	joinedAt?: string;
 	lastMessageAt?: string;
 	lastMessageText?: string;
-	remainingChatMids: string[];
 	isFirstJoin: boolean;
 	displayName?: string;
 }
 
 interface OcRecentPresenceFile {
-	version: 1;
+	version: 2;
 	presences: OcRecentPresence[];
 }
 
 const MONITORING_WINDOW_MS = 30 * 60_000;
 const MAX_CLOCK_FUTURE_MS = 60_000;
-const EMPTY_FILE: OcRecentPresenceFile = { version: 1, presences: [] };
+const EMPTY_FILE: OcRecentPresenceFile = { version: 2, presences: [] };
 
 function nowIso(): string {
 	return new Date().toISOString();
@@ -98,25 +90,12 @@ function presenceKey(squareMid: string, memberMid: string): string {
 	return `${squareMid}:${memberMid}`;
 }
 
-function parseChat(value: unknown): OcRecentChatPresence | undefined {
-	if (!value || typeof value !== "object") return undefined;
-	const item = value as Partial<OcRecentChatPresence>;
-	const chatMid = stringValue(item.chatMid);
-	if (!chatMid) return undefined;
-	return {
-		chatMid,
-		joinedAt: stringValue(item.joinedAt),
-		leftAt: stringValue(item.leftAt),
-		active: item.active === true,
-	};
-}
-
 function parseFile(value: unknown): OcRecentPresenceFile {
 	if (!value || typeof value !== "object") return structuredClone(EMPTY_FILE);
 	const raw = value as Partial<OcRecentPresenceFile>;
 	const presences = Array.isArray(raw.presences) ? raw.presences : [];
 	return {
-		version: 1,
+		version: 2,
 		presences: presences.flatMap((value) => {
 			const item = value as Partial<OcRecentPresence>;
 			const squareMid = stringValue(item.squareMid);
@@ -128,6 +107,7 @@ function parseFile(value: unknown): OcRecentPresenceFile {
 				squareMid,
 				memberMid,
 				displayName: stringValue(item.displayName),
+				mainChatMid: stringValue(item.mainChatMid),
 				joinedAt,
 				leftAt: stringValue(item.leftAt),
 				squareActive: item.squareActive === true,
@@ -135,21 +115,11 @@ function parseFile(value: unknown): OcRecentPresenceFile {
 				messageCount: Math.max(0, Math.floor(Number(item.messageCount) || 0)),
 				lastMessageAt: stringValue(item.lastMessageAt),
 				lastMessageText: stringValue(item.lastMessageText),
-				chats: Array.isArray(item.chats)
-					? item.chats.flatMap((chat) => {
-						const parsed = parseChat(chat);
-						return parsed ? [parsed] : [];
-					})
-					: [],
 				expiresAt,
 				updatedAt: stringValue(item.updatedAt) ?? joinedAt,
 			}];
 		}),
 	};
-}
-
-function activeChatMids(presence: OcRecentPresence): string[] {
-	return presence.chats.filter((chat) => chat.active).map((chat) => chat.chatMid);
 }
 
 class OcRecentPresenceStore {
@@ -197,8 +167,8 @@ class OcRecentPresenceStore {
 		const existing = this.presencesByKey.get(key);
 		if (existing?.squareActive) {
 			existing.displayName = input.displayName ?? existing.displayName;
+			existing.mainChatMid = input.squareChatMid ?? existing.mainChatMid;
 			existing.isFirstJoin = existing.isFirstJoin && input.isFirstJoin;
-			this.updateChat(existing, input.squareChatMid, joinedAtMs, true);
 			existing.updatedAt = nowIso();
 			this.scheduleSave();
 			return structuredClone(existing);
@@ -213,15 +183,14 @@ class OcRecentPresenceStore {
 			squareMid: input.squareMid,
 			memberMid: input.memberMid,
 			displayName: input.displayName,
+			mainChatMid: input.squareChatMid,
 			joinedAt,
 			squareActive: true,
 			isFirstJoin: input.isFirstJoin,
 			messageCount: 0,
-			chats: [],
 			expiresAt: new Date(joinedAtMs + MONITORING_WINDOW_MS).toISOString(),
 			updatedAt: nowIso(),
 		};
-		this.updateChat(presence, input.squareChatMid, joinedAtMs, true);
 		if (existing) {
 			const index = this.data.presences.indexOf(existing);
 			if (index >= 0) this.data.presences[index] = presence;
@@ -229,30 +198,6 @@ class OcRecentPresenceStore {
 			this.data.presences.push(presence);
 		}
 		this.presencesByKey.set(key, presence);
-		this.scheduleSave();
-		return structuredClone(presence);
-	}
-
-	recordChatJoin(input: OcRecentChatInput): OcRecentPresence | undefined {
-		const presence = this.current(input.squareMid, input.memberMid);
-		if (!presence || !presence.squareActive) return undefined;
-		const atMs = eventTime(input.at);
-		if (atMs < (millisFromIso(presence.joinedAt) ?? 0)) return structuredClone(presence);
-		presence.displayName = input.displayName ?? presence.displayName;
-		this.updateChat(presence, input.squareChatMid, atMs, true);
-		presence.updatedAt = nowIso();
-		this.scheduleSave();
-		return structuredClone(presence);
-	}
-
-	recordChatLeave(input: OcRecentChatInput): OcRecentPresence | undefined {
-		const presence = this.current(input.squareMid, input.memberMid);
-		if (!presence) return undefined;
-		const atMs = eventTime(input.at);
-		if (atMs < (millisFromIso(presence.joinedAt) ?? 0)) return structuredClone(presence);
-		presence.displayName = input.displayName ?? presence.displayName;
-		this.updateChat(presence, input.squareChatMid, atMs, false);
-		presence.updatedAt = nowIso();
 		this.scheduleSave();
 		return structuredClone(presence);
 	}
@@ -266,7 +211,6 @@ class OcRecentPresenceStore {
 		presence.messageCount += 1;
 		presence.lastMessageAt = new Date(atMs).toISOString();
 		presence.lastMessageText = input.text?.replace(/\s+/g, " ").trim().slice(0, 300);
-		this.updateChat(presence, input.squareChatMid, atMs, true);
 		presence.updatedAt = nowIso();
 		// 発言ごとのGitHub書き込みは避け、次の参加・退出保存へ同梱する。
 		return structuredClone(presence);
@@ -293,11 +237,6 @@ class OcRecentPresenceStore {
 		presence.displayName = input.displayName ?? presence.displayName;
 		presence.leftAt = new Date(leftAtMs).toISOString();
 		presence.squareActive = false;
-		for (const chat of presence.chats) {
-			if (!chat.active) continue;
-			chat.active = false;
-			chat.leftAt = presence.leftAt;
-		}
 		presence.updatedAt = nowIso();
 		this.scheduleSave();
 		return this.decisionFromPresence(presence, true);
@@ -339,6 +278,11 @@ class OcRecentPresenceStore {
 		return this.presencesByKey.get(presenceKey(squareMid, memberMid));
 	}
 
+	snapshot(squareMid: string, memberMid: string): OcRecentPresence | undefined {
+		const presence = this.current(squareMid, memberMid);
+		return presence ? structuredClone(presence) : undefined;
+	}
+
 	private decisionFromPresence(
 		presence: OcRecentPresence,
 		recorded: boolean,
@@ -357,7 +301,6 @@ class OcRecentPresenceStore {
 			joinedAt: presence.joinedAt,
 			lastMessageAt: presence.lastMessageAt,
 			lastMessageText: presence.lastMessageText,
-			remainingChatMids: activeChatMids(presence),
 			isFirstJoin: presence.isFirstJoin,
 			displayName: presence.displayName,
 		};
@@ -368,35 +311,8 @@ class OcRecentPresenceStore {
 			recorded: false,
 			ignoreReason,
 			messageCount: 0,
-			remainingChatMids: [],
 			isFirstJoin: false,
 		};
-	}
-
-	private updateChat(
-		presence: OcRecentPresence,
-		chatMid: string | undefined,
-		atMs: number,
-		active: boolean,
-	): void {
-		if (!chatMid) return;
-		let chat = presence.chats.find((item) => item.chatMid === chatMid);
-		if (!chat) {
-			chat = { chatMid, active: false };
-			presence.chats.push(chat);
-		}
-		const joinedAtMs = millisFromIso(chat.joinedAt);
-		const leftAtMs = millisFromIso(chat.leftAt);
-		if (active) {
-			if (leftAtMs !== undefined && atMs <= leftAtMs) return;
-			if (!chat.active) chat.joinedAt = new Date(atMs).toISOString();
-			chat.leftAt = undefined;
-		} else {
-			if (joinedAtMs !== undefined && atMs < joinedAtMs) return;
-			if (leftAtMs !== undefined && atMs <= leftAtMs) return;
-			chat.leftAt = new Date(atMs).toISOString();
-		}
-		chat.active = active;
 	}
 
 	private pruneExpired(now = Date.now()): void {
