@@ -7,6 +7,7 @@ import {
 } from "../runtime/squareReadReceipts.js";
 
 const WATCH_MS = 2_000;
+const PRE_WINDOW_MS = 5_000;
 const DISPLAY_LIMIT = 30;
 
 interface ReadTarget {
@@ -86,13 +87,13 @@ async function formatReadResult(
 	const receipts = uniqueSquareReadReceipts(listSquareReadReceipts({
 		squareChatMid: message.destination.chatMid,
 		messageId: target.messageId,
-		sinceReceivedAt: startedAt,
+		sinceReceivedAt: startedAt - PRE_WINDOW_MS,
 		untilReceivedAt: startedAt + WATCH_MS,
 	}));
 	const lines = [
 		"既読MID確認",
 		`対象: ${target.label}`,
-		`取得範囲: 実行後${Math.round(WATCH_MS / 1000)}秒間にbotが受信した既読イベント`,
+		`取得範囲: 実行直前${Math.round(PRE_WINDOW_MS / 1000)}秒から実行後${Math.round(WATCH_MS / 1000)}秒までにbotが受信した既読イベント`,
 		`人数: ${receipts.length}`,
 	];
 	if (receipts.length === 0) {
