@@ -208,29 +208,26 @@ export class OpenChatMemberSignalDispatcher {
 			});
 		});
 
-		try {
-			await this.handlers.track(signal, replayed);
-		} catch (error) {
+		// 即抜け追跡と挨拶送信は独立した購読処理として同時に開始する。
+		const tracking = this.handlers.track(signal, replayed).catch((error) => {
 			console.error("[oc-member-signal] tracking handler failed", {
 				type: signal.type,
 				origin: signal.origin,
 				memberMid: signal.event.memberMid,
 				error,
 			});
-			return;
-		}
-
-		if (replayed) return;
-		try {
-			await this.handlers.notify(signal, signal.ignoreBefore);
-		} catch (error) {
-			console.error("[oc-member-signal] member message handler failed", {
-				type: signal.type,
-				origin: signal.origin,
-				memberMid: signal.event.memberMid,
-				error,
+		});
+		const notification = replayed
+			? Promise.resolve()
+			: this.handlers.notify(signal, signal.ignoreBefore).catch((error) => {
+				console.error("[oc-member-signal] member message handler failed", {
+					type: signal.type,
+					origin: signal.origin,
+					memberMid: signal.event.memberMid,
+					error,
+				});
 			});
-		}
+		await Promise.all([tracking, notification]);
 	}
 
 	private pruneRecent(now: number): void {

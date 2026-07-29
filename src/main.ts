@@ -826,6 +826,10 @@ async function handleSquareMessage(
 		threadMid,
 		chatMid,
 	);
+	ocModerationSettingsStore.rememberLeftSoonSourceChat(
+		target.destination.scopeMid,
+		target.destination.chatMid,
+	);
 	recordSquareMessage(message, target.destination);
 	if (rawMessage) {
 		void handleOpenChatMemberSystemMessage(

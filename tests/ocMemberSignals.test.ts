@@ -89,12 +89,31 @@ test("keeps join and leave processing ordered for the same member", async () => 
 		dispatcher.publish(joinSignal(at)),
 		dispatcher.publish(leaveSignal(at + 5_000)),
 	]);
-	assert.deepEqual(events, [
-		"track:join",
+	assert.deepEqual(new Set(events), new Set([
 		"notify:join",
-		"track:leave",
+		"track:join",
 		"notify:leave",
-	]);
+		"track:leave",
+	]));
+	const lastJoinIndex = Math.max(events.indexOf("notify:join"), events.indexOf("track:join"));
+	const firstLeaveIndex = Math.min(events.indexOf("notify:leave"), events.indexOf("track:leave"));
+	assert.equal(lastJoinIndex < firstLeaveIndex, true);
+});
+
+test("still sends the configured member message when tracking fails", async () => {
+	const events: string[] = [];
+	const dispatcher = new OpenChatMemberSignalDispatcher({
+		async record() {},
+		async track() {
+			throw new Error("tracking failed");
+		},
+		async notify(signal) {
+			events.push(`notify:${signal.type}`);
+		},
+	});
+
+	assert.equal(await dispatcher.publish(joinSignal(Date.now())), "processed");
+	assert.deepEqual(events, ["notify:join"]);
 });
 
 test("restores replayed signals without running notifications", async () => {

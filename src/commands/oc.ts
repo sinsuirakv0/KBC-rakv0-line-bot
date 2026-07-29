@@ -318,6 +318,7 @@ function setupStatusLines(squareMid: string): string[] {
 		`URL許可ルール: ${settings.urlAllowRules.length}件（HTTPSのみ）`,
 		`画像/動画連投削除: ${enabledText(settings.mediaBurstDeleteEnabled)}`,
 		`即抜け監視: ${enabledText(settings.leftSoonMonitoringEnabled)}`,
+		`即抜け監視元: ${settings.leftSoonSourceChatMid ? shortId(settings.leftSoonSourceChatMid) : "未記録"}`,
 		`初参加・危険語処分: ${enabledText(settings.dangerWordAutoKickEnabled)}`,
 		`短時間一斉参加監視: ${enabledText(settings.joinCohortWatchEnabled)}`,
 		`副官部屋: ${settings.modRoomChatMid ? `設定済み (${shortId(settings.modRoomChatMid)})` : "未設定"}`,
@@ -1125,7 +1126,12 @@ async function applySetupSelection(
 		lines.push(result === "unchanged" ? "副官部屋: 変更なし（未設定）" : "副官部屋: 解除");
 	};
 	const applyLeftSoon = (enabled: boolean): void => {
-		const result = ocModerationSettingsStore.setLeftSoonMonitoring(squareMid, enabled, actorMid);
+		const result = ocModerationSettingsStore.setLeftSoonMonitoring(
+			squareMid,
+			enabled,
+			actorMid,
+			message.destination.chatMid,
+		);
 		lines.push(flagChangeText("即抜け監視", result, enabled));
 	};
 	const applyDangerWord = (enabled: boolean): void => {

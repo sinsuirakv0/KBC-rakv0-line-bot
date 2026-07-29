@@ -1,6 +1,7 @@
 ﻿import type { Client } from "@evex/linejs";
 import type { SyncedLineStorage } from "../storage/lineStorage.js";
 import { lineHealth } from "../runtime/lineHealth.js";
+import { resolveMainSquareChatMid } from "./ocMainChat.js";
 import { ocMemberSignalDispatcher } from "./ocMemberSignals.js";
 import { ocModerationSettingsStore, type OcMemberMessageSetting } from "./ocModerationSettings.js";
 import {
@@ -358,61 +359,69 @@ async function confirmConfiguredChats(
 			}
 			joined.push(setting);
 		} catch (error) {
-			if (!isNotJoinedSquareChatError(error)) {
-				throw new Error(
-					`OpenChat membership confirmation failed for ${setting.squareChatMid}: ${compactError(error)}`,
-				);
+			const detail = compactError(error);
+			if (isNotJoinedSquareChatError(error)) {
+				console.log("[oc-member-message:chat-poll] configured chat skipped because this bot is not a member", {
+					squareChatMid: setting.squareChatMid,
+				});
+				continue;
 			}
-			console.log("[oc-member-message:chat-poll] configured chat skipped because this bot is not a member", {
+			console.warn("[oc-member-message:chat-poll] configured chat confirmation failed; skipping this target", {
 				squareChatMid: setting.squareChatMid,
+				error: detail,
 			});
 		}
 	}
 	return joined;
 }
 
-function isMainSquareChatType(value: unknown): boolean {
-	return value === 4 || value === "SQUARE_DEFAULT" || String(value) === "4";
+function leftSoonSourceChatMids(
+	setting: ReturnType<typeof ocModerationSettingsStore.snapshot>,
+	configured: WatchedMemberMessageChat[],
+): string[] {
+	const mids = new Set<string>();
+	if (setting.leftSoonSourceChatMid) mids.add(setting.leftSoonSourceChatMid);
+	if (setting.modRoomChatMid) mids.add(setting.modRoomChatMid);
+	for (const chat of configured) {
+		if (chat.squareMid === setting.squareMid) mids.add(chat.squareChatMid);
+	}
+	return [...mids];
 }
 
-async function discoverLeftSoonMonitoringChats(client: Client): Promise<WatchedMemberMessageChat[]> {
+async function discoverLeftSoonMonitoringChats(
+	client: Client,
+	configured: WatchedMemberMessageChat[],
+): Promise<WatchedMemberMessageChat[]> {
 	const monitoringSettings = ocModerationSettingsStore.leftSoonMonitoringSettings();
 	if (monitoringSettings.length === 0) return [];
-	const settingsBySquareMid = new Map(
-		monitoringSettings.map((setting) => [setting.squareMid, setting]),
-	);
 	const found: WatchedMemberMessageChat[] = [];
-	let continuationToken = "";
-	for (let page = 0; page < 10; page++) {
-		const response = await client.base.square.getJoinedSquareChats({
-			request: { continuationToken, limit: 100 },
-		});
-		const raw = response as { chats?: unknown[]; continuationToken?: unknown };
-		for (const value of raw.chats ?? []) {
-			const chat = rawObject(value);
-			const squareMid = rawString(chat?.squareMid);
-			const squareChatMid = rawString(chat?.squareChatMid);
-			if (!squareMid || !squareChatMid || !isMainSquareChatType(chat?.type)) continue;
-			const setting = settingsBySquareMid.get(squareMid);
-			if (!setting) continue;
+	for (const setting of monitoringSettings) {
+		const sourceChatMids = leftSoonSourceChatMids(setting, configured);
+		let squareChatMid: string | undefined;
+		for (const sourceChatMid of sourceChatMids) {
+			squareChatMid = await resolveMainSquareChatMid(client, setting.squareMid, sourceChatMid);
+			if (squareChatMid) break;
+		}
+		if (squareChatMid) {
 			found.push({
-				squareMid,
+				squareMid: setting.squareMid,
 				squareChatMid,
 				updatedAt: setting.updatedAt,
 			});
+			continue;
 		}
-		continuationToken = rawString(raw.continuationToken) ?? "";
-		if (!continuationToken) break;
+		console.warn("[oc-member-message:chat-poll] left-soon main chat could not be resolved", {
+			squareMid: setting.squareMid,
+			sourceChatCount: sourceChatMids.length,
+		});
 	}
 	return found;
 }
 
 async function resolveWatchedChats(client: Client): Promise<WatchedMemberMessageChat[]> {
 	const configured = configuredMemberMessageChats();
-	const [confirmed, monitoring] = await Promise.all([
-		confirmConfiguredChats(client, configured),
-		discoverLeftSoonMonitoringChats(client),
-	]);
+	const confirmed = await confirmConfiguredChats(client, configured);
+	const monitoring = await discoverLeftSoonMonitoringChats(client, confirmed);
 	const watched = mergeWatchedChats([...confirmed, ...monitoring]);
 	console.log("[oc-member-message:chat-poll] watch targets refreshed", {
 		configuredChatCount: configured.length,

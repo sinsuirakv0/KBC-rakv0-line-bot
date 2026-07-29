@@ -13,6 +13,7 @@ export interface OcModerationSetting {
 	linkDeleteEnabled: boolean;
 	mediaBurstDeleteEnabled: boolean;
 	leftSoonMonitoringEnabled: boolean;
+	leftSoonSourceChatMid?: string;
 	dangerWordAutoKickEnabled: boolean;
 	joinCohortWatchEnabled: boolean;
 	modRoomChatMid?: string;
@@ -73,6 +74,7 @@ function emptySetting(squareMid: string): OcModerationSetting {
 		linkDeleteEnabled: false,
 		mediaBurstDeleteEnabled: false,
 		leftSoonMonitoringEnabled: false,
+		leftSoonSourceChatMid: undefined,
 		dangerWordAutoKickEnabled: false,
 		joinCohortWatchEnabled: false,
 		modRoomChatMid: undefined,
@@ -149,6 +151,9 @@ function parseSettings(value: unknown): OcModerationSettingsFile {
 			linkDeleteEnabled: item.linkDeleteEnabled === true,
 			mediaBurstDeleteEnabled: item.mediaBurstDeleteEnabled === true,
 			leftSoonMonitoringEnabled: item.leftSoonMonitoringEnabled === true,
+			leftSoonSourceChatMid: typeof item.leftSoonSourceChatMid === "string"
+				? item.leftSoonSourceChatMid
+				: undefined,
 			dangerWordAutoKickEnabled: item.dangerWordAutoKickEnabled === true,
 			joinCohortWatchEnabled: item.joinCohortWatchEnabled === true,
 			modRoomChatMid: typeof item.modRoomChatMid === "string" ? item.modRoomChatMid : undefined,
@@ -319,8 +324,41 @@ class OcModerationSettingsStore {
 		return this.setFlag(squareMid, "mediaBurstDeleteEnabled", enabled, updatedBy);
 	}
 
-	setLeftSoonMonitoring(squareMid: string, enabled: boolean, updatedBy: string): "enabled" | "disabled" | "unchanged" {
-		return this.setFlag(squareMid, "leftSoonMonitoringEnabled", enabled, updatedBy);
+	setLeftSoonMonitoring(
+		squareMid: string,
+		enabled: boolean,
+		updatedBy: string,
+		sourceChatMid?: string,
+	): "enabled" | "disabled" | "unchanged" {
+		const setting = this.ensureSetting(squareMid, updatedBy);
+		const sourceChanged = enabled &&
+			typeof sourceChatMid === "string" &&
+			sourceChatMid.length > 0 &&
+			setting.leftSoonSourceChatMid !== sourceChatMid;
+		if (setting.leftSoonMonitoringEnabled === enabled && !sourceChanged) return "unchanged";
+		setting.leftSoonMonitoringEnabled = enabled;
+		if (sourceChanged) setting.leftSoonSourceChatMid = sourceChatMid;
+		setting.updatedAt = nowIso();
+		setting.updatedBy = updatedBy;
+		this.scheduleSave();
+		return enabled ? "enabled" : "disabled";
+	}
+
+	rememberLeftSoonSourceChat(squareMid: string, sourceChatMid: string): boolean {
+		const setting = this.data.settings.find((item) => item.squareMid === squareMid);
+		if (
+			!setting?.leftSoonMonitoringEnabled ||
+			setting.leftSoonSourceChatMid ||
+			!sourceChatMid
+		) return false;
+		setting.leftSoonSourceChatMid = sourceChatMid;
+		setting.updatedAt = nowIso();
+		this.scheduleSave();
+		console.log("[oc-settings] restored missing left-soon source chat", {
+			squareMid,
+			sourceChatMid,
+		});
+		return true;
 	}
 
 	setDangerWordAutoKick(squareMid: string, enabled: boolean, updatedBy: string): "enabled" | "disabled" | "unchanged" {

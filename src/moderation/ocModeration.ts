@@ -27,6 +27,7 @@ import {
 	type OcUrlRuleScope,
 	type ParsedOcUrl,
 } from "./ocUrlPolicy.js";
+import { isMainSquareChat, resolveMainSquareChatMid } from "./ocMainChat.js";
 
 type SquareRole = string | number | undefined;
 
@@ -115,7 +116,6 @@ const COHORT_JOIN_WINDOW_MS = 2 * 60_000;
 const COHORT_MIN_MEMBERS = 3;
 const COHORT_WATCH_MS = 30 * 60_000;
 const ROLE_CACHE_MS = 5 * 60_000;
-const MAIN_CHAT_CACHE_MS = 6 * 60 * 60_000;
 const MEMBER_CACHE_MAX = 5_000;
 const MEMBER_CACHE_RETAIN = 4_000;
 const LOGGED_COHORTS_MAX = 2_000;
@@ -149,8 +149,6 @@ const noteScanRequests = new Map<string, Promise<boolean>>();
 const noteScanLastStartedAt = new Map<string, number>();
 const loggedMediaTypes = new Set<string>();
 const loggedCohorts = new Set<string>();
-const mainChatMidCache = new Map<string, { chatMid: string; expiresAt: number }>();
-const mainChatResolutionRequests = new Map<string, Promise<string | undefined>>();
 
 function positiveNumber(value: number, fallback: number, minimum: number): number {
 	if (!Number.isFinite(value)) return fallback;
@@ -195,112 +193,6 @@ function containsDeniedOcUrl(squareMid: string, text: string | undefined): boole
 
 function stringValue(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value : undefined;
-}
-
-function cacheMainChatMid(squareMid: string, chatMid: string): string {
-	mainChatMidCache.set(squareMid, {
-		chatMid,
-		expiresAt: Date.now() + MAIN_CHAT_CACHE_MS,
-	});
-	return chatMid;
-}
-
-async function resolveMainSquareChatMid(
-	client: Client,
-	squareMid: string,
-	sourceChatMid?: string,
-): Promise<string | undefined> {
-	const cached = mainChatMidCache.get(squareMid);
-	if (cached && cached.expiresAt > Date.now()) return cached.chatMid;
-
-	const running = mainChatResolutionRequests.get(squareMid);
-	if (running) return await running;
-	const request = (async () => {
-		if (sourceChatMid) {
-			try {
-				const response = await client.base.livetalk.getSquareInfoByChatMid({
-					request: { squareChatMid: sourceChatMid },
-				});
-				const defaultChatMid = stringValue((response as { defaultChatMid?: unknown }).defaultChatMid);
-				if (defaultChatMid) return cacheMainChatMid(squareMid, defaultChatMid);
-			} catch (error) {
-				console.warn("[oc-left-soon] getSquareInfoByChatMid failed while resolving main chat", {
-					squareMid,
-					sourceChatMid,
-					error: compactError(error),
-				});
-			}
-
-			try {
-				const response = await client.base.square.getSquareChat({ squareChatMid: sourceChatMid });
-				const chat = (response as {
-					squareChat?: { squareMid?: unknown; squareChatMid?: unknown; type?: unknown };
-				}).squareChat;
-				const type = chat?.type;
-				if (
-					stringValue(chat?.squareMid) === squareMid &&
-					(type === 4 || type === "SQUARE_DEFAULT")
-				) {
-					return cacheMainChatMid(
-						squareMid,
-						stringValue(chat?.squareChatMid) ?? sourceChatMid,
-					);
-				}
-			} catch (error) {
-				console.warn("[oc-left-soon] getSquareChat failed while resolving main chat", {
-					squareMid,
-					sourceChatMid,
-					error: compactError(error),
-				});
-			}
-		}
-
-		try {
-			let continuationToken = "";
-			for (let page = 0; page < 10; page++) {
-				const response = await client.base.square.getJoinedSquareChats({
-					request: { continuationToken, limit: 100 },
-				});
-				const raw = response as { chats?: unknown[]; continuationToken?: unknown };
-				for (const entry of raw.chats ?? []) {
-					const chat = entry as { squareMid?: unknown; squareChatMid?: unknown; type?: unknown };
-					if (stringValue(chat.squareMid) !== squareMid) continue;
-					if (chat.type !== 4 && chat.type !== "SQUARE_DEFAULT") continue;
-					const chatMid = stringValue(chat.squareChatMid);
-					if (chatMid) return cacheMainChatMid(squareMid, chatMid);
-				}
-				continuationToken = stringValue(raw.continuationToken) ?? "";
-				if (!continuationToken) break;
-			}
-		} catch (error) {
-			console.warn("[oc-left-soon] failed to list chats while resolving main chat", {
-				squareMid,
-				error: compactError(error),
-			});
-		}
-		return undefined;
-	})().finally(() => {
-		mainChatResolutionRequests.delete(squareMid);
-	});
-	mainChatResolutionRequests.set(squareMid, request);
-	return await request;
-}
-
-async function isMainSquareChat(
-	client: Client,
-	squareMid: string,
-	squareChatMid: string | undefined,
-): Promise<boolean> {
-	if (!squareChatMid) return false;
-	const mainChatMid = await resolveMainSquareChatMid(client, squareMid, squareChatMid);
-	if (!mainChatMid) {
-		console.warn("[oc-left-soon] main chat could not be resolved", {
-			squareMid,
-			squareChatMid,
-		});
-		return false;
-	}
-	return mainChatMid === squareChatMid;
 }
 
 function finiteTimestamp(value: number | undefined): number {
