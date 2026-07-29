@@ -11,7 +11,6 @@ const COMMAND_LINES = [
 	"!tut/敵検索",
 	"!st/ステージ検索",
 	"!ranking/ランキング",
-	"!read/OC既読MID確認",
 	"!id/ID確認",
 	"!log/メンバー発言履歴",
 	"!ban/BOT管理BAN",

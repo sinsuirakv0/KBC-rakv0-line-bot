@@ -10,19 +10,11 @@ interface SquareEventDebugMessage {
 	threadRootMessageId?: string;
 }
 
-interface SquareEventDebugReadReceipt {
-	source: string;
-	squareChatMid?: string;
-	memberMid?: string;
-	messageId?: string;
-}
-
 interface SquareEventDebugRecord {
 	receivedAt: string;
 	type: string;
 	payloadKeys: string[];
 	messages: SquareEventDebugMessage[];
-	readReceipts: SquareEventDebugReadReceipt[];
 	threadLines: string[];
 	handlerLines: string[];
 }
@@ -95,30 +87,10 @@ function threadSummary(source: string, value: unknown): string | undefined {
 	return parts.join(" ");
 }
 
-function readReceiptSummary(source: string, value: unknown): SquareEventDebugReadReceipt | undefined {
-	if (source !== "notifiedMarkAsRead") return undefined;
-	const raw = rawObject(value);
-	if (!raw) return undefined;
-	const squareChatMid = rawString(raw.squareChatMid);
-	const memberMid = rawString(raw.sMemberMid) ?? rawString(raw.squareMemberMid) ?? rawString(raw.memberMid);
-	const messageId = rawString(raw.messageId);
-	if (!squareChatMid || !memberMid || !messageId) return undefined;
-	return {
-		source,
-		squareChatMid,
-		memberMid,
-		messageId,
-	};
-}
-
 export function recordSquareEventDebug(event: unknown): void {
 	const payload = eventPayload(event);
 	const messages = Object.entries(payload).flatMap(([key, value]) => {
 		const summary = messageSummary(key, value);
-		return summary ? [summary] : [];
-	});
-	const readReceipts = Object.entries(payload).flatMap(([key, value]) => {
-		const summary = readReceiptSummary(key, value);
 		return summary ? [summary] : [];
 	});
 	const threadLines = Object.entries(payload).flatMap(([key, value]) => {
@@ -130,7 +102,6 @@ export function recordSquareEventDebug(event: unknown): void {
 		type: eventType(event),
 		payloadKeys: Object.keys(payload).filter((key) => payload[key] !== undefined),
 		messages,
-		readReceipts,
 		threadLines,
 		handlerLines: [],
 	});
@@ -143,7 +114,6 @@ export function recordSquareHandlerDebug(line: string): void {
 		type: "HANDLER_DEBUG",
 		payloadKeys: [],
 		messages: [],
-		readReceipts: [],
 		threadLines: [],
 		handlerLines: [line],
 	});
@@ -172,16 +142,6 @@ export function formatSquareEventDebugLog(limit = 12): string {
 				].join(" "),
 			);
 			if (message.text) lines.push(`text=${message.text}`);
-		}
-		for (const receipt of record.readReceipts) {
-			lines.push(
-				[
-					`read source=${receipt.source}`,
-					`chatMid=${receipt.squareChatMid ?? "(none)"}`,
-					`memberMid=${receipt.memberMid ?? "(none)"}`,
-					`messageId=${receipt.messageId ?? "(none)"}`,
-				].join(" "),
-			);
 		}
 		for (const line of record.threadLines) lines.push(line);
 		for (const line of record.handlerLines) lines.push(line);

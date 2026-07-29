@@ -26,19 +26,6 @@ function mockClient(returnedState: unknown) {
 						},
 					};
 				},
-				async deleteOtherFromSquare(squareMemberMid: string) {
-					calls.push("kick");
-					return {
-						squareMember: {
-							squareMemberMid,
-							squareMid: "s-test",
-							displayName: "target",
-							membershipState: "KICK_OUT",
-							role: "MEMBER",
-							revision: 43,
-						},
-					};
-				},
 				async updateSquareMember(input: {
 					request: {
 						updatedAttrs: number[];
@@ -79,8 +66,12 @@ test("updates the Square membership state to BANNED", async () => {
 
 	assert.deepEqual(request.updatedAttrs, [5]);
 	assert.deepEqual(request.updatedPreferenceAttrs, []);
-	assert.equal(request.squareMember.membershipState, "BANNED");
-	assert.equal(request.squareMember.revision, 42);
+	assert.deepEqual(request.squareMember, {
+		squareMemberMid: "p-target",
+		squareMid: "s-test",
+		revision: 42,
+		membershipState: "BANNED",
+	});
 	assert.equal(response.squareMember.membershipState, "BANNED");
 });
 
@@ -89,15 +80,15 @@ test("accepts the numeric BANNED state returned by Thrift", () => {
 	assert.equal(isBannedMembershipState("6"), true);
 });
 
-test("manual moderation kicks first and always follows with BANNED", async () => {
+test("manual moderation moves a joined member directly to BANNED", async () => {
 	const mock = mockClient("BANNED");
 
 	await kickAndBanSquareMember(mock.client, "p-target");
 	const request = mock.getUpdateRequest().request;
 
-	assert.deepEqual(mock.calls, ["kick", "ban"]);
+	assert.deepEqual(mock.calls, ["get", "ban"]);
 	assert.equal(request.squareMember.membershipState, "BANNED");
-	assert.equal(request.squareMember.revision, 43);
+	assert.equal(request.squareMember.revision, 42);
 });
 
 test("does not report a KICK_OUT-only response as a successful ban", async () => {
@@ -109,12 +100,12 @@ test("does not report a KICK_OUT-only response as a successful ban", async () =>
 	);
 });
 
-test("manual moderation reports failure when only the kick succeeded", async () => {
+test("manual moderation reports failure when the direct ban is rejected", async () => {
 	const mock = mockClient("KICK_OUT");
 
 	await assert.rejects(
 		() => kickAndBanSquareMember(mock.client, "p-target"),
-		/was kicked, but rejoin ban failed/,
+		/Square member ban failed/,
 	);
-	assert.deepEqual(mock.calls, ["kick", "ban"]);
+	assert.deepEqual(mock.calls, ["get", "ban"]);
 });

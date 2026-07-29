@@ -13,17 +13,29 @@ export function isBannedMembershipState(state: unknown): boolean {
 	return state === "BANNED" || state === BANNED_MEMBERSHIP_STATE || state === String(BANNED_MEMBERSHIP_STATE);
 }
 
-export async function banSquareMember(client: Client, squareMemberMid: string) {
-	validateSquareMemberMid(squareMemberMid);
+function membershipStateUpdate(squareMember: {
+	squareMemberMid?: string;
+	squareMid?: string;
+	revision?: number | bigint;
+}, membershipState: "BANNED") {
+	if (!squareMember.squareMemberMid || !squareMember.squareMid || squareMember.revision === undefined) {
+		throw new Error("Square member data required for membership-state update was missing");
+	}
+	return {
+		squareMemberMid: squareMember.squareMemberMid,
+		squareMid: squareMember.squareMid,
+		revision: squareMember.revision,
+		membershipState,
+	};
+}
+
+async function updateMembershipStateToBanned(client: Client, squareMemberMid: string) {
 	const current = await client.base.square.getSquareMember({ squareMemberMid });
 	const response = await client.base.square.updateSquareMember({
 		request: {
 			updatedAttrs: [MEMBERSHIP_STATE_ATTRIBUTE],
 			updatedPreferenceAttrs: [],
-			squareMember: {
-				...current.squareMember,
-				membershipState: "BANNED",
-			},
+			squareMember: membershipStateUpdate(current.squareMember, "BANNED"),
 		},
 	});
 
@@ -35,31 +47,20 @@ export async function banSquareMember(client: Client, squareMemberMid: string) {
 	return response;
 }
 
+export async function banSquareMember(client: Client, squareMemberMid: string) {
+	validateSquareMemberMid(squareMemberMid);
+	return await updateMembershipStateToBanned(client, squareMemberMid);
+}
+
 export async function kickAndBanSquareMember(client: Client, squareMemberMid: string) {
 	validateSquareMemberMid(squareMemberMid);
-	const kicked = await client.base.square.deleteOtherFromSquare(squareMemberMid);
 	try {
-		const response = await client.base.square.updateSquareMember({
-			request: {
-				updatedAttrs: [MEMBERSHIP_STATE_ATTRIBUTE],
-				updatedPreferenceAttrs: [],
-				squareMember: {
-					...kicked.squareMember,
-					membershipState: "BANNED",
-				},
-			},
-		});
-
-		if (!isBannedMembershipState(response.squareMember?.membershipState)) {
-			throw new Error(
-				`membershipState=${String(response.squareMember?.membershipState)}`,
-			);
-		}
-		return response;
+		// BANNED は即時退会と再参加禁止を同時に行う。KICK_OUT 後は更新できないため直接遷移する。
+		return await updateMembershipStateToBanned(client, squareMemberMid);
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
 		throw new Error(
-			`Square member was kicked, but rejoin ban failed: ${detail}`,
+			`Square member ban failed: ${detail}`,
 		);
 	}
 }

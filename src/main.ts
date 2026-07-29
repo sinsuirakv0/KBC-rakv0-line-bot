@@ -48,7 +48,6 @@ import {
 import { lineApiQueue } from "./runtime/lineApiQueue.js";
 import { ForegroundQueueFullError, runtimeWorkload } from "./runtime/workload.js";
 import { recordSquareEventDebug, recordSquareHandlerDebug } from "./runtime/squareEventDebug.js";
-import { recordSquareReadReceiptFromEvent } from "./runtime/squareReadReceipts.js";
 import { ocIdentitySnapshotsStore } from "./moderation/ocIdentitySnapshots.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
 import { ocMemberActivityStore } from "./moderation/ocMemberActivity.js";
@@ -1876,7 +1875,6 @@ async function handleRawSquareEvent(
 	event: RawSquareEvent,
 	sessionStartedAt: number,
 ): Promise<void> {
-	recordSquareReadReceiptFromEvent(event);
 	const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
 	const memberEventContext = memberEvents.joins[0] ?? memberEvents.leaves[0];
 	const nonSignalLogEvents = extractMemberEvents(event, {
