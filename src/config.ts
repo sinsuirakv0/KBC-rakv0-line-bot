@@ -4,6 +4,7 @@ import { config as loadEnv } from "dotenv";
 loadEnv();
 
 export type LoginMethod = "qr" | "password" | "token";
+export type TalkReceiverMode = "push" | "sync";
 
 function boolEnv(name: string, fallback: boolean): boolean {
 	const value = process.env[name];
@@ -43,6 +44,12 @@ function loginMethod(): LoginMethod {
 	const value = process.env.LINE_LOGIN_METHOD?.toLowerCase() || "qr";
 	if (value === "qr" || value === "password" || value === "token") return value;
 	throw new Error(`Invalid LINE_LOGIN_METHOD: ${value}`);
+}
+
+function talkReceiverMode(): TalkReceiverMode {
+	const value = process.env.LINE_TALK_RECEIVER_MODE?.trim().toLowerCase() || "push";
+	if (value === "push" || value === "sync") return value;
+	throw new Error(`Invalid LINE_TALK_RECEIVER_MODE: ${value}`);
 }
 
 function loginPin(): string {
@@ -149,6 +156,11 @@ export const appConfig = {
 	authFailureRetryMs: numberEnv("LINE_AUTH_FAILURE_RETRY_MS", 5_000, {
 		min: 1_000,
 		max: 60_000,
+		integer: true,
+	}),
+	talkReceiverMode: talkReceiverMode(),
+	talkPushStaleMs: numberEnv("LINE_TALK_PUSH_STALE_MS", 75_000, {
+		min: 45_000,
 		integer: true,
 	}),
 	talkPollTimeoutMs: Number(process.env.LINE_TALK_POLL_TIMEOUT_MS || 5_000),

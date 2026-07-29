@@ -34,6 +34,10 @@ import {
 import { ReceiverSupervisor } from "./runtime/receiverSupervisor.js";
 import { SessionManager } from "./runtime/sessionManager.js";
 import { runStartupStages } from "./runtime/startupStages.js";
+import {
+	listenTalkPushEvents,
+	type TalkPushTransport,
+} from "./runtime/talkPushReceiver.js";
 import { lineApiQueue } from "./runtime/lineApiQueue.js";
 import { ForegroundQueueFullError, runtimeWorkload } from "./runtime/workload.js";
 import { recordSquareEventDebug, recordSquareHandlerDebug } from "./runtime/squareEventDebug.js";
@@ -1668,7 +1672,7 @@ function isTalkSyncGoneError(error: unknown): boolean {
 	return /status=410\b/i.test(compactError(error));
 }
 
-async function listenRawTalkEvents(
+async function listenRawTalkSyncEvents(
 	client: Client,
 	ownMid: string,
 	signal: AbortSignal,
@@ -1753,6 +1757,53 @@ async function listenRawTalkEvents(
 		}
 		await sleepUntilRetry(appConfig.talkPollIntervalMs, signal);
 	}
+}
+
+async function listenRawTalkPushEvents(
+	client: Client,
+	ownMid: string,
+	signal: AbortSignal,
+	onAuthenticationError: AuthenticationErrorReporter,
+): Promise<void> {
+	try {
+		await listenTalkPushEvents({
+			push: client.base.push as unknown as TalkPushTransport<RawTalkEvent>,
+			signal,
+			staleMs: appConfig.talkPushStaleMs,
+			onHeartbeat(eventCount) {
+				if (eventCount > 0) {
+					lineHealth.markSuccess("talk", eventCount);
+					return;
+				}
+				lineHealth.markHeartbeat("talk", Date.now(), true);
+			},
+			onEvent(event) {
+				void handleRawTalkEvent(client, ownMid, event as RawTalkEvent)
+					.catch((error) => handleEventProcessingError("talk", "message handler", error));
+			},
+		});
+	} catch (error) {
+		if (signal.aborted) return;
+		lineHealth.markError("talk", error);
+		if (isAuthenticationError(error)) {
+			onAuthenticationError("talk", error);
+		}
+		throw error;
+	}
+}
+
+async function listenRawTalkEvents(
+	client: Client,
+	ownMid: string,
+	signal: AbortSignal,
+	onAuthenticationError: AuthenticationErrorReporter,
+): Promise<void> {
+	if (appConfig.talkReceiverMode === "sync") {
+		console.warn("[talk:event] using legacy SYNC4 receiver");
+		await listenRawTalkSyncEvents(client, ownMid, signal, onAuthenticationError);
+		return;
+	}
+	await listenRawTalkPushEvents(client, ownMid, signal, onAuthenticationError);
 }
 
 async function handleRawSquareEvent(
