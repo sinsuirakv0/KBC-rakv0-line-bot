@@ -59,6 +59,8 @@ export interface ReplyableLineMessage {
 	client: Client;
 	destination: LineDestination;
 	mentionMids: string[];
+	sourceMessageId?: string;
+	sourceCreatedAt?: number;
 	replyToMessageId?: string;
 }
 

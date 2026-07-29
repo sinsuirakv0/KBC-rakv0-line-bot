@@ -18,6 +18,7 @@ import { logCommand } from "./log.js";
 import { ocCommand } from "./oc.js";
 import { pushCommand } from "./push.js";
 import { rankingCommand } from "./ranking.js";
+import { readCommand } from "./read.js";
 import { saleCommand } from "./sale.js";
 import { stageCommand } from "./stage.js";
 import { testCommand } from "./test.js";
@@ -44,6 +45,7 @@ for (const command of [
 	ocCommand,
 	pushCommand,
 	rankingCommand,
+	readCommand,
 	banCommand,
 	testCommand,
 	helpCommand,

@@ -48,6 +48,7 @@ import {
 import { lineApiQueue } from "./runtime/lineApiQueue.js";
 import { ForegroundQueueFullError, runtimeWorkload } from "./runtime/workload.js";
 import { recordSquareEventDebug, recordSquareHandlerDebug } from "./runtime/squareEventDebug.js";
+import { recordSquareReadReceiptFromEvent } from "./runtime/squareReadReceipts.js";
 import { ocIdentitySnapshotsStore } from "./moderation/ocIdentitySnapshots.js";
 import { ocKickHistoryStore } from "./moderation/ocKickHistory.js";
 import { ocMemberActivityStore } from "./moderation/ocMemberActivity.js";
@@ -152,6 +153,7 @@ interface RawSquareEvent {
 		notifiedCreateSquareChatMember?: unknown;
 		notifiedJoinSquareChat?: unknown;
 		notifiedLeaveSquareChat?: unknown;
+		notifiedMarkAsRead?: unknown;
 		notifiedUpdateSquareMember?: unknown;
 		notifiedUpdateSquareChatMember?: unknown;
 	} & Record<string, unknown>;
@@ -1061,6 +1063,8 @@ function resolveSenderName(
 class SquareReplyTarget implements ReplyableLineMessage {
 	readonly destination;
 	readonly mentionMids: string[];
+	readonly sourceMessageId?: string;
+	readonly sourceCreatedAt?: number;
 	readonly replyToMessageId?: string;
 	private threadMid?: string;
 	readonly isThreadSource: boolean;
@@ -1076,7 +1080,10 @@ class SquareReplyTarget implements ReplyableLineMessage {
 		threadMid?: string,
 		chatMid?: string,
 	) {
+		const rawMessage = (message.raw as RawSquareMessage).message;
 		this.mentionMids = squareMentionMids(message);
+		this.sourceMessageId = rawMessage?.id;
+		this.sourceCreatedAt = rawNumber(rawMessage?.createdTime);
 		this.replyToMessageId = message.getReplyTarget()?.id;
 		this.threadMid = threadMid ?? (message.raw as RawSquareMessage).threadInfo?.chatThreadMid;
 		this.isThreadSource = Boolean(this.threadMid);
@@ -1869,6 +1876,7 @@ async function handleRawSquareEvent(
 	event: RawSquareEvent,
 	sessionStartedAt: number,
 ): Promise<void> {
+	recordSquareReadReceiptFromEvent(event);
 	const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
 	const memberEventContext = memberEvents.joins[0] ?? memberEvents.leaves[0];
 	const nonSignalLogEvents = extractMemberEvents(event, {
