@@ -1,9 +1,7 @@
 ﻿import type { Client } from "@evex/linejs";
 import type { SyncedLineStorage } from "../storage/lineStorage.js";
-import { permissionStore } from "../permissions/store.js";
 import { lineHealth } from "../runtime/lineHealth.js";
-import { handleOpenChatJoinEventMessage, handleOpenChatLeaveEventMessage } from "./ocJoinMessage.js";
-import { handleOpenChatMemberJoin, handleOpenChatMemberLeave } from "./ocModeration.js";
+import { ocMemberSignalDispatcher } from "./ocMemberSignals.js";
 import { ocModerationSettingsStore, type OcMemberMessageSetting } from "./ocModerationSettings.js";
 import {
 	isSquareChatMembershipJoined,
@@ -30,6 +28,7 @@ interface WatchedMemberMessageChat {
 
 const POLLING_INTERVAL_MS = 1_000;
 const ERROR_RETRY_MS = 30_000;
+const WATCH_SETTINGS_REFRESH_MS = 60_000;
 // 1つのOCの過去イベント取得で、他のOCの参加通知監視を止めない。
 const MAX_CATCH_UP_PAGES_PER_TURN = 3;
 
@@ -119,28 +118,23 @@ async function handleJoinEvent(
 		memberCreatedAt,
 		replayed: joinedAt < ignoreBefore,
 	});
-	await handleOpenChatMemberJoin({
-		client,
-		squareMid,
-		squareChatMid,
-		memberMid,
-		displayName: rawString(member?.displayName),
-		joinedAt,
-		memberCreatedAt,
-		source: "chat-member",
-	}, { suppressActions: joinedAt < ignoreBefore });
-	if (!ocModerationSettingsStore.joinMessage(setting.squareChatMid)) return;
-	if (permissionStore.isBotStopped({ kind: "square", chatMid: squareChatMid, chatType: "SQUARE" })) return;
-	await handleOpenChatJoinEventMessage({
-		client,
-		squareMid,
-		squareChatMid,
-		memberMid,
-		displayName: rawString(member?.displayName),
-		joinedAt,
-		memberCreatedAt,
-		source: "chat-member",
-	}, { ignoreBefore });
+	void ocMemberSignalDispatcher.publish({
+		type: "join",
+		origin: "chat-poll",
+		ignoreBefore,
+		event: {
+			client,
+			squareMid,
+			squareChatMid,
+			memberMid,
+			displayName: rawString(member?.displayName),
+			joinedAt,
+			memberCreatedAt,
+			source: "chat-member",
+		},
+	}).catch((error) => {
+		console.error("[oc-member-message:chat-poll] join signal failed", { squareChatMid, memberMid, error });
+	});
 }
 
 async function handleLeaveEvent(
@@ -175,28 +169,23 @@ async function handleLeaveEvent(
 		replayed: leftAt < ignoreBefore,
 		leftSoonMonitoringEnabled: ocModerationSettingsStore.snapshot(squareMid).leftSoonMonitoringEnabled,
 	});
-	await handleOpenChatMemberLeave({
-		client,
-		squareMid,
-		squareChatMid,
-		memberMid,
-		displayName: rawString(member?.displayName),
-		leftAt,
-		memberCreatedAt,
-		source: "chat-member",
-	}, { suppressActions: leftAt < ignoreBefore });
-	if (!ocModerationSettingsStore.leaveMessage(setting.squareChatMid)) return;
-	if (permissionStore.isBotStopped({ kind: "square", chatMid: squareChatMid, chatType: "SQUARE" })) return;
-	await handleOpenChatLeaveEventMessage({
-		client,
-		squareMid,
-		squareChatMid,
-		memberMid,
-		displayName: rawString(member?.displayName),
-		leftAt,
-		memberCreatedAt,
-		source: "chat-member",
-	}, { ignoreBefore });
+	void ocMemberSignalDispatcher.publish({
+		type: "leave",
+		origin: "chat-poll",
+		ignoreBefore,
+		event: {
+			client,
+			squareMid,
+			squareChatMid,
+			memberMid,
+			displayName: rawString(member?.displayName),
+			leftAt,
+			memberCreatedAt,
+			source: "chat-member",
+		},
+	}).catch((error) => {
+		console.error("[oc-member-message:chat-poll] leave signal failed", { squareChatMid, memberMid, error });
+	});
 }
 
 async function handleChatMemberUpdateEvent(
@@ -216,55 +205,51 @@ async function handleChatMemberUpdateEvent(
 	const eventAt = rawNumber(event.createdTime);
 	const memberCreatedAt = rawNumber(peer?.createdAt);
 	if (squareChatMid !== setting.squareChatMid || !memberMid || eventAt === undefined) return;
-	const replayed = eventAt < ignoreBefore;
 	if (isSquareChatMembershipJoined(membershipState)) {
-		await handleOpenChatMemberJoin({
-			client,
-			squareMid,
-			squareChatMid,
-			memberMid,
-			displayName: rawString(peer?.displayName),
-			joinedAt: eventAt,
-			memberCreatedAt,
-			source: "chat-member",
-		}, { suppressActions: replayed });
+		void ocMemberSignalDispatcher.publish({
+			type: "join",
+			origin: "chat-poll",
+			ignoreBefore,
+			event: {
+				client,
+				squareMid,
+				squareChatMid,
+				memberMid,
+				displayName: rawString(peer?.displayName),
+				joinedAt: eventAt,
+				memberCreatedAt,
+				source: "chat-member",
+			},
+		}).catch((error) => {
+			console.error("[oc-member-message:chat-poll] member update join signal failed", {
+				squareChatMid,
+				memberMid,
+				error,
+			});
+		});
 	}
 	if (isSquareChatMembershipLeft(membershipState)) {
-		await handleOpenChatMemberLeave({
-			client,
-			squareMid,
-			squareChatMid,
-			memberMid,
-			displayName: rawString(peer?.displayName),
-			leftAt: eventAt,
-			memberCreatedAt,
-			source: "chat-member",
-		}, { suppressActions: replayed });
-	}
-	if (permissionStore.isBotStopped({ kind: "square", chatMid: squareChatMid, chatType: "SQUARE" })) return;
-	if (isSquareChatMembershipJoined(membershipState) && ocModerationSettingsStore.joinMessage(setting.squareChatMid)) {
-		await handleOpenChatJoinEventMessage({
-			client,
-			squareMid,
-			squareChatMid,
-			memberMid,
-			displayName: rawString(peer?.displayName),
-			joinedAt: eventAt,
-			memberCreatedAt,
-			source: "chat-member",
-		}, { ignoreBefore });
-	}
-	if (isSquareChatMembershipLeft(membershipState) && ocModerationSettingsStore.leaveMessage(setting.squareChatMid)) {
-		await handleOpenChatLeaveEventMessage({
-			client,
-			squareMid,
-			squareChatMid,
-			memberMid,
-			displayName: rawString(peer?.displayName),
-			leftAt: eventAt,
-			memberCreatedAt,
-			source: "chat-member",
-		}, { ignoreBefore });
+		void ocMemberSignalDispatcher.publish({
+			type: "leave",
+			origin: "chat-poll",
+			ignoreBefore,
+			event: {
+				client,
+				squareMid,
+				squareChatMid,
+				memberMid,
+				displayName: rawString(peer?.displayName),
+				leftAt: eventAt,
+				memberCreatedAt,
+				source: "chat-member",
+			},
+		}).catch((error) => {
+			console.error("[oc-member-message:chat-poll] member update leave signal failed", {
+				squareChatMid,
+				memberMid,
+				error,
+			});
+		});
 	}
 }
 
@@ -331,35 +316,38 @@ async function pollChat(
 	});
 }
 
-function mergeMemberMessageSettings(
-	joinedSquareChatMids?: ReadonlySet<string>,
-): WatchedMemberMessageChat[] {
+function mergeWatchedChats(settings: WatchedMemberMessageChat[]): WatchedMemberMessageChat[] {
 	const byChatMid = new Map<string, WatchedMemberMessageChat>();
-	const settings: OcMemberMessageSetting[] = [
-		...ocModerationSettingsStore.joinMessageSettings(),
-		...ocModerationSettingsStore.leaveMessageSettings(),
-	];
 	for (const setting of settings) {
-		if (joinedSquareChatMids && !joinedSquareChatMids.has(setting.squareChatMid)) continue;
 		const current = byChatMid.get(setting.squareChatMid);
 		const currentAt = current ? Date.parse(current.updatedAt) : Number.NEGATIVE_INFINITY;
 		const nextAt = Date.parse(setting.updatedAt);
 		if (!current || (Number.isFinite(nextAt) && nextAt > currentAt)) {
-			byChatMid.set(setting.squareChatMid, {
-				squareMid: setting.squareMid,
-				squareChatMid: setting.squareChatMid,
-				updatedAt: setting.updatedAt,
-			});
+			byChatMid.set(setting.squareChatMid, setting);
 		}
 	}
 	return [...byChatMid.values()];
 }
 
-async function confirmJoinedSquareChatMids(
+function configuredMemberMessageChats(): WatchedMemberMessageChat[] {
+	const settings: OcMemberMessageSetting[] = [
+		...ocModerationSettingsStore.joinMessageSettings(),
+		...ocModerationSettingsStore.leaveMessageSettings(),
+	];
+	return mergeWatchedChats(
+		settings.map((setting) => ({
+				squareMid: setting.squareMid,
+				squareChatMid: setting.squareChatMid,
+				updatedAt: setting.updatedAt,
+		})),
+	);
+}
+
+async function confirmConfiguredChats(
 	client: Client,
 	settings: WatchedMemberMessageChat[],
-): Promise<Set<string>> {
-	const squareChatMids = new Set<string>();
+): Promise<WatchedMemberMessageChat[]> {
+	const joined: WatchedMemberMessageChat[] = [];
 	for (const setting of settings) {
 		try {
 			const response = await client.base.square.getSquareChat({
@@ -368,7 +356,7 @@ async function confirmJoinedSquareChatMids(
 			if (response.squareChat.squareChatMid !== setting.squareChatMid) {
 				throw new Error("getSquareChat returned a different squareChatMid");
 			}
-			squareChatMids.add(setting.squareChatMid);
+			joined.push(setting);
 		} catch (error) {
 			if (!isNotJoinedSquareChatError(error)) {
 				throw new Error(
@@ -380,7 +368,59 @@ async function confirmJoinedSquareChatMids(
 			});
 		}
 	}
-	return squareChatMids;
+	return joined;
+}
+
+function isMainSquareChatType(value: unknown): boolean {
+	return value === 4 || value === "SQUARE_DEFAULT" || String(value) === "4";
+}
+
+async function discoverLeftSoonMonitoringChats(client: Client): Promise<WatchedMemberMessageChat[]> {
+	const monitoringSettings = ocModerationSettingsStore.leftSoonMonitoringSettings();
+	if (monitoringSettings.length === 0) return [];
+	const settingsBySquareMid = new Map(
+		monitoringSettings.map((setting) => [setting.squareMid, setting]),
+	);
+	const found: WatchedMemberMessageChat[] = [];
+	let continuationToken = "";
+	for (let page = 0; page < 10; page++) {
+		const response = await client.base.square.getJoinedSquareChats({
+			request: { continuationToken, limit: 100 },
+		});
+		const raw = response as { chats?: unknown[]; continuationToken?: unknown };
+		for (const value of raw.chats ?? []) {
+			const chat = rawObject(value);
+			const squareMid = rawString(chat?.squareMid);
+			const squareChatMid = rawString(chat?.squareChatMid);
+			if (!squareMid || !squareChatMid || !isMainSquareChatType(chat?.type)) continue;
+			const setting = settingsBySquareMid.get(squareMid);
+			if (!setting) continue;
+			found.push({
+				squareMid,
+				squareChatMid,
+				updatedAt: setting.updatedAt,
+			});
+		}
+		continuationToken = rawString(raw.continuationToken) ?? "";
+		if (!continuationToken) break;
+	}
+	return found;
+}
+
+async function resolveWatchedChats(client: Client): Promise<WatchedMemberMessageChat[]> {
+	const configured = configuredMemberMessageChats();
+	const [confirmed, monitoring] = await Promise.all([
+		confirmConfiguredChats(client, configured),
+		discoverLeftSoonMonitoringChats(client),
+	]);
+	const watched = mergeWatchedChats([...confirmed, ...monitoring]);
+	console.log("[oc-member-message:chat-poll] watch targets refreshed", {
+		configuredChatCount: configured.length,
+		confirmedChatCount: confirmed.length,
+		leftSoonMainChatCount: monitoring.length,
+		watchedChatCount: watched.length,
+	});
+	return watched;
 }
 
 export async function listenOpenChatJoinMessageEvents(
@@ -389,24 +429,22 @@ export async function listenOpenChatJoinMessageEvents(
 	signal: AbortSignal,
 	sessionStartedAt: number,
 ): Promise<void> {
-	const configuredSettings = mergeMemberMessageSettings();
-	const joinedSquareChatMids = configuredSettings.length > 0
-		? await confirmJoinedSquareChatMids(client, configuredSettings)
-		: new Set<string>();
-	const joinedSettings = mergeMemberMessageSettings(joinedSquareChatMids);
-	const ignoredSettings = configuredSettings.filter(
-		(setting) => !joinedSquareChatMids.has(setting.squareChatMid),
-	);
-	console.log("[oc-member-message:chat-poll] configured OpenChat memberships confirmed", {
-		joinedChatCount: joinedSquareChatMids.size,
-		configuredChatCount: configuredSettings.length,
-		watchedChatCount: joinedSettings.length,
-		ignoredChatCount: ignoredSettings.length,
-	});
 	const states = new Map<string, ChatPollingState>();
+	let settings = await resolveWatchedChats(client);
+	let refreshAt = Date.now() + WATCH_SETTINGS_REFRESH_MS;
 	while (!signal.aborted) {
 		lineHealth.markHeartbeat("member-message");
-		const settings = mergeMemberMessageSettings(joinedSquareChatMids);
+		if (Date.now() >= refreshAt) {
+			try {
+				settings = await resolveWatchedChats(client);
+			} catch (error) {
+				console.warn("[oc-member-message:chat-poll] watch target refresh failed; keeping current targets", {
+					error: compactError(error),
+					watchedChatCount: settings.length,
+				});
+			}
+			refreshAt = Date.now() + WATCH_SETTINGS_REFRESH_MS;
+		}
 		const activeChatMids = new Set(settings.map((setting) => setting.squareChatMid));
 		for (const [squareChatMid] of states) {
 			if (activeChatMids.has(squareChatMid)) continue;

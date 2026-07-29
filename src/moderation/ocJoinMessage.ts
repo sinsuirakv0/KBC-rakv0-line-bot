@@ -4,19 +4,6 @@ import type { OpenChatMemberJoinEvent, OpenChatMemberLeaveEvent } from "./ocMode
 import { lineApiQueue } from "../runtime/lineApiQueue.js";
 import { ocModerationSettingsStore } from "./ocModerationSettings.js";
 
-export interface OpenChatJoinSystemMessage {
-	client: Client;
-	squareMid: string;
-	squareChatMid: string;
-	senderMid: string;
-	senderName?: string;
-	messageId?: string;
-	text?: string;
-	contentType?: string | number;
-	contentMetadata?: Record<string, string>;
-	mentionMids: string[];
-}
-
 type MemberMessageMode = "join" | "leave";
 
 const RECENT_MEMBER_MESSAGE_RESPONSE_MS = 90_000;
@@ -43,10 +30,6 @@ export function nameFromJoinNotificationText(text: string | undefined): string |
 		if (name) return name;
 	}
 	return undefined;
-}
-
-function looksLikeJoinNotification(text: string | undefined): boolean {
-	return /(?:参加|入室|加入|joined)/i.test(text ?? "");
 }
 
 function reserveMemberMessageResponse(
@@ -82,34 +65,6 @@ function memberShortId(squareMid: string, memberMid: string | undefined): string
 		.replace(/[^0-9a-z]/gi, "")
 		.slice(0, 6)
 		.toLowerCase();
-}
-
-function joinedMemberMid(message: OpenChatJoinSystemMessage): string | undefined {
-	const mentioned = message.mentionMids.find((mid) => /^p[0-9a-f]{8,}$/i.test(mid));
-	if (mentioned) return mentioned;
-	if (/^p[0-9a-f]{8,}$/i.test(message.senderMid)) return message.senderMid;
-	return undefined;
-}
-
-async function joinedMemberName(
-	message: OpenChatJoinSystemMessage,
-	memberMid: string | undefined,
-	detectedName: string | undefined,
-): Promise<string> {
-	if (detectedName) return detectedName;
-	const fromText = nameFromJoinNotificationText(message.text);
-	if (fromText) return fromText;
-	if (message.senderName) return message.senderName;
-	if (memberMid) {
-		try {
-			const member = await message.client.base.square.getSquareMember({ squareMemberMid: memberMid });
-			const displayName = cleanDisplayName(member.squareMember.displayName);
-			if (displayName) return displayName;
-		} catch (error) {
-			console.warn("[oc-join-message] member name lookup failed", error);
-		}
-	}
-	return "参加者";
 }
 
 async function displayNameForMember(input: {
@@ -206,42 +161,6 @@ async function sendConfiguredMemberMessage(input: {
 		console.warn("[oc-member-message] send failed", error);
 	}
 	return true;
-}
-
-export async function handleOpenChatJoinSystemMessage(message: OpenChatJoinSystemMessage): Promise<boolean> {
-	const setting = ocModerationSettingsStore.joinMessage(message.squareChatMid);
-	if (!setting) return false;
-	const joinedName = nameFromJoinNotificationText(message.text);
-	if (!joinedName) {
-		if (looksLikeJoinNotification(message.text)) {
-			console.log("[oc-join-message] join-like system message ignored", {
-				squareMid: message.squareMid,
-				squareChatMid: message.squareChatMid,
-				messageId: message.messageId,
-				senderMid: message.senderMid,
-				text: message.text,
-				contentType: message.contentType,
-				metadataKeys: Object.keys(message.contentMetadata ?? {}).sort(),
-				mentionCount: message.mentionMids.length,
-			});
-		}
-		return false;
-	}
-
-	const memberMid = joinedMemberMid(message);
-	const displayName = await joinedMemberName(message, memberMid, joinedName);
-	return await sendConfiguredMemberMessage({
-		mode: "join",
-		client: message.client,
-		squareMid: message.squareMid,
-		squareChatMid: message.squareChatMid,
-		memberMid,
-		displayName,
-		detectedName: joinedName,
-		messageId: message.messageId,
-		source: "system-message",
-		fallbackName: "参加者",
-	});
 }
 
 export async function handleOpenChatJoinEventMessage(

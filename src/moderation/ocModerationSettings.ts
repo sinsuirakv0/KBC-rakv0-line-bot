@@ -208,6 +208,15 @@ class OcModerationSettingsStore {
 		};
 	}
 
+	leftSoonMonitoringSettings(): OcModerationSetting[] {
+		return this.data.settings
+			.filter((setting) => setting.leftSoonMonitoringEnabled)
+			.map((setting) => ({
+				...setting,
+				urlAllowRules: setting.urlAllowRules.map((rule) => ({ ...rule })),
+			}));
+	}
+
 	urlAllowRules(squareMid: string): OcUrlAllowRule[] {
 		return this.snapshot(squareMid).urlAllowRules;
 	}

@@ -54,8 +54,6 @@ import { ocMemberActivityStore } from "./moderation/ocMemberActivity.js";
 import { ocRecentPresenceStore } from "./moderation/ocRecentPresence.js";
 import { ocModerationCasesStore } from "./moderation/ocModerationCases.js";
 import {
-	handleOpenChatMemberJoin,
-	handleOpenChatMemberLeave,
 	handleOpenChatModerationCaseReply,
 	handleOpenChatNoteStatusModeration,
 	handleOpenChatModeration,
@@ -66,11 +64,12 @@ import {
 	type OpenChatPostModerationEvent,
 } from "./moderation/ocModeration.js";
 import {
-	handleOpenChatJoinEventMessage,
-	handleOpenChatLeaveEventMessage,
-	handleOpenChatJoinSystemMessage,
 	nameFromJoinNotificationText,
 } from "./moderation/ocJoinMessage.js";
+import {
+	ocMemberSignalDispatcher,
+	type OpenChatMemberSignal,
+} from "./moderation/ocMemberSignals.js";
 import { listenOpenChatJoinMessageEvents } from "./moderation/ocJoinMessagePolling.js";
 import { ocModerationSettingsStore } from "./moderation/ocModerationSettings.js";
 import {
@@ -84,6 +83,7 @@ import { memberNameHistoryStore } from "./nameHistory/store.js";
 import { startMessageLogAutoHistoryScheduler } from "./messageLog/autoHistory.js";
 import { startMessageLogRemoteSyncScheduler } from "./messageLog/remoteSync.js";
 import { messageLogStore, type StoredMessageLog } from "./messageLog/store.js";
+import { extractMemberEvents } from "./memberEventLog/events.js";
 import { memberEventLogStore } from "./memberEventLog/store.js";
 import { startMemberEventLogRemoteSyncScheduler } from "./memberEventLog/remoteSync.js";
 
@@ -282,6 +282,7 @@ async function handleOpenChatMemberSystemMessage(
 	client: Client,
 	rawMessage: NonNullable<RawSquareMessage["message"]>,
 	destination: SquareReplyTarget["destination"],
+	sessionStartedAt: number,
 	threadMid?: string,
 ): Promise<void> {
 	if (threadMid || !rawMessage.from?.startsWith("p")) return;
@@ -296,14 +297,19 @@ async function handleOpenChatMemberSystemMessage(
 			memberMid: rawMessage.from,
 			createdAt,
 		});
-		await handleOpenChatMemberJoin({
-			client,
-			squareMid: destination.scopeMid,
-			squareChatMid: destination.chatMid,
-			memberMid: rawMessage.from,
-			displayName: joinedName,
-			joinedAt: createdAt,
-			source: "chat-member",
+		await ocMemberSignalDispatcher.publish({
+			type: "join",
+			origin: "system-message",
+			ignoreBefore: sessionStartedAt,
+			event: {
+				client,
+				squareMid: destination.scopeMid,
+				squareChatMid: destination.chatMid,
+				memberMid: rawMessage.from,
+				displayName: joinedName,
+				joinedAt: createdAt,
+				source: "chat-member",
+			},
 		});
 		return;
 	}
@@ -341,14 +347,19 @@ async function handleOpenChatMemberSystemMessage(
 		memberMid: rawMessage.from,
 		createdAt,
 	});
-	await handleOpenChatMemberLeave({
-		client,
-		squareMid: destination.scopeMid,
-		squareChatMid: destination.chatMid,
-		memberMid: rawMessage.from,
-		displayName: leftName,
-		leftAt: createdAt,
-		source: "chat-member",
+	await ocMemberSignalDispatcher.publish({
+		type: "leave",
+		origin: "system-message",
+		ignoreBefore: sessionStartedAt,
+		event: {
+			client,
+			squareMid: destination.scopeMid,
+			squareChatMid: destination.chatMid,
+			memberMid: rawMessage.from,
+			displayName: leftName,
+			leftAt: createdAt,
+			source: "chat-member",
+		},
 	});
 }
 
@@ -786,6 +797,7 @@ function squareMentionMids(message: SquareMessage): string[] {
 async function handleSquareMessage(
 	client: Client,
 	message: SquareMessage,
+	sessionStartedAt: number,
 	threadMid?: string,
 	chatMidOverride?: string,
 ): Promise<void> {
@@ -816,7 +828,13 @@ async function handleSquareMessage(
 	);
 	recordSquareMessage(message, target.destination);
 	if (rawMessage) {
-		await handleOpenChatMemberSystemMessage(client, rawMessage, target.destination, threadMid)
+		void handleOpenChatMemberSystemMessage(
+			client,
+			rawMessage,
+			target.destination,
+			sessionStartedAt,
+			threadMid,
+		)
 			.catch((error) => {
 				console.warn("[oc-left-soon] system message processing failed", error);
 			});
@@ -858,18 +876,6 @@ async function handleSquareMessage(
 		return;
 	}
 	if (!squareText.startsWith(appConfig.commandPrefix)) {
-		if (!threadMid && await handleOpenChatJoinSystemMessage({
-			client,
-			squareMid: target.destination.scopeMid,
-			squareChatMid: target.destination.chatMid,
-			senderMid: target.destination.senderMid,
-			senderName: target.destination.senderName,
-			messageId: rawMessage?.id,
-			text: squareText,
-			contentType: rawMessage?.contentType,
-			contentMetadata: rawMessage?.contentMetadata,
-			mentionMids: target.mentionMids,
-		})) return;
 		if (await handleOcSetupReply(squareText, target)) return;
 		if (await handleOpenChatModerationCaseReply(squareText, target)) return;
 		if (await handleLogTargetSelectionReply(squareText, target)) return;
@@ -1860,57 +1866,34 @@ async function handleRawSquareEvent(
 ): Promise<void> {
 	const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
 	const memberEventContext = memberEvents.joins[0] ?? memberEvents.leaves[0];
-	void memberEventLogStore.recordHistoryEvents([event], {
+	const nonSignalLogEvents = extractMemberEvents(event, {
 		chatMid: memberEventContext?.squareChatMid ?? memberEventContext?.squareMid,
 		scopeMid: memberEventContext?.squareMid,
-	}).catch((error) => {
-		handleEventProcessingError("square", "member event log", error);
-	});
+	}).filter((item) => item.type === "kick");
+	if (nonSignalLogEvents.length > 0) {
+		void memberEventLogStore.recordParsedEvents(nonSignalLogEvents).catch((error) => {
+			handleEventProcessingError("square", "member event log", error);
+		});
+	}
 	for (const joinEvent of memberEvents.joins) {
-		try {
-			await handleOpenChatMemberJoin(joinEvent);
-		} catch (error) {
-			handleEventProcessingError("square", "member join handler", error);
-		}
-		if (
-			joinEvent.squareChatMid &&
-			ocModerationSettingsStore.joinMessage(joinEvent.squareChatMid) &&
-			!permissionStore.isBotStopped(botStopTargetFromDestination({
-				kind: "square",
-				chatMid: joinEvent.squareChatMid,
-				scopeMid: joinEvent.squareMid,
-				chatType: "SQUARE",
-				senderMid: joinEvent.memberMid,
-				senderName: joinEvent.displayName,
-				encrypted: false,
-			}))
-		) {
-			void handleOpenChatJoinEventMessage(joinEvent, { ignoreBefore: sessionStartedAt })
-				.catch((error) => handleEventProcessingError("square", "join message handler", error));
-		}
+		const signal: OpenChatMemberSignal = {
+			type: "join",
+			origin: "square-receiver",
+			ignoreBefore: sessionStartedAt,
+			event: joinEvent,
+		};
+		void ocMemberSignalDispatcher.publish(signal)
+			.catch((error) => handleEventProcessingError("square", "member join signal", error));
 	}
 	for (const leaveEvent of memberEvents.leaves) {
-		try {
-			await handleOpenChatMemberLeave(leaveEvent);
-		} catch (error) {
-			handleEventProcessingError("square", "member leave handler", error);
-		}
-		if (
-			leaveEvent.squareChatMid &&
-			ocModerationSettingsStore.leaveMessage(leaveEvent.squareChatMid) &&
-			!permissionStore.isBotStopped(botStopTargetFromDestination({
-				kind: "square",
-				chatMid: leaveEvent.squareChatMid,
-				scopeMid: leaveEvent.squareMid,
-				chatType: "SQUARE",
-				senderMid: leaveEvent.memberMid,
-				senderName: leaveEvent.displayName,
-				encrypted: false,
-			}))
-		) {
-			void handleOpenChatLeaveEventMessage(leaveEvent, { ignoreBefore: sessionStartedAt })
-				.catch((error) => handleEventProcessingError("square", "leave message handler", error));
-		}
+		const signal: OpenChatMemberSignal = {
+			type: "leave",
+			origin: "square-receiver",
+			ignoreBefore: sessionStartedAt,
+			event: leaveEvent,
+		};
+		void ocMemberSignalDispatcher.publish(signal)
+			.catch((error) => handleEventProcessingError("square", "member leave signal", error));
 	}
 	const postModerationEvent = postModerationEventFromSquareEvent(client, event);
 	if (postModerationEvent) {
@@ -1926,7 +1909,7 @@ async function handleRawSquareEvent(
 		void handleSquareMessage(client, new SquareMessage({
 			client,
 			raw: eventMessage.raw as never,
-		}), eventMessage.threadMid, eventMessage.chatMid)
+		}), sessionStartedAt, eventMessage.threadMid, eventMessage.chatMid)
 			.catch((error) => handleEventProcessingError("square", "message handler", error));
 	}
 }
@@ -1937,25 +1920,30 @@ async function restoreReplayedSquareMemberActivity(
 ): Promise<number> {
 	const memberEvents = await memberActivityEventsFromSquareEvent(client, event);
 	const memberEventContext = memberEvents.joins[0] ?? memberEvents.leaves[0];
-	void memberEventLogStore.recordHistoryEvents([event], {
+	const nonSignalLogEvents = extractMemberEvents(event, {
 		chatMid: memberEventContext?.squareChatMid ?? memberEventContext?.squareMid,
 		scopeMid: memberEventContext?.squareMid,
-	}).catch((error) => {
-		handleEventProcessingError("square", "replayed member event log", error);
-	});
+	}).filter((item) => item.type === "kick");
+	if (nonSignalLogEvents.length > 0) {
+		void memberEventLogStore.recordParsedEvents(nonSignalLogEvents).catch((error) => {
+			handleEventProcessingError("square", "replayed member event log", error);
+		});
+	}
 	for (const joinEvent of memberEvents.joins) {
-		try {
-			await handleOpenChatMemberJoin(joinEvent, { suppressActions: true });
-		} catch (error) {
-			handleEventProcessingError("square", "replayed member join restore", error);
-		}
+		await ocMemberSignalDispatcher.publish({
+			type: "join",
+			origin: "replay",
+			suppressActions: true,
+			event: joinEvent,
+		}).catch((error) => handleEventProcessingError("square", "replayed member join restore", error));
 	}
 	for (const leaveEvent of memberEvents.leaves) {
-		try {
-			await handleOpenChatMemberLeave(leaveEvent, { suppressActions: true });
-		} catch (error) {
-			handleEventProcessingError("square", "replayed member leave restore", error);
-		}
+		await ocMemberSignalDispatcher.publish({
+			type: "leave",
+			origin: "replay",
+			suppressActions: true,
+			event: leaveEvent,
+		}).catch((error) => handleEventProcessingError("square", "replayed member leave restore", error));
 	}
 	return memberEvents.joins.length + memberEvents.leaves.length;
 }

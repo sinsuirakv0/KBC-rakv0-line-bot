@@ -1829,22 +1829,6 @@ export async function handleOpenChatMemberLeave(
 			at: event.leftAt,
 			clearAllChats: false,
 		});
-		if (suppressActions) {
-			console.log("[oc-left-soon] chat leave action suppressed", {
-				squareMid: event.squareMid,
-				squareChatMid: event.squareChatMid,
-				memberMid: event.memberMid,
-			});
-			return;
-		}
-		if (!ocModerationSettingsStore.snapshot(event.squareMid).leftSoonMonitoringEnabled) {
-			console.log("[oc-left-soon] chat leave ignored because monitoring is disabled", {
-				squareMid: event.squareMid,
-				squareChatMid: event.squareChatMid,
-				memberMid: event.memberMid,
-			});
-			return;
-		}
 		if (!await isMainSquareChat(event.client, event.squareMid, event.squareChatMid)) {
 			console.log("[oc-left-soon] subchat leave ignored", {
 				squareMid: event.squareMid,
@@ -1853,18 +1837,21 @@ export async function handleOpenChatMemberLeave(
 			});
 			return;
 		}
-		const restoredEvent = await restoreRecentPresenceForLeave(event, false);
+		const monitoringEnabled = ocModerationSettingsStore.snapshot(event.squareMid).leftSoonMonitoringEnabled;
+		const restoredEvent = await restoreRecentPresenceForLeave(event, suppressActions);
 		console.log("[oc-left-soon] main chat leave detected", {
 			squareMid: event.squareMid,
 			squareChatMid: event.squareChatMid,
 			memberMid: event.memberMid,
 			hasRecentPresence: Boolean(ocRecentPresenceStore.snapshot(event.squareMid, event.memberMid)),
+			monitoringEnabled,
+			suppressActions,
 		});
 		await processSquareMemberLeave({
 			...restoredEvent,
 			clearAllChats: true,
 			source: "square-member",
-		}, { suppressActions });
+		}, { suppressActions: suppressActions || !monitoringEnabled });
 		return;
 	}
 	const restoredEvent = await restoreRecentPresenceForLeave(event, suppressActions);
