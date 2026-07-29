@@ -1,5 +1,7 @@
 ﻿import type { Client } from "@evex/linejs";
 
+import { lineApiQueue } from "../runtime/lineApiQueue.js";
+
 const MAX_MESSAGE_LENGTH = 1_600;
 
 function messageIdFromSquareSendResult(value: unknown): string | undefined {
@@ -72,7 +74,9 @@ export async function sendSquareThreadWithRoot(
 	rootText: string,
 	bodyText: string,
 ): Promise<void> {
-	const root = await client.base.square.sendMessage({ squareChatMid: chatMid, text: rootText });
+	const root = await lineApiQueue.run("event-push:thread-root", () =>
+		client.base.square.sendMessage({ squareChatMid: chatMid, text: rootText })
+	);
 	const rootMessageId = messageIdFromSquareSendResult(root);
 	if (!rootMessageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
 	const response = await client.base.square.getSquareThreadMid({
@@ -86,20 +90,22 @@ export async function sendSquareThreadWithRoot(
 		console.warn("[push:event:daily] joinSquareThread failed; trying thread send anyway", error);
 	}
 	for (const text of splitText(bodyText)) {
-		await client.base.square.sendSquareThreadMessage({
-			request: {
-				reqSeq: await client.base.getReqseq("sq"),
-				chatMid,
-				threadMid,
-				threadMessage: {
-					message: {
-						to: threadMid,
-						text,
-						contentType: "NONE",
-						toType: "SQUARE_THREAD",
+		await lineApiQueue.run("event-push:thread-text", async () =>
+			client.base.square.sendSquareThreadMessage({
+				request: {
+					reqSeq: await client.base.getReqseq("sq"),
+					chatMid,
+					threadMid,
+					threadMessage: {
+						message: {
+							to: threadMid,
+							text,
+							contentType: "NONE",
+							toType: "SQUARE_THREAD",
+						},
 					},
 				},
-			},
-		});
+			})
+		);
 	}
 }

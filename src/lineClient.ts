@@ -8,6 +8,10 @@ import {
 } from "@evex/linejs";
 import { BaseClient } from "@evex/linejs/base";
 import { appConfig, getPasswordCredentials } from "./config.js";
+import {
+	isAuthenticationLineError,
+	isExpiredAuthenticationLineError,
+} from "./runtime/lineErrorPolicy.js";
 import type { SyncedLineStorage } from "./storage/lineStorage.js";
 
 const STORAGE_AUTH_KEY = ".auth";
@@ -34,19 +38,11 @@ async function writeQrCode(url: string): Promise<void> {
 }
 
 export function isAuthenticationError(error: unknown): boolean {
-	let detail = error instanceof Error ? `${error.name} ${error.message}` : String(error);
-	try {
-		detail += ` ${JSON.stringify(error)}`;
-	} catch { /* best-effort error inspection */ }
-	return /NOT_AUTHORIZED|AUTHENTICATION_DIVESTED|INVALID_AUTH|EXPIRED_AUTH/i.test(detail);
+	return isAuthenticationLineError(error);
 }
 
 export function isExpiredAuthenticationError(error: unknown): boolean {
-	let detail = error instanceof Error ? `${error.name} ${error.message}` : String(error);
-	try {
-		detail += ` ${JSON.stringify(error)}`;
-	} catch { /* best-effort error inspection */ }
-	return /NOT_AUTHORIZED_DEVICE/i.test(detail) && /\bEXPIRED\b/i.test(detail);
+	return isExpiredAuthenticationLineError(error);
 }
 
 export async function createLineClient(storage: SyncedLineStorage): Promise<Client> {
@@ -138,7 +134,9 @@ export async function createLineClient(storage: SyncedLineStorage): Promise<Clie
 
 	client.base.on("update:authtoken", saveToken);
 	await saveToken(client.authToken);
-	await storage.flushBackup();
+	await storage.flushBackup().catch((error) => {
+		console.warn("[line-storage] post-login backup failed; LINE session will continue", error);
+	});
 
 	return client;
 }

@@ -1,6 +1,7 @@
 ﻿import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
 import { permissionStore } from "../permissions/store.js";
+import { lineApiQueue } from "../runtime/lineApiQueue.js";
 import { loadEventCatalog } from "./catalog.js";
 import {
 	dailyDeliveryInWindow,
@@ -23,14 +24,18 @@ async function sendToTarget(
 ): Promise<"sent" | "stopped"> {
 	if (permissionStore.isBotStopped(target)) return "stopped";
 	if (target.kind === "square") {
-		await client.base.square.sendMessage({ squareChatMid: target.chatMid, text });
+		await lineApiQueue.run("event-push:square", () =>
+			client.base.square.sendMessage({ squareChatMid: target.chatMid, text })
+		);
 		return "sent";
 	}
-	await client.base.talk.sendMessage({
-		to: target.chatMid,
-		text,
-		e2ee: target.encrypted,
-	});
+	await lineApiQueue.run("event-push:talk", () =>
+		client.base.talk.sendMessage({
+			to: target.chatMid,
+			text,
+			e2ee: target.encrypted,
+		})
+	);
 	return "sent";
 }
 

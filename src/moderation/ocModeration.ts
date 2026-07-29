@@ -14,6 +14,7 @@ import {
 	type OcModerationCaseType,
 } from "./ocModerationCases.js";
 import { permissionStore, targetFromDestination, type PermissionTarget } from "../permissions/store.js";
+import { lineApiQueue } from "../runtime/lineApiQueue.js";
 import { ocModerationSettingsStore } from "./ocModerationSettings.js";
 import {
 	blockedOcUrlComponent,
@@ -789,44 +790,46 @@ async function deleteSquareMessageRef(
 ): Promise<boolean> {
 	if (handledMessageIds.has(messageRefKey(ref))) return true;
 	rememberHandled(ref);
-	try {
-		const result = await client.base.square.destroyMessage({
-			squareChatMid: ref.squareChatMid,
-			messageId: ref.messageId,
-		});
-		console.log("[oc-moderation] message deleted", {
-			reason,
-			method: "destroyMessage",
-			squareChatMid: ref.squareChatMid,
-			messageId: ref.messageId,
-			result,
-		});
-		return true;
-	} catch (destroyError) {
+	return await lineApiQueue.run("oc-moderation:delete", async () => {
 		try {
-			const result = await client.base.square.unsendMessage({
+			const result = await client.base.square.destroyMessage({
 				squareChatMid: ref.squareChatMid,
 				messageId: ref.messageId,
 			});
 			console.log("[oc-moderation] message deleted", {
 				reason,
-				method: "unsendMessage",
+				method: "destroyMessage",
 				squareChatMid: ref.squareChatMid,
 				messageId: ref.messageId,
 				result,
 			});
 			return true;
-		} catch (unsendError) {
-			console.warn("[oc-moderation] message deletion failed", {
-				reason,
-				squareChatMid: ref.squareChatMid,
-				messageId: ref.messageId,
-				destroyError,
-				unsendError,
-			});
-			return false;
+		} catch (destroyError) {
+			try {
+				const result = await client.base.square.unsendMessage({
+					squareChatMid: ref.squareChatMid,
+					messageId: ref.messageId,
+				});
+				console.log("[oc-moderation] message deleted", {
+					reason,
+					method: "unsendMessage",
+					squareChatMid: ref.squareChatMid,
+					messageId: ref.messageId,
+					result,
+				});
+				return true;
+			} catch (unsendError) {
+				console.warn("[oc-moderation] message deletion failed", {
+					reason,
+					squareChatMid: ref.squareChatMid,
+					messageId: ref.messageId,
+					destroyError,
+					unsendError,
+				});
+				return false;
+			}
 		}
-	}
+	}, "high");
 }
 
 async function deleteSquareMessage(message: OpenChatModerationMessage, reason: string): Promise<boolean> {
@@ -854,11 +857,14 @@ async function sendMentionNotice(message: OpenChatModerationMessage, notice: str
 	const prefix = await mentionPrefix(message);
 	const text = `${prefix}\n${notice}`;
 	try {
-		await message.client.base.square.sendMessage({
-			squareChatMid: message.squareChatMid,
-			text,
-			contentMetadata: mentionMetadata(0, prefix.length, message.senderMid),
-		});
+		await lineApiQueue.run("oc-moderation:mention-notice", () =>
+			message.client.base.square.sendMessage({
+				squareChatMid: message.squareChatMid,
+				text,
+				contentMetadata: mentionMetadata(0, prefix.length, message.senderMid),
+			}),
+			"high",
+		);
 	} catch (error) {
 		console.warn("[oc-moderation] notice send failed", error);
 	}
@@ -866,10 +872,13 @@ async function sendMentionNotice(message: OpenChatModerationMessage, notice: str
 
 async function sendPlainNotice(message: OpenChatModerationMessage, notice: string): Promise<void> {
 	try {
-		await message.client.base.square.sendMessage({
-			squareChatMid: message.squareChatMid,
-			text: notice,
-		});
+		await lineApiQueue.run("oc-moderation:plain-notice", () =>
+			message.client.base.square.sendMessage({
+				squareChatMid: message.squareChatMid,
+				text: notice,
+			}),
+			"high",
+		);
 	} catch (error) {
 		console.warn("[oc-moderation] notice send failed", error);
 	}
@@ -914,13 +923,14 @@ async function sendModRoomLog(
 		console.warn("[oc-moderation] mod room not configured", { squareMid, text });
 		return false;
 	}
+	const modRoomChatMid = settings.modRoomChatMid;
 	let caseId: string | undefined;
 	if (caseInfo) {
 		caseId = ocModerationCasesStore.record({
 			type: caseInfo.type,
 			status: caseInfo.status,
 			squareMid,
-			modRoomChatMid: settings.modRoomChatMid,
+			modRoomChatMid,
 			targetMid: caseInfo.targetMid,
 			targetName: caseInfo.targetName,
 			reason: caseInfo.reason,
@@ -928,20 +938,23 @@ async function sendModRoomLog(
 		}).id;
 	}
 	try {
-		const sent = await client.base.square.sendMessage({
-			squareChatMid: settings.modRoomChatMid,
-			text,
-		});
+		const sent = await lineApiQueue.run("oc-moderation:mod-room-log", () =>
+			client.base.square.sendMessage({
+				squareChatMid: modRoomChatMid,
+				text,
+			}),
+			"high",
+		);
 		const messageId = squareSendMessageId(sent);
 		if (caseId && messageId) {
-			ocModerationCasesStore.attachMessage(caseId, settings.modRoomChatMid, messageId);
+			ocModerationCasesStore.attachMessage(caseId, modRoomChatMid, messageId);
 			if (!caseInfo?.deferFlush) await ocModerationCasesStore.flush();
 		}
 		return true;
 	} catch (error) {
 		console.warn("[oc-moderation] mod room log send failed", {
 			squareMid,
-			modRoomChatMid: settings.modRoomChatMid,
+			modRoomChatMid,
 			error,
 		});
 		return false;
@@ -1144,14 +1157,17 @@ async function sendLeftSoonMainNotice(
 		return;
 	}
 	try {
-		await event.client.base.square.sendMessage({
-			squareChatMid,
-			text: [
-				"自動強制退会が実行されました。",
-				"判断理由: 参加から5分以内の即抜け",
-				`参加時間: ${formatParticipationDuration(info.stayMs)}`,
-			].join("\n"),
-		});
+		await lineApiQueue.run("oc-moderation:auto-kick-notice", () =>
+			event.client.base.square.sendMessage({
+				squareChatMid,
+				text: [
+					"自動強制退会が実行されました。",
+					"判断理由: 参加から5分以内の即抜け",
+					`参加時間: ${formatParticipationDuration(info.stayMs)}`,
+				].join("\n"),
+			}),
+			"high",
+		);
 	} catch (error) {
 		console.warn("[oc-left-soon] automatic ban notice send failed", {
 			squareMid: event.squareMid,
@@ -1184,10 +1200,13 @@ async function sendDangerWordMainNotice(
 			"副官はログを確認してください。",
 		].join("\n");
 	try {
-		await message.client.base.square.sendMessage({
-			squareChatMid: message.squareChatMid,
-			text,
-		});
+		await lineApiQueue.run("oc-moderation:danger-word-notice", () =>
+			message.client.base.square.sendMessage({
+				squareChatMid: message.squareChatMid,
+				text,
+			}),
+			"high",
+		);
 	} catch (error) {
 		console.warn("[oc-moderation] danger word main notice failed", error);
 	}

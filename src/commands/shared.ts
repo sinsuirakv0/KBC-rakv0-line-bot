@@ -99,6 +99,19 @@ export interface CommandProgress {
 	detach(): void;
 }
 
+export type CommandPriority = "high" | "normal";
+export type CommandProgressMode = "auto" | "none";
+
+export interface CommandPolicy {
+	priority: CommandPriority;
+	progress: CommandProgressMode;
+}
+
+export type CommandPolicyResolver = (
+	args: string[],
+	commandName: string,
+) => Partial<CommandPolicy>;
+
 export interface SendLongOptions {
 	preferThread?: boolean;
 	threadNotice?: string;
@@ -117,6 +130,7 @@ export const THREAD_OUTPUT_OPTIONS: SendLongOptions = {
 export interface LineCommand {
 	name: string;
 	aliases?: string[];
+	policy?: Partial<CommandPolicy> | CommandPolicyResolver;
 	execute(context: CommandContext): Promise<void>;
 }
 

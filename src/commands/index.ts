@@ -1,5 +1,9 @@
 import { appConfig } from "../config.js";
-import type { LineCommand, ReplyableLineMessage } from "./shared.js";
+import type {
+	CommandPolicy,
+	LineCommand,
+	ReplyableLineMessage,
+} from "./shared.js";
 import { startCommandProgress } from "./progress.js";
 import { banCommand } from "./ban.js";
 import { botCommand } from "./bot.js";
@@ -21,6 +25,10 @@ import { unitCommand } from "./unit.js";
 import { rankingStore } from "../ranking/store.js";
 
 const commands = new Map<string, LineCommand>();
+const DEFAULT_COMMAND_POLICY: CommandPolicy = {
+	priority: "normal",
+	progress: "auto",
+};
 
 for (const command of [
 	gatyaCommand,
@@ -45,16 +53,44 @@ for (const command of [
 	for (const alias of command.aliases ?? []) commands.set(alias, command);
 }
 
-export async function handleLineCommand(messageText: string, message: ReplyableLineMessage): Promise<boolean> {
-	if (!messageText.startsWith(appConfig.commandPrefix)) return false;
+interface ResolvedCommand {
+	body: string;
+	name: string;
+	args: string[];
+	command: LineCommand;
+	policy: CommandPolicy;
+}
+
+function resolveCommand(messageText: string): ResolvedCommand | undefined {
+	if (!messageText.startsWith(appConfig.commandPrefix)) return undefined;
 	const body = messageText.slice(appConfig.commandPrefix.length).trim();
-	if (!body) return false;
+	if (!body) return undefined;
 	const [nameRaw, ...args] = body.split(/\s+/);
 	const name = nameRaw.toLowerCase();
 	const command = commands.get(name);
-	if (!command) return false;
+	if (!command) return undefined;
+	const configured = typeof command.policy === "function"
+		? command.policy(args, name)
+		: command.policy;
+	return {
+		body,
+		name,
+		args,
+		command,
+		policy: { ...DEFAULT_COMMAND_POLICY, ...configured },
+	};
+}
+
+export function getLineCommandPolicy(messageText: string): CommandPolicy | undefined {
+	return resolveCommand(messageText)?.policy;
+}
+
+export async function handleLineCommand(messageText: string, message: ReplyableLineMessage): Promise<boolean> {
+	const resolved = resolveCommand(messageText);
+	if (!resolved) return false;
+	const { body, name, args, command, policy } = resolved;
 	rankingStore.record(message.destination);
-	const progress = await startCommandProgress(message, name);
+	const progress = await startCommandProgress(message, name, policy.progress);
 	try {
 		await command.execute({ message, command: name, args, rawText: messageText, body, progress });
 	} finally {

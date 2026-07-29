@@ -145,7 +145,17 @@ export class GithubContentsClient {
 		let lastStatus = 0;
 		let lastDetail = "";
 		for (let attempt = 1; attempt <= 5; attempt++) {
-			const response = await this.put(filePath, content, message, nextSha);
+			let response: Response;
+			try {
+				response = await this.put(filePath, content, message, nextSha);
+			} catch (error) {
+				lastStatus = 0;
+				lastDetail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+				if (attempt >= 5) break;
+				console.warn(`[github] retrying ${filePath} after network error (attempt ${attempt})`, lastDetail);
+				await this.sleep(this.retryDelayMs(attempt));
+				continue;
+			}
 			if (response.ok) {
 				const result = await response.json() as { content?: { sha?: string } };
 				if (result.content?.sha) this.shaCache.set(filePath, result.content.sha);
@@ -153,21 +163,52 @@ export class GithubContentsClient {
 			}
 			lastStatus = response.status;
 			lastDetail = await response.text();
-			if (response.status !== 409 && response.status !== 422) break;
-			const latestSha = await this.readSha(filePath).catch(() => undefined);
-			if (latestSha) {
-				nextSha = latestSha;
-				console.log(`[github] retrying ${filePath} with latest sha after HTTP ${response.status} (attempt ${attempt})`);
-			} else if (nextSha) {
-				nextSha = undefined;
-				this.shaCache.delete(filePath);
-				console.log(`[github] retrying ${filePath} as new file after HTTP ${response.status} (attempt ${attempt})`);
-			} else {
-				break;
+			if (response.status === 409 || response.status === 422) {
+				try {
+					const latestSha = await this.readSha(filePath);
+					if (latestSha) {
+						nextSha = latestSha;
+						console.log(`[github] retrying ${filePath} with latest sha after HTTP ${response.status} (attempt ${attempt})`);
+					} else {
+						nextSha = undefined;
+						this.shaCache.delete(filePath);
+						console.log(`[github] retrying ${filePath} as new file after HTTP ${response.status} (attempt ${attempt})`);
+					}
+				} catch (error) {
+					// SHA取得失敗時にSHAを外すと、既存ファイルへのPUTがさらに422になる。
+					console.warn(`[github] latest sha lookup failed for ${filePath}; keeping current sha`, error);
+				}
+				await this.sleep(this.retryDelayMs(attempt));
+				continue;
 			}
-			await this.sleep(250 * attempt);
+			if (this.isTransientStatus(response.status) && attempt < 5) {
+				const retryAfterMs = this.retryAfterMs(response);
+				console.warn(`[github] retrying ${filePath} after HTTP ${response.status} (attempt ${attempt})`);
+				await this.sleep(retryAfterMs ?? this.retryDelayMs(attempt));
+				continue;
+			}
+			break;
 		}
-		throw new Error(`GitHub write failed: HTTP ${lastStatus} ${lastDetail.slice(0, 1000)}`);
+		const statusLabel = lastStatus === 0 ? "network error" : `HTTP ${lastStatus}`;
+		throw new Error(`GitHub write failed: ${statusLabel} ${lastDetail.slice(0, 1000)}`);
+	}
+
+	private isTransientStatus(status: number): boolean {
+		return status === 408 || status === 429 || status >= 500;
+	}
+
+	private retryAfterMs(response: Response): number | undefined {
+		const value = response.headers.get("retry-after");
+		if (!value) return undefined;
+		const seconds = Number(value);
+		if (Number.isFinite(seconds)) return Math.max(250, Math.min(60_000, seconds * 1_000));
+		const date = Date.parse(value);
+		if (!Number.isFinite(date)) return undefined;
+		return Math.max(250, Math.min(60_000, date - Date.now()));
+	}
+
+	private retryDelayMs(attempt: number): number {
+		return Math.min(5_000, 250 * (2 ** Math.max(0, attempt - 1)));
 	}
 
 	private async put(

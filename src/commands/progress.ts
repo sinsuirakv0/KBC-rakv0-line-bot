@@ -1,4 +1,8 @@
-﻿import type { CommandProgress, ReplyableLineMessage } from "./shared.js";
+﻿import type {
+	CommandProgress,
+	CommandProgressMode,
+	ReplyableLineMessage,
+} from "./shared.js";
 
 const CLEANUP_DELAY_MS = 250;
 
@@ -56,7 +60,9 @@ class DeletableCommandProgress implements CommandProgress {
 export async function startCommandProgress(
 	message: ReplyableLineMessage,
 	commandName: string,
+	mode: CommandProgressMode = "auto",
 ): Promise<CommandProgress> {
+	if (mode === "none") return new NullCommandProgress();
 	const progress = new DeletableCommandProgress(message);
 	try {
 		await progress.update(`!${commandName} を処理中...`);

@@ -1,5 +1,6 @@
 ﻿import type { Client } from "@evex/linejs";
 import { permissionStore } from "../permissions/store.js";
+import { lineApiQueue } from "../runtime/lineApiQueue.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
 
 const EVENT_TYPES = new Set(["gatya", "sale", "item"]);
@@ -87,13 +88,17 @@ export async function notifyScheduleUpdate(
 				continue;
 			}
 			if (target.kind === "square") {
-				await client.base.square.sendMessage({ squareChatMid: target.chatMid, text });
+				await lineApiQueue.run("event-update:square", () =>
+					client.base.square.sendMessage({ squareChatMid: target.chatMid, text })
+				);
 			} else {
-				await client.base.talk.sendMessage({
-					to: target.chatMid,
-					text,
-					e2ee: target.encrypted,
-				});
+				await lineApiQueue.run("event-update:talk", () =>
+					client.base.talk.sendMessage({
+						to: target.chatMid,
+						text,
+						e2ee: target.encrypted,
+					})
+				);
 			}
 			sent++;
 		} catch (error) {

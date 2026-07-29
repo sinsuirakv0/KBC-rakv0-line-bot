@@ -61,6 +61,7 @@ export function introText(snapshot: RuntimeEnvironmentSnapshot): string {
 
 export const introCommand: LineCommand = {
 	name: "intro",
+	policy: { progress: "none" },
 	async execute({ message, args }) {
 		if (args[0]?.toLowerCase() === "help") {
 			await message.send("!intro\nMuninの自己紹介と現在の動作環境を表示します。");

@@ -8,6 +8,9 @@ interface ChannelHealth {
 	lastErrorAt?: number;
 	lastError?: string;
 	consecutiveFailures: number;
+	restartCount: number;
+	lastRestartAt?: number;
+	lastRestartReason?: string;
 }
 
 export interface LineHealthChannelSnapshot extends ChannelHealth {
@@ -38,7 +41,7 @@ export interface LineHealthSnapshot {
 const CHANNELS: LineHealthChannel[] = ["talk", "square", "member-message"];
 
 function newChannelHealth(): ChannelHealth {
-	return { consecutiveFailures: 0 };
+	return { consecutiveFailures: 0, restartCount: 0 };
 }
 
 function compactError(error: unknown): string {
@@ -70,6 +73,7 @@ class LineHealth {
 				startedAt: now,
 				lastHeartbeatAt: now,
 				consecutiveFailures: 0,
+				restartCount: 0,
 			};
 		}
 	}
@@ -120,6 +124,15 @@ class LineHealth {
 		state.lastErrorAt = now;
 		state.lastError = compactError(error);
 		state.consecutiveFailures += 1;
+	}
+
+	markRestart(channel: LineHealthChannel, reason: unknown, now = Date.now()): void {
+		const state = this.channels[channel];
+		state.restartCount += 1;
+		state.lastRestartAt = now;
+		state.lastRestartReason = compactError(reason);
+		state.lastHeartbeatAt = now;
+		state.consecutiveFailures = 0;
 	}
 
 	isStale(channel: Exclude<LineHealthChannel, "member-message">, staleMs: number, now = Date.now()): boolean {

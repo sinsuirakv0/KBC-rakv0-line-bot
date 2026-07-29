@@ -71,6 +71,17 @@ export const appConfig = {
 	commandPrefix: process.env.COMMAND_PREFIX || "!",
 	commandMaxConcurrency: numberEnv("COMMAND_MAX_CONCURRENCY", 2, { min: 1, max: 4, integer: true }),
 	commandQueueLimit: numberEnv("COMMAND_QUEUE_LIMIT", 30, { min: 5, max: 100, integer: true }),
+	lineApiQueueLimit: numberEnv("LINE_API_QUEUE_LIMIT", 100, { min: 20, max: 500, integer: true }),
+	lineApiHighPriorityReserve: numberEnv("LINE_API_HIGH_PRIORITY_RESERVE", 20, {
+		min: 1,
+		max: 100,
+		integer: true,
+	}),
+	lineApiSendIntervalMs: numberEnv("LINE_API_SEND_INTERVAL_MS", 50, {
+		min: 0,
+		max: 1_000,
+		integer: true,
+	}),
 	backgroundQuietMs: numberEnv("BACKGROUND_QUIET_MS", 15_000, { min: 0, integer: true }),
 	backgroundRetryMs: numberEnv("BACKGROUND_RETRY_MS", 10_000, { min: 1_000, integer: true }),
 	backgroundMaxEventLoopLagMs: numberEnv("BACKGROUND_MAX_EVENT_LOOP_LAG_MS", 250, {
@@ -98,7 +109,27 @@ export const appConfig = {
 		process.env.LINE_STORAGE_GITHUB_PATH || "line-auth/storage.enc.json",
 	lineStorageBackupKey: process.env.LINE_STORAGE_BACKUP_KEY || "",
 	lineStorageBackupIntervalMs: Number(process.env.LINE_STORAGE_BACKUP_INTERVAL_MS || 30_000),
-	loginRetryMs: Number(process.env.LINE_LOGIN_RETRY_MS || 15_000),
+	loginRetryMs: numberEnv("LINE_LOGIN_RETRY_MS", 15_000, { min: 5_000, integer: true }),
+	loginRetryMaxMs: numberEnv("LINE_LOGIN_RETRY_MAX_MS", 5 * 60_000, {
+		min: 30_000,
+		integer: true,
+	}),
+	loginInvalidCredentialRetryMs: numberEnv("LINE_LOGIN_INVALID_CREDENTIAL_RETRY_MS", 30 * 60_000, {
+		min: 5 * 60_000,
+		integer: true,
+	}),
+	loginRestrictedRetryMs: numberEnv("LINE_LOGIN_RESTRICTED_RETRY_MS", 6 * 60 * 60_000, {
+		min: 30 * 60_000,
+		integer: true,
+	}),
+	loginRateLimitRetryMs: numberEnv("LINE_LOGIN_RATE_LIMIT_RETRY_MS", 60 * 60_000, {
+		min: 5 * 60_000,
+		integer: true,
+	}),
+	sessionStableResetMs: numberEnv("LINE_SESSION_STABLE_RESET_MS", 10 * 60_000, {
+		min: 60_000,
+		integer: true,
+	}),
 	authWatchdogMs: Number(process.env.LINE_AUTH_WATCHDOG_MS || 60_000),
 	authFailureThreshold: numberEnv("LINE_AUTH_FAILURE_THRESHOLD", 2, {
 		min: 2,
@@ -112,8 +143,18 @@ export const appConfig = {
 	}),
 	talkPollTimeoutMs: Number(process.env.LINE_TALK_POLL_TIMEOUT_MS || 5_000),
 	talkPollIntervalMs: Number(process.env.LINE_TALK_POLL_INTERVAL_MS || 250),
-	talkPollStaleMs: Number(process.env.LINE_TALK_POLL_STALE_MS || 90_000),
-	squarePollStaleMs: Number(process.env.LINE_SQUARE_POLL_STALE_MS || 120_000),
+	talkPollGoneLeaseMs: numberEnv("LINE_TALK_POLL_GONE_LEASE_MS", 15_000, {
+		min: 5_000,
+		integer: true,
+	}),
+	talkPollStaleMs: numberEnv("LINE_TALK_POLL_STALE_MS", 180_000, {
+		min: 150_000,
+		integer: true,
+	}),
+	squarePollStaleMs: numberEnv("LINE_SQUARE_POLL_STALE_MS", 180_000, {
+		min: 120_000,
+		integer: true,
+	}),
 	staleRestartThreshold: numberEnv("LINE_STALE_RESTART_THRESHOLD", 2, {
 		min: 2,
 		max: 5,

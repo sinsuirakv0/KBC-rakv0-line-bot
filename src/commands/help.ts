@@ -22,6 +22,7 @@ const COMMAND_LINES = [
 
 export const helpCommand: LineCommand = {
 	name: "help",
+	policy: { progress: "none" },
 	async execute({ message }) {
 		await message.send(COMMAND_LINES.join("\n"));
 	},

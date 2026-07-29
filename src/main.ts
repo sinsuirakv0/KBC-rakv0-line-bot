@@ -1,6 +1,6 @@
 ﻿import { SquareMessage, type Client } from "@evex/linejs";
 import { appConfig } from "./config.js";
-import { handleLineCommand } from "./commands/index.js";
+import { getLineCommandPolicy, handleLineCommand } from "./commands/index.js";
 import { handleOcSetupReply } from "./commands/oc.js";
 import {
 	THREAD_OUTPUT_NOTICE,
@@ -26,6 +26,15 @@ import { pushSubscriptionStore } from "./subscriptions/store.js";
 import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
 import { lineHealth } from "./runtime/lineHealth.js";
+import {
+	compactLineError,
+	isUnsupportedLineError,
+	LoginRetryPolicy,
+} from "./runtime/lineErrorPolicy.js";
+import { ReceiverSupervisor } from "./runtime/receiverSupervisor.js";
+import { SessionManager } from "./runtime/sessionManager.js";
+import { runStartupStages } from "./runtime/startupStages.js";
+import { lineApiQueue } from "./runtime/lineApiQueue.js";
 import { ForegroundQueueFullError, runtimeWorkload } from "./runtime/workload.js";
 import { recordSquareEventDebug, recordSquareHandlerDebug } from "./runtime/squareEventDebug.js";
 import { ocIdentitySnapshotsStore } from "./moderation/ocIdentitySnapshots.js";
@@ -176,18 +185,32 @@ let warnedEncryptedTalk = false;
 let activeHandlers = 0;
 const senderNames = new Map<string, string>();
 const senderNameRequests = new Map<string, Promise<string | undefined>>();
+const senderNameFailureUntil = new Map<string, number>();
 const squareScopeRequests = new Map<string, Promise<string>>();
 const squareSelfMemberRequests = new Map<string, Promise<string | undefined>>();
 const SENDER_NAME_CACHE_MAX = 5_000;
 const SENDER_NAME_CACHE_RETAIN = 4_000;
+const SENDER_NAME_FAILURE_CACHE_MAX = 2_000;
+const SENDER_NAME_FAILURE_RETRY_MS = 10 * 60_000;
+const SENDER_NAME_UNSUPPORTED_RETRY_MS = 6 * 60 * 60_000;
 
 function rememberSenderName(key: string, name: string): void {
 	senderNames.set(key, name);
+	senderNameFailureUntil.delete(key);
 	if (senderNames.size <= SENDER_NAME_CACHE_MAX) return;
 	while (senderNames.size > SENDER_NAME_CACHE_RETAIN) {
 		const oldestKey = senderNames.keys().next().value as string | undefined;
 		if (!oldestKey) break;
 		senderNames.delete(oldestKey);
+	}
+}
+
+function rememberSenderNameFailure(key: string, retryAt: number): void {
+	senderNameFailureUntil.set(key, retryAt);
+	while (senderNameFailureUntil.size > SENDER_NAME_FAILURE_CACHE_MAX) {
+		const oldestKey = senderNameFailureUntil.keys().next().value as string | undefined;
+		if (!oldestKey) break;
+		senderNameFailureUntil.delete(oldestKey);
 	}
 }
 
@@ -348,38 +371,42 @@ async function dispatchText(
 ): Promise<void> {
 	try {
 		const command = messageText.slice(appConfig.commandPrefix.length).trim().split(/\s+/, 1)[0] || "unknown";
-		const highPriority = command === "ping" ||
-			/^bot\s+(?:status|start)(?:\s|$)/i.test(messageText.slice(appConfig.commandPrefix.length).trim());
-		await runtimeWorkload.runForeground(`${channel}:!${command}`, async () => {
-			const startedAt = Date.now();
-			activeHandlers += 1;
-			try {
-				if (
-					messageText.startsWith(appConfig.commandPrefix) &&
-					!isBotPermissionBypassCommand(messageText) &&
-					!permissionStore.canExecute(message.destination)
-				) {
-					await message.send("実行権限がありません。");
-					return;
+		const commandPolicy = getLineCommandPolicy(messageText);
+		const highPriority = command === "ping" || commandPolicy?.priority === "high";
+		await runtimeWorkload.runForeground(
+			`${channel}:!${command}`,
+			() => lineApiQueue.withPriority(highPriority ? "high" : "normal", async () => {
+				const startedAt = Date.now();
+				activeHandlers += 1;
+				try {
+					if (
+						messageText.startsWith(appConfig.commandPrefix) &&
+						!isBotPermissionBypassCommand(messageText) &&
+						!permissionStore.canExecute(message.destination)
+					) {
+						await message.send("実行権限がありません。");
+						return;
+					}
+					if (messageText === `${appConfig.commandPrefix}ping` || messageText === `${appConfig.commandPrefix}ping help`) {
+						rankingStore.record(message.destination);
+						if (await handlePing(messageText, message)) return;
+					}
+					if (await handleLineCommand(messageText, message)) return;
+				} catch (error) {
+					if (channel === "square") {
+						recordSquareHandlerDebug(`dispatch error text=${shortDebugText(messageText)} error=${compactError(error)}`);
+					}
+					console.error(`[${channel}:message] handler failed`, error);
+				} finally {
+					const elapsedMs = Date.now() - startedAt;
+					if (elapsedMs >= 1_000 || messageText === `${appConfig.commandPrefix}ping`) {
+						console.log(`[perf] ${channel} !${command} handler=${elapsedMs}ms concurrent=${activeHandlers}`);
+					}
+					activeHandlers -= 1;
 				}
-				if (messageText === `${appConfig.commandPrefix}ping` || messageText === `${appConfig.commandPrefix}ping help`) {
-					rankingStore.record(message.destination);
-					if (await handlePing(messageText, message)) return;
-				}
-				if (await handleLineCommand(messageText, message)) return;
-			} catch (error) {
-				if (channel === "square") {
-					recordSquareHandlerDebug(`dispatch error text=${shortDebugText(messageText)} error=${compactError(error)}`);
-				}
-				console.error(`[${channel}:message] handler failed`, error);
-			} finally {
-				const elapsedMs = Date.now() - startedAt;
-				if (elapsedMs >= 1_000 || messageText === `${appConfig.commandPrefix}ping`) {
-					console.log(`[perf] ${channel} !${command} handler=${elapsedMs}ms concurrent=${activeHandlers}`);
-				}
-				activeHandlers -= 1;
-			}
-		}, highPriority ? "high" : "normal");
+			}),
+			highPriority ? "high" : "normal",
+		);
 	} catch (error) {
 		if (error instanceof ForegroundQueueFullError) {
 			console.warn(`[workload] command queue full channel=${channel} queue=${error.queueLength}`);
@@ -868,6 +895,9 @@ async function handleSquareMessage(
 				});
 				recordSquareMessage(message, { ...target.destination, senderName: name });
 			}
+		})
+		.catch((error) => {
+			console.warn("[ranking] square name post-processing failed", compactLineError(error));
 		});
 }
 
@@ -985,6 +1015,11 @@ function resolveSenderName(
 	const key = `${kind}:${mid}`;
 	const cached = senderNames.get(key);
 	if (cached) return Promise.resolve(cached);
+	const failureUntil = senderNameFailureUntil.get(key);
+	if (failureUntil !== undefined) {
+		if (failureUntil > Date.now()) return Promise.resolve(undefined);
+		senderNameFailureUntil.delete(key);
+	}
 	let request = senderNameRequests.get(key);
 	if (!request) {
 		request = (kind === "square"
@@ -995,7 +1030,14 @@ function resolveSenderName(
 			if (name) rememberSenderName(key, name);
 			return name || undefined;
 		}).catch((error) => {
-			console.warn(`[ranking] failed to resolve ${kind} name for ${mid}`, error);
+			const retryMs = isUnsupportedLineError(error)
+				? SENDER_NAME_UNSUPPORTED_RETRY_MS
+				: SENDER_NAME_FAILURE_RETRY_MS;
+			rememberSenderNameFailure(key, Date.now() + retryMs);
+			console.warn(`[ranking] failed to resolve ${kind} name for ${mid}; retry is deferred`, {
+				retryMs,
+				error: compactLineError(error),
+			});
 			return undefined;
 		}).finally(() => {
 			senderNameRequests.delete(key);
@@ -1049,10 +1091,12 @@ class SquareReplyTarget implements ReplyableLineMessage {
 
 	async send(text: string): Promise<string | undefined> {
 		if (this.isThreadSource) return await this.sendThread(text);
-		const sent = await this.client.base.square.sendMessage({
-			squareChatMid: this.destination.chatMid,
-			text,
-		});
+		const sent = await lineApiQueue.run("square:send-text", () =>
+			this.client.base.square.sendMessage({
+				squareChatMid: this.destination.chatMid,
+				text,
+			})
+		);
 		return messageIdFromSquareSendResult(sent);
 	}
 
@@ -1102,72 +1146,80 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	}
 
 	private async sendThreadText(threadMid: string, text: string): Promise<string | undefined> {
-		const sent = await this.client.base.square.sendSquareThreadMessage({
-			request: {
-				reqSeq: await this.client.base.getReqseq("sq"),
-				chatMid: this.destination.chatMid,
-				threadMid,
-				threadMessage: {
-					message: {
-						to: threadMid,
-						text,
-						contentType: "NONE",
-						toType: "SQUARE_THREAD",
+		const sent = await lineApiQueue.run("square:send-thread-text", async () =>
+			this.client.base.square.sendSquareThreadMessage({
+				request: {
+					reqSeq: await this.client.base.getReqseq("sq"),
+					chatMid: this.destination.chatMid,
+					threadMid,
+					threadMessage: {
+						message: {
+							to: threadMid,
+							text,
+							contentType: "NONE",
+							toType: "SQUARE_THREAD",
+						},
 					},
 				},
-			},
-		});
+			})
+		);
 		this.pendingThreadRoot = false;
 		return messageIdFromSquareSendResult(sent);
 	}
 
 	async sendMention(text: string, mentions: OutgoingMention[]): Promise<string | undefined> {
 		if (this.isThreadSource) return await this.sendThread(text);
-		const sent = await this.client.base.square.sendMessage({
-			squareChatMid: this.destination.chatMid,
-			text,
-			contentMetadata: mentionMetadata(mentions),
-		});
+		const sent = await lineApiQueue.run("square:send-mention", () =>
+			this.client.base.square.sendMessage({
+				squareChatMid: this.destination.chatMid,
+				text,
+				contentMetadata: mentionMetadata(mentions),
+			})
+		);
 		return messageIdFromSquareSendResult(sent);
 	}
 
 	async sendImage(image: OutgoingImage): Promise<void> {
-		const sent = await this.client.base.square.sendMessage({
-			squareChatMid: this.destination.chatMid,
-			contentType: "IMAGE" as never,
+		await lineApiQueue.run("square:send-image", async () => {
+			const sent = await this.client.base.square.sendMessage({
+				squareChatMid: this.destination.chatMid,
+				contentType: "IMAGE" as never,
+			});
+			const messageId = messageIdFromSquareSendResult(sent);
+			if (!messageId) throw new Error("画像メッセージIDを取得できませんでした");
+			await this.client.base.obs.uploadObjTalk(
+				this.destination.chatMid,
+				"image",
+				image.blob,
+				messageId,
+				image.filename,
+			);
 		});
-		const messageId = messageIdFromSquareSendResult(sent);
-		if (!messageId) throw new Error("画像メッセージIDを取得できませんでした");
-		await this.client.base.obs.uploadObjTalk(
-			this.destination.chatMid,
-			"image",
-			image.blob,
-			messageId,
-			image.filename,
-		);
 	}
 
 	async deleteMessage(messageId: string): Promise<void> {
 		const threadMid = this.isThreadSource ? this.threadMid : undefined;
-		try {
-			await this.client.base.square.destroyMessage({
-				squareChatMid: this.destination.chatMid,
-				messageId,
-				threadMid,
-			});
-			return;
-		} catch (destroyError) {
+		await lineApiQueue.run("square:delete-message", async () => {
 			try {
-				await this.client.base.square.unsendMessage({
+				await this.client.base.square.destroyMessage({
 					squareChatMid: this.destination.chatMid,
 					messageId,
 					threadMid,
 				});
-			} catch (unsendError) {
-				console.warn("[square] progress message deletion failed", { destroyError, unsendError });
-				throw unsendError;
+				return;
+			} catch (destroyError) {
+				try {
+					await this.client.base.square.unsendMessage({
+						squareChatMid: this.destination.chatMid,
+						messageId,
+						threadMid,
+					});
+				} catch (unsendError) {
+					console.warn("[square] progress message deletion failed", { destroyError, unsendError });
+					throw unsendError;
+				}
 			}
-		}
+		});
 	}
 
 	private async resolveThreadMid(
@@ -1206,10 +1258,12 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	}
 
 	private async sendThreadRootNotice(): Promise<unknown> {
-		return await this.client.base.square.sendMessage({
-			squareChatMid: this.destination.chatMid,
-			text: THREAD_OUTPUT_NOTICE,
-		});
+		return await lineApiQueue.run("square:send-thread-root", () =>
+			this.client.base.square.sendMessage({
+				squareChatMid: this.destination.chatMid,
+				text: THREAD_OUTPUT_NOTICE,
+			})
+		);
 	}
 
 	private async debugThreadMidFromMessage(
@@ -1333,26 +1387,29 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 
 	async sendImage(image: OutgoingImage): Promise<void> {
 		const to = this.sendTo();
-		if (this.isEncrypted() && (to.startsWith("u") || to.startsWith("c"))) {
-			await this.client.base.obs.uploadMediaByE2EE({
+		await lineApiQueue.run("talk:send-image", async () => {
+			if (this.isEncrypted() && (to.startsWith("u") || to.startsWith("c"))) {
+				await this.client.base.obs.uploadMediaByE2EE({
+					to,
+					oType: "image",
+					data: image.blob,
+					filename: image.filename,
+				});
+				return;
+			}
+			const sent = await this.client.base.talk.sendMessage({
 				to,
-				oType: "image",
-				data: image.blob,
-				filename: image.filename,
+				contentType: "IMAGE" as never,
 			});
-			return;
-		}
-
-		const sent = await this.client.base.talk.sendMessage({
-			to,
-			contentType: "IMAGE" as never,
+			if (!sent.id) throw new Error("画像メッセージIDを取得できませんでした");
+			await this.client.base.obs.uploadObjTalk(to, "image", image.blob, sent.id, image.filename);
 		});
-		if (!sent.id) throw new Error("画像メッセージIDを取得できませんでした");
-		await this.client.base.obs.uploadObjTalk(to, "image", image.blob, sent.id, image.filename);
 	}
 
 	async deleteMessage(messageId: string): Promise<void> {
-		await this.client.base.talk.unsendMessage({ messageId });
+		await lineApiQueue.run("talk:delete-message", () =>
+			this.client.base.talk.unsendMessage({ messageId })
+		);
 	}
 
 	private sendTo(): string {
@@ -1378,13 +1435,15 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 		relatedMessageId?: string,
 		contentMetadata?: Record<string, string>,
 	): Promise<string | undefined> {
-		const sent = await this.client.base.talk.sendMessage({
-			to: this.sendTo(),
-			text,
-			relatedMessageId,
-			contentMetadata,
-			e2ee: this.isEncrypted(),
-		});
+		const sent = await lineApiQueue.run("talk:send-text", () =>
+			this.client.base.talk.sendMessage({
+				to: this.sendTo(),
+				text,
+				relatedMessageId,
+				contentMetadata,
+				e2ee: this.isEncrypted(),
+			})
+		);
 		return sent.id;
 	}
 
@@ -1520,6 +1579,9 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 				});
 				recordTalkMessage(raw, { ...target.destination, senderName: name }, parsed);
 			}
+		})
+		.catch((error) => {
+			console.warn("[ranking] talk name post-processing failed", compactLineError(error));
 		});
 }
 
@@ -1597,10 +1659,11 @@ async function listenRawTalkEvents(
 	let revision: number | bigint = 0;
 	let globalRev: number | bigint = 0;
 	let individualRev: number | bigint = 0;
+	let immediateGoneCount = 0;
 	// Keep the wait bounded: LINEJS defaults sync() to a 180-second long poll.
 	while (!signal.aborted) {
+		const pollStartedAt = Date.now();
 		try {
-			const pollStartedAt = Date.now();
 			const response = await client.base.talk.sync({
 				revision,
 				globalRev,
@@ -1616,6 +1679,7 @@ async function listenRawTalkEvents(
 			if (nextIndividualRev !== undefined) individualRev = nextIndividualRev;
 
 			const operations = response.operationResponse?.operations ?? [];
+			immediateGoneCount = 0;
 			lineHealth.markSuccess("talk", operations.length);
 			if (operations.length > 0) {
 				console.log(`[perf] talk poll=${Date.now() - pollStartedAt}ms events=${operations.length}`);
@@ -1632,15 +1696,32 @@ async function listenRawTalkEvents(
 				await sleepUntilRetry(appConfig.talkPollIntervalMs, signal);
 				continue;
 			}
-			lineHealth.markError("talk", error);
 			if (!signal.aborted && isTalkSyncGoneError(error)) {
-				console.warn("[talk:event] sync cursor was rejected with HTTP 410; resetting revisions");
-				revision = 0;
-				globalRev = 0;
-				individualRev = 0;
+				const elapsedMs = Date.now() - pollStartedAt;
+				if (elapsedMs >= appConfig.talkPollGoneLeaseMs) {
+					// 長時間待機後の410はlong-pollの終了として扱い、カーソルを維持する。
+					immediateGoneCount = 0;
+					lineHealth.markHeartbeat("talk", Date.now(), true);
+					await sleepUntilRetry(appConfig.talkPollIntervalMs, signal);
+					continue;
+				}
+				immediateGoneCount += 1;
+				console.warn("[talk:event] sync returned an immediate HTTP 410", {
+					elapsedMs,
+					consecutive: immediateGoneCount,
+				});
+				if (immediateGoneCount >= 3) {
+					console.warn("[talk:event] repeated immediate HTTP 410; resetting revisions");
+					revision = 0;
+					globalRev = 0;
+					individualRev = 0;
+					immediateGoneCount = 0;
+				}
+				lineHealth.markHeartbeat("talk", Date.now(), true);
 				await sleepUntilRetry(1_000, signal);
 				continue;
 			}
+			lineHealth.markError("talk", error);
 			if (!signal.aborted) {
 				handleReceiverPollingError("talk", error, onAuthenticationError);
 			}
@@ -1846,57 +1927,6 @@ async function sleepUntilRetry(ms: number, signal: AbortSignal): Promise<void> {
 	await Promise.race([sleep(ms), waitForAbort(signal)]);
 }
 
-async function superviseOpenChatMemberMessageEvents(
-	client: Client,
-	storage: SyncedLineStorage,
-	signal: AbortSignal,
-	sessionStartedAt: number,
-): Promise<void> {
-	let restartCount = 0;
-	while (!signal.aborted) {
-		try {
-			console.log("[oc-member-message:chat-poll] supervisor started", { restartCount });
-			lineHealth.markHeartbeat("member-message");
-			await listenOpenChatJoinMessageEvents(client, storage, signal, sessionStartedAt);
-			if (signal.aborted) break;
-			throw new Error("OpenChat member-message watcher stopped unexpectedly");
-		} catch (error) {
-			if (signal.aborted) break;
-			restartCount += 1;
-			lineHealth.markError("member-message", error);
-			console.error("[oc-member-message:chat-poll] stopped; restarting", {
-				restartCount,
-				error: compactError(error),
-			});
-			await sleepUntilRetry(appConfig.ocMemberMessageRetryMs, signal);
-		}
-	}
-}
-
-async function superviseEventReceiver(
-	channel: ReceiverChannel,
-	signal: AbortSignal,
-	run: () => Promise<void>,
-): Promise<void> {
-	let restartCount = 0;
-	while (!signal.aborted) {
-		try {
-			await run();
-			if (signal.aborted) break;
-			throw new Error(`${channel} receiver stopped unexpectedly`);
-		} catch (error) {
-			if (signal.aborted) break;
-			restartCount += 1;
-			lineHealth.markError(channel, error);
-			console.error(`[${channel}:event] receiver stopped; restarting locally`, {
-				restartCount,
-				error: compactError(error),
-			});
-			await sleepUntilRetry(1_000, signal);
-		}
-	}
-}
-
 async function runSession(
 	client: Client,
 	storage: SyncedLineStorage,
@@ -1920,7 +1950,9 @@ async function runSession(
 		console.warn("[line] E2EE self key is not available; encrypted Talk messages cannot be read yet");
 	}
 
-	await storage.flushBackup();
+	await storage.flushBackup().catch((error) => {
+		console.warn("[line-storage] session-start backup failed; receivers will still start", error);
+	});
 	const controller = new AbortController();
 	const relayShutdown = () => controller.abort();
 	shutdownSignal.addEventListener("abort", relayShutdown, { once: true });
@@ -2035,32 +2067,67 @@ async function runSession(
 		requestAuthenticationVerification(`${channel}-poll`, error);
 	};
 
+	const receiverSupervisors = new Map<ReceiverChannel | "member-message", ReceiverSupervisor>();
+	const startReceiver = (
+		channel: ReceiverChannel | "member-message",
+		retryDelayMs: number,
+		run: (signal: AbortSignal) => Promise<void>,
+	): ReceiverSupervisor => {
+		const supervisor = new ReceiverSupervisor({
+			name: channel,
+			parentSignal: controller.signal,
+			retryDelayMs,
+			run,
+			onRestart(detail) {
+				lineHealth.markRestart(channel, detail.reason);
+				console.error(`[${channel}:event] receiver restarting locally`, {
+					restartCount: detail.restartCount,
+					requested: detail.requested,
+					error: compactLineError(detail.reason),
+				});
+			},
+		});
+		receiverSupervisors.set(channel, supervisor);
+		void supervisor.run().catch((error) => {
+			// Supervisor自体の障害は記録するが、別受信系や認証セッションは巻き込まない。
+			lineHealth.markError(channel, error);
+			console.error(`[${channel}:event] supervisor crashed`, error);
+		});
+		return supervisor;
+	};
+
 	if (appConfig.enableTalk) {
-		void superviseEventReceiver(
+		startReceiver(
 			"talk",
-			controller.signal,
-			() => listenRawTalkEvents(
+			1_000,
+			(signal) => listenRawTalkEvents(
 				client,
 				profile.mid,
-				controller.signal,
+				signal,
 				onAuthenticationError,
 			),
-		).catch((error) => onFatal("talk-supervisor-crash", error));
+		);
 	}
 	if (appConfig.enableSquare) {
-		void superviseEventReceiver(
+		startReceiver(
 			"square",
-			controller.signal,
-			() => listenRawSquareEvents(
+			1_000,
+			(signal) => listenRawSquareEvents(
 				client,
 				storage,
-				controller.signal,
+				signal,
 				onAuthenticationError,
 				sessionStartedAt,
 			),
-		).catch((error) => onFatal("square-supervisor-crash", error));
-		void superviseOpenChatMemberMessageEvents(client, storage, controller.signal, sessionStartedAt)
-			.catch((error) => onFatal("member-message-supervisor-crash", error));
+		);
+		startReceiver(
+			"member-message",
+			appConfig.ocMemberMessageRetryMs,
+			async (signal) => {
+				lineHealth.markHeartbeat("member-message");
+				await listenOpenChatJoinMessageEvents(client, storage, signal, sessionStartedAt);
+			},
+		);
 	}
 
 	console.log("[app] bot is listening");
@@ -2072,29 +2139,35 @@ async function runSession(
 		if (lagMs >= 1_000) console.warn(`[perf] event-loop lag=${lagMs}ms`);
 		eventLoopCheckedAt = now;
 	}, 10_000);
-	let staleWatchdogFailures = 0;
+	const staleWatchdogFailures: Record<ReceiverChannel, number> = {
+		talk: 0,
+		square: 0,
+	};
 	const watchdog = setInterval(() => {
 		if (controller.signal.aborted) return;
-		const staleChannels = [
-			...(appConfig.enableTalk && lineHealth.isStale("talk", appConfig.talkPollStaleMs) ? ["talk"] : []),
-			...(appConfig.enableSquare && lineHealth.isStale("square", appConfig.squarePollStaleMs) ? ["square"] : []),
+		const channels: Array<{ channel: ReceiverChannel; enabled: boolean; staleMs: number }> = [
+			{ channel: "talk", enabled: appConfig.enableTalk, staleMs: appConfig.talkPollStaleMs },
+			{ channel: "square", enabled: appConfig.enableSquare, staleMs: appConfig.squarePollStaleMs },
 		];
-		if (staleChannels.length > 0) {
-			staleWatchdogFailures += 1;
-			const error = new Error(`LINE event polling became stale: ${staleChannels.join(", ")}`);
-			console.warn("[line] event polling watchdog detected stale receiver", {
-				staleChannels,
-				failures: staleWatchdogFailures,
-				threshold: appConfig.staleRestartThreshold,
-				talkStaleMs: appConfig.talkPollStaleMs,
-				squareStaleMs: appConfig.squarePollStaleMs,
-			});
-			if (staleWatchdogFailures >= appConfig.staleRestartThreshold) {
-				onFatal("event-polling-stale", error);
+		for (const { channel, enabled, staleMs } of channels) {
+			if (!enabled || !lineHealth.isStale(channel, staleMs)) {
+				staleWatchdogFailures[channel] = 0;
+				continue;
 			}
-			return;
+			staleWatchdogFailures[channel] += 1;
+			const error = new Error(`LINE event polling became stale: ${channel}`);
+			console.warn("[line] event polling watchdog detected stale receiver", {
+				channel,
+				failures: staleWatchdogFailures[channel],
+				threshold: appConfig.staleRestartThreshold,
+				staleMs,
+			});
+			if (staleWatchdogFailures[channel] >= appConfig.staleRestartThreshold) {
+				if (receiverSupervisors.get(channel)?.restart(error)) {
+					staleWatchdogFailures[channel] = 0;
+				}
+			}
 		}
-		staleWatchdogFailures = 0;
 	}, appConfig.authWatchdogMs);
 	const runtimeCheckpoint = setInterval(() => {
 		void runtimeStore.checkpoint().catch((error) => {
@@ -2159,44 +2232,88 @@ async function main(): Promise<void> {
 	process.once("SIGINT", shutdown);
 	process.once("SIGTERM", shutdown);
 
-	await Promise.all([
-		pushSubscriptionStore.initialize(),
-		eventPushStore.initialize(),
-		pushReminderStore.initialize(),
-		rankingStore.initialize(),
-		runtimeStore.initialize(),
-		permissionStore.initialize(),
-		ocIdentitySnapshotsStore.initialize(),
-		ocKickHistoryStore.initialize(),
-		ocMemberActivityStore.initialize(),
-		ocRecentPresenceStore.initialize(),
-		ocModerationCasesStore.initialize(),
-		ocModerationSettingsStore.initialize(),
-		memberNameHistoryStore.initialize(),
-		messageLogStore.initialize(),
-		memberEventLogStore.initialize(),
-	]);
+	await runStartupStages([
+		{
+			name: "core",
+			tasks: [
+				{ name: "permissions", initialize: () => permissionStore.initialize() },
+				{ name: "runtime", initialize: () => runtimeStore.initialize() },
+				{ name: "oc-settings", initialize: () => ocModerationSettingsStore.initialize() },
+				{ name: "oc-recent-presence", initialize: () => ocRecentPresenceStore.initialize() },
+			],
+		},
+		{
+			name: "moderation",
+			tasks: [
+				{ name: "oc-member-activity", initialize: () => ocMemberActivityStore.initialize() },
+				{ name: "oc-moderation-cases", initialize: () => ocModerationCasesStore.initialize() },
+				{ name: "oc-identity-snapshots", initialize: () => ocIdentitySnapshotsStore.initialize() },
+				{ name: "oc-kick-history", initialize: () => ocKickHistoryStore.initialize() },
+			],
+		},
+		{
+			name: "notifications",
+			tasks: [
+				{ name: "push-subscriptions", initialize: () => pushSubscriptionStore.initialize() },
+				{ name: "event-push", initialize: () => eventPushStore.initialize() },
+				{ name: "push-reminders", initialize: () => pushReminderStore.initialize() },
+			],
+		},
+		{
+			name: "user-data",
+			tasks: [
+				{ name: "ranking", initialize: () => rankingStore.initialize() },
+				{ name: "member-name-history", initialize: () => memberNameHistoryStore.initialize() },
+			],
+		},
+		{
+			name: "logs",
+			tasks: [
+				{ name: "message-log", initialize: () => messageLogStore.initialize() },
+				{ name: "member-event-log", initialize: () => memberEventLogStore.initialize() },
+			],
+		},
+	], {
+		concurrency: 2,
+		pauseMs: 250,
+		signal: shutdownController.signal,
+		onStage(name, state) {
+			console.log(`[startup] ${name} ${state}`);
+		},
+	});
 	startEventPushScheduler(() => activeClient, shutdownController.signal);
 	startPushReminderScheduler(() => activeClient, shutdownController.signal);
 	startMessageLogAutoHistoryScheduler(() => activeClient, shutdownController.signal);
 	startMessageLogRemoteSyncScheduler(shutdownController.signal);
 	startMemberEventLogRemoteSyncScheduler(shutdownController.signal);
 	const storage = await initializeLineStorage();
-	while (!shutdownController.signal.aborted) {
-		try {
-			const client = await createLineClient(storage);
+	const loginRetryPolicy = new LoginRetryPolicy(
+		appConfig.loginRetryMs,
+		appConfig.loginRetryMaxMs,
+		appConfig.loginInvalidCredentialRetryMs,
+		appConfig.loginRestrictedRetryMs,
+		appConfig.loginRateLimitRetryMs,
+	);
+	const sessionManager = new SessionManager<Client>({
+		signal: shutdownController.signal,
+		retryPolicy: loginRetryPolicy,
+		stableResetMs: appConfig.sessionStableResetMs,
+		create: () => createLineClient(storage),
+		run: (client, signal) => runSession(client, storage, signal),
+		onActiveChange(client) {
 			activeClient = client;
-			await runSession(client, storage, shutdownController.signal);
-		} catch (error) {
-			activeClient = null;
-			if (shutdownController.signal.aborted) break;
-			console.error("[line] session stopped; automatic login will retry", error);
-			await storage.flushBackup().catch(() => {});
-			await sleepUntilRetry(appConfig.loginRetryMs, shutdownController.signal);
-		} finally {
-			activeClient = null;
-		}
-	}
+		},
+		onRetry(retry) {
+			console.error("[line] session stopped; automatic login will retry", {
+				kind: retry.kind,
+				attempt: retry.attempt,
+				delayMs: retry.delayMs,
+				error: retry.detail,
+			});
+		},
+		beforeRetry: () => storage.flushBackup(),
+	});
+	await sessionManager.run();
 
 	await storage.flushBackup().catch(() => {});
 	await rankingStore.flush().catch(() => {});

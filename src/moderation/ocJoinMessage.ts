@@ -1,6 +1,7 @@
 ﻿import type { Client } from "@evex/linejs";
 import { createHash } from "node:crypto";
 import type { OpenChatMemberJoinEvent, OpenChatMemberLeaveEvent } from "./ocModeration.js";
+import { lineApiQueue } from "../runtime/lineApiQueue.js";
 import { ocModerationSettingsStore } from "./ocModerationSettings.js";
 
 export interface OpenChatJoinSystemMessage {
@@ -185,11 +186,13 @@ async function sendConfiguredMemberMessage(input: {
 		: undefined;
 
 	try {
-		await input.client.base.square.sendMessage({
-			squareChatMid: input.squareChatMid,
-			text,
-			contentMetadata,
-		});
+		await lineApiQueue.run(`oc-member-${input.mode}:send`, () =>
+			input.client.base.square.sendMessage({
+				squareChatMid: input.squareChatMid,
+				text,
+				contentMetadata,
+			})
+		);
 		console.log("[oc-member-message] sent", {
 			mode: input.mode,
 			squareMid: input.squareMid,

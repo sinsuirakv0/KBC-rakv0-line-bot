@@ -17,6 +17,7 @@ import {
 } from "../permissions/store.js";
 import { runtimeStore } from "../runtime/store.js";
 import { lineHealth, type LineHealthChannelSnapshot } from "../runtime/lineHealth.js";
+import { lineApiQueue } from "../runtime/lineApiQueue.js";
 import { runtimeWorkload } from "../runtime/workload.js";
 import { githubContentsClient } from "../storage/githubContents.js";
 import { collectRuntimeEnvironment, formatRuntimeEnvironment } from "../runtime/environment.js";
@@ -94,7 +95,8 @@ function formatReceiverHealth(health: LineHealthChannelSnapshot, now = Date.now(
 		? "未確認"
 		: `${formatDuration(Math.max(0, now - lastActivityAt))}前`;
 	const error = health.consecutiveFailures > 0 ? ` / 連続失敗 ${health.consecutiveFailures}` : "";
-	return `最終通信 ${responded}${error}`;
+	const restarts = health.restartCount > 0 ? ` / 局所再起動 ${health.restartCount}` : "";
+	return `最終通信 ${responded}${error}${restarts}`;
 }
 
 function formatMemberMessageHealth(health: LineHealthChannelSnapshot, now = Date.now()): string {
@@ -102,7 +104,8 @@ function formatMemberMessageHealth(health: LineHealthChannelSnapshot, now = Date
 		? "未確認"
 		: `${formatDuration(Math.max(0, now - health.lastHeartbeatAt))}前`;
 	const error = health.consecutiveFailures > 0 ? ` / 連続失敗 ${health.consecutiveFailures}` : "";
-	return `最終監視 ${active}${error}`;
+	const restarts = health.restartCount > 0 ? ` / 局所再起動 ${health.restartCount}` : "";
+	return `最終監視 ${active}${error}${restarts}`;
 }
 
 function sessionEndSourceLabel(source: string): string {
@@ -663,6 +666,16 @@ async function executeSetting(command: Parameters<LineCommand["execute"]>[0]): P
 
 export const botCommand: LineCommand = {
 	name: "bot",
+	policy(args) {
+		const action = args[0]?.toLowerCase();
+		const statusOption = args[1]?.toLowerCase();
+		if (action === "status" && statusOption === "test" && args[2]?.toLowerCase() !== "env") {
+			return { priority: "normal", progress: "auto" };
+		}
+		if (action === "status") return { priority: "high", progress: "none" };
+		if (action === "start") return { priority: "high" };
+		return {};
+	},
 	async execute(command) {
 		const { message, args } = command;
 		const action = args[0]?.toLowerCase();
@@ -705,6 +718,7 @@ export const botCommand: LineCommand = {
 		const status = runtimeStore.snapshot();
 		const receiverHealth = lineHealth.snapshot();
 		const workload = runtimeWorkload.snapshot();
+		const lineApi = lineApiQueue.snapshot();
 		const stopTarget = botStopTargetFromDestination(message.destination);
 		const stopStatus = permissionStore.botStopStatus(stopTarget);
 		const lastSessionEnd = status.lastSessionEnd;
@@ -746,6 +760,7 @@ export const botCommand: LineCommand = {
 			`背景処理: ${workload.activeBackground ?? "なし"} / 待機 ${workload.queuedBackground}`,
 			`直近イベントループ遅延: ${Math.round(workload.lastEventLoopLagMs)}ms`,
 			`GitHub書き込み待機: ${githubContentsClient.pendingMutationCount}`,
+			`LINE送信待機: ${lineApi.pendingHigh + lineApi.pendingNormal}${lineApi.active ? ` / 実行中 ${lineApi.active}` : ""}`,
 		].join("\n"));
 	},
 };

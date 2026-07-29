@@ -18,6 +18,7 @@ import {
 	permissionStore,
 	targetFromDestination,
 } from "../permissions/store.js";
+import { lineApiQueue } from "../runtime/lineApiQueue.js";
 import { argValue } from "./permissionArgs.js";
 import { sendLong, type LineCommand, type ReplyableLineMessage } from "./shared.js";
 
@@ -923,40 +924,48 @@ async function executeProbeDestroyBot(command: Parameters<LineCommand["execute"]
 	await runProbeSteps(command, "destroy-bot", [
 		{
 			name: "destroyMessages(threadMid empty)",
-			run: () => message.client.base.square.destroyMessages({
-				request: {
-					squareChatMid: message.destination.chatMid,
-					messageIds: [bulkWithThreadId],
-					threadMid: "",
-				},
-			}),
+			run: () => lineApiQueue.run("oc-probe:destroy-messages", () =>
+				message.client.base.square.destroyMessages({
+					request: {
+						squareChatMid: message.destination.chatMid,
+						messageIds: [bulkWithThreadId],
+						threadMid: "",
+					},
+				})
+			),
 		},
 		{
 			name: "destroyMessages(threadMid omitted)",
-			run: () => message.client.base.square.destroyMessages({
-				request: {
-					squareChatMid: message.destination.chatMid,
-					messageIds: [bulkWithoutThreadId],
-				} as {
-					squareChatMid: string;
-					messageIds: string[];
-					threadMid: string;
-				},
-			}),
+			run: () => lineApiQueue.run("oc-probe:destroy-messages", () =>
+				message.client.base.square.destroyMessages({
+					request: {
+						squareChatMid: message.destination.chatMid,
+						messageIds: [bulkWithoutThreadId],
+					} as {
+						squareChatMid: string;
+						messageIds: string[];
+						threadMid: string;
+					},
+				})
+			),
 		},
 		{
 			name: "destroyMessage(single)",
-			run: () => message.client.base.square.destroyMessage({
-				squareChatMid: message.destination.chatMid,
-				messageId: destroyOneId,
-			}),
+			run: () => lineApiQueue.run("oc-probe:destroy-message", () =>
+				message.client.base.square.destroyMessage({
+					squareChatMid: message.destination.chatMid,
+					messageId: destroyOneId,
+				})
+			),
 		},
 		{
 			name: "unsendMessage(single)",
-			run: () => message.client.base.square.unsendMessage({
-				squareChatMid: message.destination.chatMid,
-				messageId: unsendOneId,
-			}),
+			run: () => lineApiQueue.run("oc-probe:unsend-message", () =>
+				message.client.base.square.unsendMessage({
+					squareChatMid: message.destination.chatMid,
+					messageId: unsendOneId,
+				})
+			),
 		},
 	]);
 }
@@ -1236,15 +1245,18 @@ async function executeModRoom(command: Parameters<LineCommand["execute"]>[0]): P
 			await message.send("副官部屋が未設定です。副官部屋で !oc modroom set を実行してください。");
 			return;
 		}
+		const modRoomChatMid = settings.modRoomChatMid;
 		try {
-			await message.client.base.square.sendMessage({
-				squareChatMid: settings.modRoomChatMid,
-				text: [
-					"【副官部屋テスト】",
-					"OC管理ログの送信先として設定されています。",
-					`実行者: ${message.destination.senderName ?? message.destination.senderMid}`,
-				].join("\n"),
-			});
+			await lineApiQueue.run("oc:mod-room-test", () =>
+				message.client.base.square.sendMessage({
+					squareChatMid: modRoomChatMid,
+					text: [
+						"【副官部屋テスト】",
+						"OC管理ログの送信先として設定されています。",
+						`実行者: ${message.destination.senderName ?? message.destination.senderMid}`,
+					].join("\n"),
+				})
+			);
 			await message.send("副官部屋へテストログを送信しました。");
 		} catch (error) {
 			await message.send(`副官部屋への送信に失敗しました: ${compactError(error)}`);
@@ -1843,6 +1855,7 @@ async function sendKickSummaryToModRoom(
 	if (message.destination.kind !== "square" || results.length === 0) return;
 	const settings = ocModerationSettingsStore.snapshot(message.destination.scopeMid);
 	if (!settings.modRoomChatMid || settings.modRoomChatMid === message.destination.chatMid) return;
+	const modRoomChatMid = settings.modRoomChatMid;
 
 	const actorName = message.destination.senderName || message.destination.senderMid;
 	const lines = [
@@ -1860,14 +1873,16 @@ async function sendKickSummaryToModRoom(
 		),
 	];
 	try {
-		await message.client.base.square.sendMessage({
-			squareChatMid: settings.modRoomChatMid,
-			text: lines.join("\n"),
-		});
+		await lineApiQueue.run("oc:kick-mod-room-log", () =>
+			message.client.base.square.sendMessage({
+				squareChatMid: modRoomChatMid,
+				text: lines.join("\n"),
+			})
+		);
 	} catch (error) {
 		console.warn("[oc] kick mod room log send failed", {
 			squareMid: message.destination.scopeMid,
-			modRoomChatMid: settings.modRoomChatMid,
+			modRoomChatMid,
 			error,
 		});
 	}

@@ -284,14 +284,7 @@ async function sendTargetSelection(
 async function dismissProgressMessage(message: ReplyableLineMessage, messageId?: string): Promise<void> {
 	if (!messageId) return;
 	try {
-		if (message.destination.kind === "square") {
-			await message.client.base.square.destroyMessage({
-				squareChatMid: message.destination.chatMid,
-				messageId,
-			});
-			return;
-		}
-		await message.client.base.talk.unsendMessage({ messageId });
+		await message.deleteMessage?.(messageId);
 	} catch (error) {
 		console.warn(`[log] progress message cleanup failed for ${messageId}`, error);
 	}
