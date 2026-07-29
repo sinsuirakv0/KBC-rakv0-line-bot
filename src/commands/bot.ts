@@ -760,7 +760,7 @@ export const botCommand: LineCommand = {
 			`背景処理: ${workload.activeBackground ?? "なし"} / 待機 ${workload.queuedBackground}`,
 			`直近イベントループ遅延: ${Math.round(workload.lastEventLoopLagMs)}ms`,
 			`GitHub書き込み待機: ${githubContentsClient.pendingMutationCount}`,
-			`LINE送信待機: ${lineApi.pendingHigh + lineApi.pendingNormal}${lineApi.active ? ` / 実行中 ${lineApi.active}` : ""}`,
+			`LINE送信: 実行中 ${lineApi.activeCount}/${lineApi.maxConcurrent} / 待機 ${lineApi.pendingHigh + lineApi.pendingNormal}${lineApi.active ? ` / 最長 ${formatDuration(lineApi.oldestActiveMs)} ${lineApi.active}` : ""}`,
 		].join("\n"));
 	},
 };

@@ -82,6 +82,16 @@ export const appConfig = {
 		max: 1_000,
 		integer: true,
 	}),
+	lineApiMaxConcurrent: numberEnv("LINE_API_MAX_CONCURRENT", 2, {
+		min: 1,
+		max: 4,
+		integer: true,
+	}),
+	lineApiStallWarnMs: numberEnv("LINE_API_STALL_WARN_MS", 15_000, {
+		min: 1_000,
+		max: 5 * 60_000,
+		integer: true,
+	}),
 	backgroundQuietMs: numberEnv("BACKGROUND_QUIET_MS", 15_000, { min: 0, integer: true }),
 	backgroundRetryMs: numberEnv("BACKGROUND_RETRY_MS", 10_000, { min: 1_000, integer: true }),
 	backgroundMaxEventLoopLagMs: numberEnv("BACKGROUND_MAX_EVENT_LOOP_LAG_MS", 250, {

@@ -1091,11 +1091,13 @@ class SquareReplyTarget implements ReplyableLineMessage {
 
 	async send(text: string): Promise<string | undefined> {
 		if (this.isThreadSource) return await this.sendThread(text);
-		const sent = await lineApiQueue.run("square:send-text", () =>
-			this.client.base.square.sendMessage({
+		const sent = await lineApiQueue.run(
+			"square:send-text",
+			() => this.client.base.square.sendMessage({
 				squareChatMid: this.destination.chatMid,
 				text,
-			})
+			}),
+			{ scope: this.lineApiScope() },
 		);
 		return messageIdFromSquareSendResult(sent);
 	}
@@ -1146,8 +1148,9 @@ class SquareReplyTarget implements ReplyableLineMessage {
 	}
 
 	private async sendThreadText(threadMid: string, text: string): Promise<string | undefined> {
-		const sent = await lineApiQueue.run("square:send-thread-text", async () =>
-			this.client.base.square.sendSquareThreadMessage({
+		const sent = await lineApiQueue.run(
+			"square:send-thread-text",
+			async () => this.client.base.square.sendSquareThreadMessage({
 				request: {
 					reqSeq: await this.client.base.getReqseq("sq"),
 					chatMid: this.destination.chatMid,
@@ -1161,7 +1164,8 @@ class SquareReplyTarget implements ReplyableLineMessage {
 						},
 					},
 				},
-			})
+			}),
+			{ scope: this.lineApiScope() },
 		);
 		this.pendingThreadRoot = false;
 		return messageIdFromSquareSendResult(sent);
@@ -1169,12 +1173,14 @@ class SquareReplyTarget implements ReplyableLineMessage {
 
 	async sendMention(text: string, mentions: OutgoingMention[]): Promise<string | undefined> {
 		if (this.isThreadSource) return await this.sendThread(text);
-		const sent = await lineApiQueue.run("square:send-mention", () =>
-			this.client.base.square.sendMessage({
+		const sent = await lineApiQueue.run(
+			"square:send-mention",
+			() => this.client.base.square.sendMessage({
 				squareChatMid: this.destination.chatMid,
 				text,
 				contentMetadata: mentionMetadata(mentions),
-			})
+			}),
+			{ scope: this.lineApiScope() },
 		);
 		return messageIdFromSquareSendResult(sent);
 	}
@@ -1194,7 +1200,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 				messageId,
 				image.filename,
 			);
-		});
+		}, { scope: this.lineApiScope() });
 	}
 
 	async deleteMessage(messageId: string): Promise<void> {
@@ -1219,7 +1225,7 @@ class SquareReplyTarget implements ReplyableLineMessage {
 					throw unsendError;
 				}
 			}
-		});
+		}, { scope: this.lineApiScope() });
 	}
 
 	private async resolveThreadMid(
@@ -1263,7 +1269,11 @@ class SquareReplyTarget implements ReplyableLineMessage {
 				squareChatMid: this.destination.chatMid,
 				text: THREAD_OUTPUT_NOTICE,
 			})
-		);
+		, { scope: this.lineApiScope() });
+	}
+
+	private lineApiScope(): string {
+		return `square:${this.destination.chatMid}`;
 	}
 
 	private async debugThreadMidFromMessage(
@@ -1403,12 +1413,14 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 			});
 			if (!sent.id) throw new Error("画像メッセージIDを取得できませんでした");
 			await this.client.base.obs.uploadObjTalk(to, "image", image.blob, sent.id, image.filename);
-		});
+		}, { scope: this.lineApiScope() });
 	}
 
 	async deleteMessage(messageId: string): Promise<void> {
-		await lineApiQueue.run("talk:delete-message", () =>
-			this.client.base.talk.unsendMessage({ messageId })
+		await lineApiQueue.run(
+			"talk:delete-message",
+			() => this.client.base.talk.unsendMessage({ messageId }),
+			{ scope: this.lineApiScope() },
 		);
 	}
 
@@ -1435,16 +1447,22 @@ class RawTalkReplyTarget implements ReplyableLineMessage {
 		relatedMessageId?: string,
 		contentMetadata?: Record<string, string>,
 	): Promise<string | undefined> {
-		const sent = await lineApiQueue.run("talk:send-text", () =>
-			this.client.base.talk.sendMessage({
+		const sent = await lineApiQueue.run(
+			"talk:send-text",
+			() => this.client.base.talk.sendMessage({
 				to: this.sendTo(),
 				text,
 				relatedMessageId,
 				contentMetadata,
 				e2ee: this.isEncrypted(),
-			})
+			}),
+			{ scope: this.lineApiScope() },
 		);
 		return sent.id;
+	}
+
+	private lineApiScope(): string {
+		return `talk:${this.sendTo()}`;
 	}
 
 	private isEncrypted(): boolean {
