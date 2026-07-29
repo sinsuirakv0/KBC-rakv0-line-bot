@@ -2034,6 +2034,10 @@ async function runSession(
 ): Promise<void> {
 	const profile = await client.getMyProfile();
 	console.log(`[line] logged in as ${profile.displayName} (${profile.mid})`);
+	const squareSyncOwnerState = await storage.ensureSquareSyncOwner(profile.mid);
+	console.log(`[line-storage] square sync owner ${squareSyncOwnerState}`, {
+		tokensReset: squareSyncOwnerState !== "confirmed",
+	});
 	const sessionStartedAt = Date.now();
 	const storedRefreshToken = await storage.get("refreshToken");
 	const refreshTokenAvailable = typeof storedRefreshToken === "string" &&

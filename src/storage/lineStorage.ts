@@ -17,7 +17,18 @@ interface EncryptedStorageFile {
 
 const SQUARE_SYNC_TOKEN_STORAGE_KEY = "kbc.squareSyncToken";
 const SQUARE_CHAT_SYNC_TOKENS_STORAGE_KEY = "kbc.squareChatSyncTokens";
+const SQUARE_SYNC_OWNER_STORAGE_KEY = "kbc.squareSyncOwnerMid";
 const SQUARE_SYNC_TOKEN_SAVE_DELAY_MS = 5_000;
+
+export type SquareSyncOwnerState = "confirmed" | "initialized" | "changed";
+
+export function classifySquareSyncOwner(
+	storedOwnerMid: unknown,
+	activeOwnerMid: string,
+): SquareSyncOwnerState {
+	if (typeof storedOwnerMid !== "string" || !storedOwnerMid) return "initialized";
+	return storedOwnerMid === activeOwnerMid ? "confirmed" : "changed";
+}
 
 function encryptionKey(): Buffer | null {
 	if (!appConfig.lineStorageBackupKey) return null;
@@ -187,6 +198,34 @@ export class SyncedLineStorage extends FileStorage {
 		const token = typeof value === "string" && value ? value : undefined;
 		this.persistedSquareSyncToken = token;
 		return token;
+	}
+
+	async ensureSquareSyncOwner(ownerMid: string): Promise<SquareSyncOwnerState> {
+		const storedOwnerMid = await this.get(SQUARE_SYNC_OWNER_STORAGE_KEY);
+		const state = classifySquareSyncOwner(storedOwnerMid, ownerMid);
+		if (state === "confirmed") return state;
+
+		if (this.squareSyncTokenTimer) {
+			clearTimeout(this.squareSyncTokenTimer);
+			this.squareSyncTokenTimer = undefined;
+		}
+		if (this.squareChatSyncTokenTimer) {
+			clearTimeout(this.squareChatSyncTokenTimer);
+			this.squareChatSyncTokenTimer = undefined;
+		}
+		this.pendingSquareSyncToken = undefined;
+		this.pendingSquareChatSyncTokens.clear();
+		await this.squareSyncTokenQueue;
+		await this.squareChatSyncTokenQueue;
+
+		// Square同期トークンはLINEアカウント固有なので、所有者不明または変更時に全て破棄する。
+		await super.delete(SQUARE_SYNC_TOKEN_STORAGE_KEY);
+		await super.delete(SQUARE_CHAT_SYNC_TOKENS_STORAGE_KEY);
+		await super.set(SQUARE_SYNC_OWNER_STORAGE_KEY, ownerMid);
+		this.persistedSquareSyncToken = undefined;
+		this.squareChatSyncTokens = {};
+		backup.schedule();
+		return state;
 	}
 
 	scheduleSquareSyncToken(token: string): void {
