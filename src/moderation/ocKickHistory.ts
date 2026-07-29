@@ -12,6 +12,7 @@ export interface OcKickHistoryEntry {
 	targetName: string;
 	actorMid: string;
 	actorName: string;
+	action?: "kick" | "ban" | "kick_and_ban";
 	reason?: string;
 	result: "success" | "failed";
 	error?: string;
@@ -54,6 +55,9 @@ function parseHistory(value: unknown): OcKickHistoryFile {
 				targetName: item.targetName,
 				actorMid: item.actorMid,
 				actorName: item.actorName,
+				action: item.action === "kick" || item.action === "ban" || item.action === "kick_and_ban"
+					? item.action
+					: undefined,
 				reason: typeof item.reason === "string" ? item.reason : undefined,
 				result: item.result,
 				error: typeof item.error === "string" ? item.error : undefined,

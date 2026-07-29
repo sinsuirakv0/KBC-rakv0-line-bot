@@ -6,6 +6,7 @@ import {
 import { ocKickHistoryStore } from "../moderation/ocKickHistory.js";
 import { ocMemberActivityStore } from "../moderation/ocMemberActivity.js";
 import { ocModerationSettingsStore } from "../moderation/ocModerationSettings.js";
+import { kickAndBanSquareMember } from "../moderation/ocSquareBan.js";
 import {
 	createOcUrlAllowRule,
 	ocUrlRuleTarget,
@@ -80,13 +81,13 @@ function adminHelpText(): string {
 		"!oc probe",
 		"  仕様未確認のSquare APIを安全条件つきで検証",
 		"!oc kick @ユーザー 理由",
-		"  指定したメンバーを強制退会",
+		"  指定したメンバーを強制退会し、再参加を禁止",
 		"!oc kick @A @B 理由",
-		"  複数人をまとめて強制退会",
+		"  複数人をまとめて強制退会し、再参加を禁止",
 		"!oc kick userID:<p...> <p...> 理由",
-		"  MID指定で強制退会",
+		"  MID指定で強制退会し、再参加を禁止",
 		"!oc kick his",
-		"  強制退会履歴を表示",
+		"  強制退会・再参加禁止履歴を表示",
 	].join("\n");
 }
 
@@ -1830,13 +1831,20 @@ async function kickHistory(command: Parameters<LineCommand["execute"]>[0]): Prom
 	}
 	const entries = ocKickHistoryStore.list(message.destination.scopeMid, 10);
 	if (entries.length === 0) {
-		await message.send("強制退会履歴はありません。");
+		await message.send("強制退会・再参加禁止履歴はありません。");
 		return;
 	}
 	await message.send([
-		"強制退会履歴",
+		"強制退会・再参加禁止履歴",
 		...entries.map((entry, index) => [
 			`${index + 1}. ${formatJst(entry.at)} ${entry.result === "success" ? "成功" : "失敗"}`,
+			`処分: ${entry.action === "kick_and_ban"
+				? "強制退会 + 再参加禁止"
+				: entry.action === "ban"
+					? "再参加禁止"
+					: entry.action === "kick"
+						? "強制退会"
+						: "旧履歴（詳細不明）"}`,
 			`対象: ${entry.targetName} (${entry.targetMid})`,
 			`実行者: ${entry.actorName}`,
 			`理由: ${entry.reason || "なし"}`,
@@ -1919,32 +1927,26 @@ async function executeKick(command: Parameters<LineCommand["execute"]>[0]): Prom
 	}
 
 	const actorName = message.destination.senderName || message.destination.senderMid;
-	const lines = ["強制退会結果"];
+	const lines = ["強制退会・再参加禁止結果"];
 	const results: KickResultSummary[] = [];
 	for (const userMid of mids) {
 		let targetName = userMid;
 		try {
-			const target = await message.client.base.square.getSquareMember({ squareMemberMid: userMid });
-			targetName = target.squareMember.displayName || userMid;
-		} catch {
-			targetName = "(取得失敗)";
-		}
-
-		try {
-			const response = await message.client.base.square.deleteOtherFromSquare(userMid);
-			const kickedName = response.squareMember.displayName || targetName;
+			const response = await kickAndBanSquareMember(message.client, userMid);
+			const bannedName = response.squareMember.displayName || targetName;
 			ocKickHistoryStore.record({
 				squareMid: message.destination.scopeMid,
 				chatMid: message.destination.chatMid,
 				targetMid: userMid,
-				targetName: kickedName,
+				targetName: bannedName,
 				actorMid: message.destination.senderMid,
 				actorName,
+				action: "kick_and_ban",
 				reason: reason || undefined,
 				result: "success",
 			});
-			results.push({ targetMid: userMid, targetName: kickedName, result: "success" });
-			lines.push(`成功: ${kickedName} (${userMid})`);
+			results.push({ targetMid: userMid, targetName: bannedName, result: "success" });
+			lines.push(`成功: ${bannedName} (${userMid})`);
 		} catch (error) {
 			const summary = compactError(error);
 			ocKickHistoryStore.record({
@@ -1954,6 +1956,7 @@ async function executeKick(command: Parameters<LineCommand["execute"]>[0]): Prom
 				targetName,
 				actorMid: message.destination.senderMid,
 				actorName,
+				action: "kick_and_ban",
 				reason: reason || undefined,
 				result: "failed",
 				error: summary,

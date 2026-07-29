@@ -5,6 +5,7 @@ import { githubContentsClient } from "../storage/githubContents.js";
 
 export type OcModerationCaseType =
 	| "left_soon_auto_ban"
+	| "left_soon_auto_kick"
 	| "left_soon_pending_ban"
 	| "left_soon_log"
 	| "danger_word_auto_kick"
@@ -15,6 +16,7 @@ export type OcModerationCaseType =
 export type OcModerationCaseStatus =
 	| "open"
 	| "auto_banned"
+	| "kick_failed"
 	| "pending_ban"
 	| "ignored"
 	| "ban_succeeded"

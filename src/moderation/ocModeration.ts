@@ -28,6 +28,7 @@ import {
 	type ParsedOcUrl,
 } from "./ocUrlPolicy.js";
 import { isMainSquareChat, resolveMainSquareChatMid } from "./ocMainChat.js";
+import { banSquareMember } from "./ocSquareBan.js";
 
 type SquareRole = string | number | undefined;
 
@@ -947,15 +948,16 @@ async function banFromSquare(
 	actorMid = "bot:auto",
 ): Promise<{ ok: boolean; error?: string }> {
 	try {
-		const response = await client.base.square.deleteOtherFromSquare(targetMid);
-		const kickedName = cleanDisplayName(response.squareMember.displayName) ?? targetName ?? targetMid;
+		const response = await banSquareMember(client, targetMid);
+		const bannedName = cleanDisplayName(response.squareMember.displayName) ?? targetName ?? targetMid;
 		ocKickHistoryStore.record({
 			squareMid,
 			chatMid: squareMid,
 			targetMid,
-			targetName: kickedName,
+			targetName: bannedName,
 			actorMid,
 			actorName: "bot",
+			action: "ban",
 			reason,
 			result: "success",
 		});
@@ -970,6 +972,49 @@ async function banFromSquare(
 			targetName: targetName ?? targetMid,
 			actorMid,
 			actorName: "bot",
+			action: "ban",
+			reason,
+			result: "failed",
+			error: summary,
+		});
+		await ocKickHistoryStore.flush();
+		return { ok: false, error: summary };
+	}
+}
+
+async function kickFromSquare(
+	client: Client,
+	squareMid: string,
+	targetMid: string,
+	targetName: string | undefined,
+	reason: string,
+): Promise<{ ok: boolean; error?: string }> {
+	try {
+		const response = await client.base.square.deleteOtherFromSquare(targetMid);
+		const kickedName = cleanDisplayName(response.squareMember.displayName) ?? targetName ?? targetMid;
+		ocKickHistoryStore.record({
+			squareMid,
+			chatMid: squareMid,
+			targetMid,
+			targetName: kickedName,
+			actorMid: "bot:auto",
+			actorName: "bot",
+			action: "kick",
+			reason,
+			result: "success",
+		});
+		await ocKickHistoryStore.flush();
+		return { ok: true };
+	} catch (error) {
+		const summary = compactError(error);
+		ocKickHistoryStore.record({
+			squareMid,
+			chatMid: squareMid,
+			targetMid,
+			targetName: targetName ?? targetMid,
+			actorMid: "bot:auto",
+			actorName: "bot",
+			action: "kick",
 			reason,
 			result: "failed",
 			error: summary,
@@ -1115,14 +1160,14 @@ async function handleDangerWordAutoKick(
 
 	const targetName = activity.displayName ?? (await getSquareMemberSummary(message.client, message.senderMid).catch(() => undefined))?.displayName;
 	await deleteSquareMessage(message, "danger-word");
-	const banResult = await banFromSquare(
+	const kickResult = await kickFromSquare(
 		message.client,
 		message.squareMid,
 		message.senderMid,
 		targetName,
 		`初参加直後の危険語: ${word}`,
 	);
-	await sendDangerWordMainNotice(message, word, banResult.ok);
+	await sendDangerWordMainNotice(message, word, kickResult.ok);
 
 	await sendModRoomLog(
 		message.client,
@@ -1134,18 +1179,19 @@ async function handleDangerWordAutoKick(
 			`参加から: ${formatDuration(elapsedMs)}`,
 			`検出語: ${word}`,
 			`本文: ${message.text?.replace(/\s+/g, " ").trim().slice(0, 300) ?? "(本文なし)"}`,
-			`処分: ${banResult.ok ? "メッセージ削除 + 強制退会 + 再参加禁止" : "メッセージ削除 + 強制退会失敗"}`,
-			banResult.error ? `エラー: ${banResult.error}` : "",
+			`処分: ${kickResult.ok ? "メッセージ削除 + 強制退会（再参加禁止は未実行）" : "メッセージ削除 + 強制退会失敗"}`,
+			kickResult.error ? `エラー: ${kickResult.error}` : "",
 			"",
 			"理由:",
 			"参加直後に危険語を含むメッセージを送信したため、",
 			"宣伝・不正行為勧誘の可能性が高いと判定しました。",
 			"",
-			"誤検知の場合は、このログに「解除」と返信してください。",
+			"再参加禁止にする場合は、このログに「再参加禁止」と返信してください。",
+			"追加処分しない場合は「無視」と返信してください。",
 		].filter(Boolean).join("\n"),
 		{
 			type: "danger_word_auto_kick",
-			status: banResult.ok ? "auto_banned" : "ban_failed",
+			status: kickResult.ok ? "pending_ban" : "kick_failed",
 			targetMid: message.senderMid,
 			targetName,
 			reason: `danger-word:${word}`,
@@ -1153,7 +1199,7 @@ async function handleDangerWordAutoKick(
 				word,
 				text: message.text,
 				elapsedMs,
-				error: banResult.error,
+				error: kickResult.error,
 			},
 		},
 	);
@@ -1296,7 +1342,7 @@ async function handleLeftSoonDecision(
 				`最後の発言: ${lastMessageLine(info)}`,
 				"処分: 未実行",
 				"",
-				"初参加ではないため、自動再参加禁止や確認待ち処分は行いませんでした。",
+				"初参加ではないため、自動強制退会や確認待ち処分は行いませんでした。",
 			].join("\n"),
 			{
 				type: "left_soon_log",
@@ -1350,14 +1396,14 @@ async function handleLeftSoonDecision(
 		return;
 	}
 
-	const banResult = await banFromSquare(
+	const kickResult = await kickFromSquare(
 		event.client,
 		event.squareMid,
 		event.memberMid,
 		targetName,
 		"即抜け: 参加後5分以内の退会",
 	);
-	if (banResult.ok) {
+	if (kickResult.ok) {
 		await sendLeftSoonMainNotice(event, info, settings.modRoomChatMid);
 	}
 	await sendModRoomLog(
@@ -1370,28 +1416,29 @@ async function handleLeftSoonDecision(
 			`参加時間: ${formatParticipationDuration(info.stayMs)}`,
 			`発言数: ${info.messageCount}`,
 			`最後の発言: ${lastMessageLine(info)}`,
-			`処分: ${banResult.ok ? "再参加禁止" : "再参加禁止失敗"}`,
-			banResult.error ? `エラー: ${banResult.error}` : "",
+			`処分: ${kickResult.ok ? "強制退会（再参加禁止は未実行）" : "強制退会失敗"}`,
+			kickResult.error ? `エラー: ${kickResult.error}` : "",
 			"",
 			"理由:",
 			"参加後5分以内に本OCから退室したため、",
-			"即抜け荒らし対策として自動的に再参加禁止にしました。",
+			"即抜け荒らし対策として自動的に強制退会しました。",
 			"",
-			"誤入室だった可能性がある場合は、このログに「解除」と返信してください。",
+			"再参加禁止にする場合は、このログに「再参加禁止」と返信してください。",
+			"追加処分しない場合は「無視」と返信してください。",
 		].filter(Boolean).join("\n"),
 		{
-			type: "left_soon_auto_ban",
-			status: banResult.ok ? "auto_banned" : "ban_failed",
+			type: "left_soon_auto_kick",
+			status: kickResult.ok ? "pending_ban" : "kick_failed",
 			targetMid: event.memberMid,
 			targetName,
-			reason: "left-soon-auto-ban",
+			reason: "left-soon-auto-kick",
 			payload: {
 				stayMs: info.stayMs,
 				messageCount: info.messageCount,
 				joinedAt: info.joinedAt,
 				lastMessageAt: info.lastMessageAt,
 				lastMessageText: info.lastMessageText,
-				error: banResult.error,
+				error: kickResult.error,
 			},
 		},
 	);
