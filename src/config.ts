@@ -4,7 +4,7 @@ import { config as loadEnv } from "dotenv";
 loadEnv();
 
 export type LoginMethod = "qr" | "password" | "token";
-export type TalkReceiverMode = "push" | "sync";
+export type TalkReceiverMode = "sync3" | "sync4" | "push";
 
 function boolEnv(name: string, fallback: boolean): boolean {
 	const value = process.env[name];
@@ -47,8 +47,9 @@ function loginMethod(): LoginMethod {
 }
 
 function talkReceiverMode(): TalkReceiverMode {
-	const value = process.env.LINE_TALK_RECEIVER_MODE?.trim().toLowerCase() || "push";
-	if (value === "push" || value === "sync") return value;
+	const value = process.env.LINE_TALK_RECEIVER_MODE?.trim().toLowerCase() || "sync3";
+	if (value === "sync") return "sync3";
+	if (value === "push" || value === "sync3" || value === "sync4") return value;
 	throw new Error(`Invalid LINE_TALK_RECEIVER_MODE: ${value}`);
 }
 

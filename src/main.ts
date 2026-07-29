@@ -38,6 +38,13 @@ import {
 	listenTalkPushEvents,
 	type TalkPushTransport,
 } from "./runtime/talkPushReceiver.js";
+import {
+	applyTalkSyncResponse,
+	classifyTalkSyncGone,
+	requestTalkSyncV3,
+	type TalkSyncCursor,
+	type TalkSyncResponse,
+} from "./runtime/talkSync.js";
 import { lineApiQueue } from "./runtime/lineApiQueue.js";
 import { ForegroundQueueFullError, runtimeWorkload } from "./runtime/workload.js";
 import { recordSquareEventDebug, recordSquareHandlerDebug } from "./runtime/squareEventDebug.js";
@@ -97,17 +104,6 @@ interface RawTalkEvent {
 	type: string;
 	revision?: number | bigint;
 	message?: RawTalkMessage;
-}
-
-interface RawTalkSyncResponse {
-	fullSyncResponse?: {
-		nextRevision?: number | bigint;
-	};
-	operationResponse?: {
-		globalEvents?: { lastRevision?: number | bigint };
-		individualEvents?: { lastRevision?: number | bigint };
-		operations?: RawTalkEvent[];
-	};
 }
 
 interface ParsedTalkText {
@@ -1677,37 +1673,47 @@ async function listenRawTalkSyncEvents(
 	ownMid: string,
 	signal: AbortSignal,
 	onAuthenticationError: AuthenticationErrorReporter,
+	protocol: "sync3" | "sync4",
 ): Promise<void> {
-	let revision: number | bigint = 0;
-	let globalRev: number | bigint = 0;
-	let individualRev: number | bigint = 0;
+	const storedCursor = client.base.poll.sync.talk;
+	const cursor: TalkSyncCursor = {
+		revision: storedCursor.revision ?? 0,
+		globalRev: storedCursor.globalRev ?? 0,
+		individualRev: storedCursor.individualRev ?? 0,
+	};
 	let immediateGoneCount = 0;
-	// Keep the wait bounded: LINEJS defaults sync() to a 180-second long poll.
+	console.log(`[talk:event] ${protocol.toUpperCase()} receiver started`, {
+		persistedCursor: cursor.revision !== 0,
+		timeoutMs: appConfig.talkPollTimeoutMs,
+	});
 	while (!signal.aborted) {
 		const pollStartedAt = Date.now();
 		try {
-			const response = await client.base.talk.sync({
-				revision,
-				globalRev,
-				individualRev,
-				limit: 100,
-				timeout: appConfig.talkPollTimeoutMs,
-			}) as RawTalkSyncResponse;
-			const nextRevision = response.fullSyncResponse?.nextRevision;
-			if (nextRevision !== undefined) revision = nextRevision;
-			const nextGlobalRev = response.operationResponse?.globalEvents?.lastRevision;
-			if (nextGlobalRev !== undefined) globalRev = nextGlobalRev;
-			const nextIndividualRev = response.operationResponse?.individualEvents?.lastRevision;
-			if (nextIndividualRev !== undefined) individualRev = nextIndividualRev;
-
-			const operations = response.operationResponse?.operations ?? [];
+			const response = protocol === "sync3"
+				? await requestTalkSyncV3<RawTalkEvent>(
+					client.base,
+					cursor,
+					appConfig.talkPollTimeoutMs,
+				)
+				: await client.base.talk.sync({
+					revision: cursor.revision,
+					globalRev: cursor.globalRev,
+					individualRev: cursor.individualRev,
+					limit: 100,
+					timeout: appConfig.talkPollTimeoutMs,
+				}) as TalkSyncResponse<RawTalkEvent>;
+			const operations = applyTalkSyncResponse(cursor, response);
+			storedCursor.revision = cursor.revision;
+			storedCursor.globalRev = cursor.globalRev;
+			storedCursor.individualRev = cursor.individualRev;
 			immediateGoneCount = 0;
 			lineHealth.markSuccess("talk", operations.length);
 			if (operations.length > 0) {
-				console.log(`[perf] talk poll=${Date.now() - pollStartedAt}ms events=${operations.length}`);
+				console.log(
+					`[perf] talk ${protocol} poll=${Date.now() - pollStartedAt}ms events=${operations.length}`,
+				);
 			}
 			for (const event of operations) {
-				if (event.revision !== undefined) revision = event.revision;
 				void handleRawTalkEvent(client, ownMid, event)
 					.catch((error) => handleEventProcessingError("talk", "message handler", error));
 			}
@@ -1720,8 +1726,12 @@ async function listenRawTalkSyncEvents(
 			}
 			if (!signal.aborted && isTalkSyncGoneError(error)) {
 				const elapsedMs = Date.now() - pollStartedAt;
-				if (elapsedMs >= appConfig.talkPollGoneLeaseMs) {
-					// 設定したtimeoutを越えた410は暗号化経路の中断漏れなどを示すため、正常扱いしない。
+				const disposition = classifyTalkSyncGone(
+					elapsedMs,
+					appConfig.talkPollTimeoutMs,
+					appConfig.talkPollGoneLeaseMs,
+				);
+				if (disposition === "stalled") {
 					const leaseError = new Error(
 						`Talk sync exceeded its poll lease: elapsed=${elapsedMs}ms timeout=${appConfig.talkPollTimeoutMs}ms`,
 						{ cause: error },
@@ -1734,16 +1744,25 @@ async function listenRawTalkSyncEvents(
 					});
 					throw leaseError;
 				}
+				if (disposition === "poll-expired") {
+					immediateGoneCount = 0;
+					lineHealth.markHeartbeat("talk", Date.now(), true);
+					await sleepUntilRetry(appConfig.talkPollIntervalMs, signal);
+					continue;
+				}
 				immediateGoneCount += 1;
-				console.warn("[talk:event] sync returned an immediate HTTP 410", {
+				console.warn(`[talk:event] ${protocol} cursor was rejected with an immediate HTTP 410`, {
 					elapsedMs,
 					consecutive: immediateGoneCount,
 				});
 				if (immediateGoneCount >= 3) {
 					console.warn("[talk:event] repeated immediate HTTP 410; resetting revisions");
-					revision = 0;
-					globalRev = 0;
-					individualRev = 0;
+					cursor.revision = 0;
+					cursor.globalRev = 0;
+					cursor.individualRev = 0;
+					storedCursor.revision = 0;
+					storedCursor.globalRev = 0;
+					storedCursor.individualRev = 0;
 					immediateGoneCount = 0;
 				}
 				lineHealth.markHeartbeat("talk", Date.now(), true);
@@ -1798,9 +1817,14 @@ async function listenRawTalkEvents(
 	signal: AbortSignal,
 	onAuthenticationError: AuthenticationErrorReporter,
 ): Promise<void> {
-	if (appConfig.talkReceiverMode === "sync") {
-		console.warn("[talk:event] using legacy SYNC4 receiver");
-		await listenRawTalkSyncEvents(client, ownMid, signal, onAuthenticationError);
+	if (appConfig.talkReceiverMode === "sync3" || appConfig.talkReceiverMode === "sync4") {
+		await listenRawTalkSyncEvents(
+			client,
+			ownMid,
+			signal,
+			onAuthenticationError,
+			appConfig.talkReceiverMode,
+		);
 		return;
 	}
 	await listenRawTalkPushEvents(client, ownMid, signal, onAuthenticationError);
