@@ -1688,6 +1688,27 @@ async function listenRawTalkSyncEvents(
 	});
 	while (!signal.aborted) {
 		const pollStartedAt = Date.now();
+		let wakeInFlight = false;
+		const wakeTimer = setInterval(() => {
+			if (signal.aborted || wakeInFlight) return;
+			wakeInFlight = true;
+			const wakeStartedAt = Date.now();
+			void client.base.talk.wakeUpLongPolling({
+				clientRevision: cursor.revision,
+			}).then((woken) => {
+				const elapsedMs = Date.now() - wakeStartedAt;
+				if (woken === false || elapsedMs >= 1_000) {
+					console.log("[talk:event] long poll wake completed", { woken, elapsedMs });
+				}
+			}).catch((error) => {
+				if (!signal.aborted) {
+					console.warn("[talk:event] long poll wake failed", compactLineError(error));
+				}
+			}).finally(() => {
+				wakeInFlight = false;
+			});
+		}, appConfig.talkPollWakeIntervalMs);
+		wakeTimer.unref?.();
 		try {
 			const response = protocol === "sync3"
 				? await requestTalkSyncV3<RawTalkEvent>(
@@ -1773,6 +1794,8 @@ async function listenRawTalkSyncEvents(
 			if (!signal.aborted) {
 				handleReceiverPollingError("talk", error, onAuthenticationError);
 			}
+		} finally {
+			clearInterval(wakeTimer);
 		}
 		await sleepUntilRetry(appConfig.talkPollIntervalMs, signal);
 	}

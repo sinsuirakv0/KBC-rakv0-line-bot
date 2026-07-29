@@ -20,6 +20,11 @@ export interface TalkSyncResponse<TEvent = unknown> {
 
 export type TalkSyncGoneDisposition = "poll-expired" | "cursor-rejected" | "stalled";
 
+function revisionBefore(value: number | bigint): number | bigint {
+	if (typeof value === "bigint") return value > 0n ? value - 1n : 0n;
+	return Math.max(0, value - 1);
+}
+
 export async function requestTalkSyncV3<TEvent>(
 	client: BaseClient,
 	cursor: TalkSyncCursor,
@@ -32,6 +37,11 @@ export async function requestTalkSyncV3<TEvent>(
 				lastGlobalRevision: cursor.globalRev,
 				lastIndividualRevision: cursor.individualRev,
 				count: 100,
+				fullSyncRequestReason:
+					cursor.revision === 0 || cursor.revision === 0n
+						? "INITIALIZATION"
+						: "PERIODIC_SYNC",
+				lastPartialFullSyncs: {},
 			},
 		}),
 		"sync",
@@ -48,7 +58,7 @@ export function applyTalkSyncResponse<TEvent extends { revision?: number | bigin
 	response: TalkSyncResponse<TEvent>,
 ): TEvent[] {
 	const nextRevision = response.fullSyncResponse?.nextRevision;
-	if (nextRevision !== undefined) cursor.revision = nextRevision;
+	if (nextRevision !== undefined) cursor.revision = revisionBefore(nextRevision);
 	const nextGlobalRev = response.operationResponse?.globalEvents?.lastRevision;
 	if (nextGlobalRev !== undefined) cursor.globalRev = nextGlobalRev;
 	const nextIndividualRev = response.operationResponse?.individualEvents?.lastRevision;

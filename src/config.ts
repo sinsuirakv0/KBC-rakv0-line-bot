@@ -165,6 +165,11 @@ export const appConfig = {
 		integer: true,
 	}),
 	talkPollTimeoutMs: Number(process.env.LINE_TALK_POLL_TIMEOUT_MS || 5_000),
+	talkPollWakeIntervalMs: numberEnv("LINE_TALK_POLL_WAKE_INTERVAL_MS", 5_000, {
+		min: 2_000,
+		max: 30_000,
+		integer: true,
+	}),
 	talkPollIntervalMs: Number(process.env.LINE_TALK_POLL_INTERVAL_MS || 250),
 	talkPollGoneLeaseMs: numberEnv("LINE_TALK_POLL_GONE_LEASE_MS", 15_000, {
 		min: 5_000,
