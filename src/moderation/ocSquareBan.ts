@@ -55,8 +55,8 @@ export async function banSquareMember(client: Client, squareMemberMid: string) {
 export async function kickAndBanSquareMember(client: Client, squareMemberMid: string) {
 	validateSquareMemberMid(squareMemberMid);
 	try {
-		// BANNED は即時退会と再参加禁止を同時に行う。KICK_OUT 後は更新できないため直接遷移する。
-		return await updateMembershipStateToBanned(client, squareMemberMid);
+		// 手動・自動・副官部屋の確認処理をすべて同じ直接BANNED経路に統一する。
+		return await banSquareMember(client, squareMemberMid);
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
 		throw new Error(
