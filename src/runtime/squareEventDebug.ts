@@ -96,12 +96,13 @@ function threadSummary(source: string, value: unknown): string | undefined {
 }
 
 function readReceiptSummary(source: string, value: unknown): SquareEventDebugReadReceipt | undefined {
+	if (source !== "notifiedMarkAsRead") return undefined;
 	const raw = rawObject(value);
 	if (!raw) return undefined;
 	const squareChatMid = rawString(raw.squareChatMid);
 	const memberMid = rawString(raw.sMemberMid) ?? rawString(raw.squareMemberMid) ?? rawString(raw.memberMid);
 	const messageId = rawString(raw.messageId);
-	if (!squareChatMid && !memberMid && !messageId) return undefined;
+	if (!squareChatMid || !memberMid || !messageId) return undefined;
 	return {
 		source,
 		squareChatMid,
