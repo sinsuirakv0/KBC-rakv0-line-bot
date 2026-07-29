@@ -5,6 +5,9 @@
   "main": "dist/main.js",
   "type": "module",
   "scripts": {
+    "prepare:linejs": "node scripts/patch-linejs-legy-signal.mjs",
+    "postinstall": "npm run prepare:linejs",
+    "prestart": "npm run prepare:linejs",
     "build": "tsc",
     "start": "node dist/main.js",
     "dev": "tsx src/main.ts",

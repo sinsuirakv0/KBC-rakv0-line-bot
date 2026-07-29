@@ -1717,11 +1717,18 @@ async function listenRawTalkEvents(
 			if (!signal.aborted && isTalkSyncGoneError(error)) {
 				const elapsedMs = Date.now() - pollStartedAt;
 				if (elapsedMs >= appConfig.talkPollGoneLeaseMs) {
-					// 長時間待機後の410はlong-pollの終了として扱い、カーソルを維持する。
-					immediateGoneCount = 0;
-					lineHealth.markHeartbeat("talk", Date.now(), true);
-					await sleepUntilRetry(appConfig.talkPollIntervalMs, signal);
-					continue;
+					// 設定したtimeoutを越えた410は暗号化経路の中断漏れなどを示すため、正常扱いしない。
+					const leaseError = new Error(
+						`Talk sync exceeded its poll lease: elapsed=${elapsedMs}ms timeout=${appConfig.talkPollTimeoutMs}ms`,
+						{ cause: error },
+					);
+					lineHealth.markError("talk", leaseError);
+					console.error("[talk:event] sync exceeded poll lease; restarting receiver", {
+						elapsedMs,
+						timeoutMs: appConfig.talkPollTimeoutMs,
+						leaseMs: appConfig.talkPollGoneLeaseMs,
+					});
+					throw leaseError;
 				}
 				immediateGoneCount += 1;
 				console.warn("[talk:event] sync returned an immediate HTTP 410", {
