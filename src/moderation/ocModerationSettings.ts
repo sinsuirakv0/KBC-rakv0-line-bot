@@ -15,6 +15,7 @@ export interface OcModerationSetting {
 	leftSoonMonitoringEnabled: boolean;
 	leftSoonSourceChatMid?: string;
 	dangerWordAutoKickEnabled: boolean;
+	dangerWordAutoReportEnabled: boolean;
 	joinCohortWatchEnabled: boolean;
 	modRoomChatMid?: string;
 	modRoomSetAt?: string;
@@ -76,6 +77,7 @@ function emptySetting(squareMid: string): OcModerationSetting {
 		leftSoonMonitoringEnabled: false,
 		leftSoonSourceChatMid: undefined,
 		dangerWordAutoKickEnabled: false,
+		dangerWordAutoReportEnabled: false,
 		joinCohortWatchEnabled: false,
 		modRoomChatMid: undefined,
 		modRoomSetAt: undefined,
@@ -155,6 +157,7 @@ function parseSettings(value: unknown): OcModerationSettingsFile {
 				? item.leftSoonSourceChatMid
 				: undefined,
 			dangerWordAutoKickEnabled: item.dangerWordAutoKickEnabled === true,
+			dangerWordAutoReportEnabled: item.dangerWordAutoReportEnabled === true,
 			joinCohortWatchEnabled: item.joinCohortWatchEnabled === true,
 			modRoomChatMid: typeof item.modRoomChatMid === "string" ? item.modRoomChatMid : undefined,
 			modRoomSetAt: typeof item.modRoomSetAt === "string" ? item.modRoomSetAt : undefined,
@@ -365,6 +368,10 @@ class OcModerationSettingsStore {
 		return this.setFlag(squareMid, "dangerWordAutoKickEnabled", enabled, updatedBy);
 	}
 
+	setDangerWordAutoReport(squareMid: string, enabled: boolean, updatedBy: string): "enabled" | "disabled" | "unchanged" {
+		return this.setFlag(squareMid, "dangerWordAutoReportEnabled", enabled, updatedBy);
+	}
+
 	setJoinCohortWatch(squareMid: string, enabled: boolean, updatedBy: string): "enabled" | "disabled" | "unchanged" {
 		return this.setFlag(squareMid, "joinCohortWatchEnabled", enabled, updatedBy);
 	}
@@ -467,6 +474,7 @@ class OcModerationSettingsStore {
 			| "mediaBurstDeleteEnabled"
 			| "leftSoonMonitoringEnabled"
 			| "dangerWordAutoKickEnabled"
+			| "dangerWordAutoReportEnabled"
 			| "joinCohortWatchEnabled",
 		enabled: boolean,
 		updatedBy: string,

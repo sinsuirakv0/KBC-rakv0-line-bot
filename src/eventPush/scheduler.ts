@@ -17,6 +17,36 @@ import { targetWantsNotification } from "./policy.js";
 import { sendSquareThreadWithRoot } from "./squareThread.js";
 import { eventPushStore, type EventPushSubscription } from "./store.js";
 
+const preparedSquareTargets = new WeakMap<Client, Map<string, Promise<void>>>();
+
+async function prepareSquareTarget(client: Client, squareChatMid: string): Promise<void> {
+	let targets = preparedSquareTargets.get(client);
+	if (!targets) {
+		targets = new Map();
+		preparedSquareTargets.set(client, targets);
+	}
+	const current = targets.get(squareChatMid);
+	if (current) return await current;
+
+	const pending = client.base.square.getSquareChat({ squareChatMid })
+		.then(() => undefined)
+		.catch((error) => {
+			targets?.delete(squareChatMid);
+			throw error;
+		});
+	targets.set(squareChatMid, pending);
+	await pending;
+}
+
+async function prepareSquareTargetBestEffort(client: Client, squareChatMid: string): Promise<void> {
+	try {
+		await prepareSquareTarget(client, squareChatMid);
+	} catch (error) {
+		// 読み取りに失敗しても、従来どおり送信自体は試す。
+		console.warn(`[push:event] square target preparation failed for ${squareChatMid}`, error);
+	}
+}
+
 async function sendToTarget(
 	client: Client,
 	target: EventPushSubscription,
@@ -24,6 +54,7 @@ async function sendToTarget(
 ): Promise<"sent" | "stopped"> {
 	if (permissionStore.isBotStopped(target)) return "stopped";
 	if (target.kind === "square") {
+		await prepareSquareTargetBestEffort(client, target.chatMid);
 		await lineApiQueue.run("event-push:square", () =>
 			client.base.square.sendMessage({ squareChatMid: target.chatMid, text })
 		);
@@ -142,6 +173,7 @@ export async function checkEventStarts(client: Client, now: Date): Promise<void>
 			const key = `${target.kind}:${target.chatMid}|daily|${dailyDelivery.dateKey}`;
 			if (eventPushStore.hasNotified(key) || permissionStore.isBotStopped(target)) continue;
 			try {
+				await prepareSquareTargetBestEffort(client, target.chatMid);
 				await sendSquareThreadWithRoot(client, target.chatMid, rootText, bodyText);
 				deliveredKeys.push(key);
 			} catch (error) {
@@ -152,30 +184,58 @@ export async function checkEventStarts(client: Client, now: Date): Promise<void>
 	await eventPushStore.markNotified(deliveredKeys);
 }
 
+export interface EventPushSchedulerHandle {
+	wake(): void;
+}
+
+export interface EventPushSchedulerOptions {
+	intervalMs?: number;
+	initialDelayMs?: number;
+	check?: typeof checkEventStarts;
+}
+
 export function startEventPushScheduler(
 	getClient: () => Client | null,
 	signal: AbortSignal,
-): void {
+	options: EventPushSchedulerOptions = {},
+): EventPushSchedulerHandle {
 	let running = false;
+	let rerunRequested = false;
+	const intervalMs = options.intervalMs ?? appConfig.eventPushIntervalMs;
+	const initialDelayMs = options.initialDelayMs ?? 5_000;
+	const check = options.check ?? checkEventStarts;
 	const run = async () => {
-		if (running || signal.aborted) return;
+		if (signal.aborted) return;
+		if (running) {
+			rerunRequested = true;
+			return;
+		}
 		const client = getClient();
 		if (!client) return;
 		running = true;
 		try {
-			await checkEventStarts(client, new Date());
+			await check(client, new Date());
 		} catch (error) {
 			console.error("[push:event] scheduler check failed", error);
 		} finally {
 			running = false;
+			if (rerunRequested && !signal.aborted) {
+				rerunRequested = false;
+				queueMicrotask(() => void run());
+			}
 		}
 	};
 
-	const interval = setInterval(() => void run(), appConfig.eventPushIntervalMs);
-	const initial = setTimeout(() => void run(), 5_000);
+	const interval = setInterval(() => void run(), intervalMs);
+	const initial = setTimeout(() => void run(), initialDelayMs);
 	signal.addEventListener("abort", () => {
 		clearInterval(interval);
 		clearTimeout(initial);
 	}, { once: true });
-	console.log(`[push:event] scheduler started (${appConfig.eventPushIntervalMs}ms, JST)`);
+	console.log(`[push:event] scheduler started (${intervalMs}ms, JST)`);
+	return {
+		wake() {
+			void run();
+		},
+	};
 }

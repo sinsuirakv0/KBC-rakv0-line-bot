@@ -321,6 +321,11 @@ function setupStatusLines(squareMid: string): string[] {
 		`即抜け監視: ${enabledText(settings.leftSoonMonitoringEnabled)}`,
 		`即抜け監視元: ${settings.leftSoonSourceChatMid ? shortId(settings.leftSoonSourceChatMid) : "未記録"}`,
 		`初参加・危険語処分: ${enabledText(settings.dangerWordAutoKickEnabled)}`,
+		`危険語処分時のLINE自動通報: ${
+			settings.dangerWordAutoReportEnabled
+				? settings.dangerWordAutoKickEnabled ? "有効" : "待機（危険語処分がOFF）"
+				: "無効"
+		}`,
 		`短時間一斉参加監視: ${enabledText(settings.joinCohortWatchEnabled)}`,
 		`副官部屋: ${settings.modRoomChatMid ? `設定済み (${shortId(settings.modRoomChatMid)})` : "未設定"}`,
 		`即抜け記録: 参加 ${activity.lastJoinAt ? formatJst(activity.lastJoinAt) : "未記録"} / 退会 ${activity.lastLeaveAt ? formatJst(activity.lastLeaveAt) : "未記録"}`,
@@ -1066,9 +1071,10 @@ function setupMenuText(squareMid: string): string {
 		"4. 即抜け監視",
 		"5. 初参加・危険語処分",
 		"6. 短時間一斉参加監視",
-		"7. 実装済み項目をまとめてON",
+		"7. 基本項目をまとめてON（自動通報を除く）",
 		"8. 自動処理系をOFF（副官部屋は維持）",
 		"9. 現在の設定を確認",
+		"10. 危険語処分時に原因メッセージをLINEへ自動通報（SCAM）",
 		"",
 		"現在:",
 		...setupStatusLines(squareMid),
@@ -1139,6 +1145,10 @@ async function applySetupSelection(
 		const result = ocModerationSettingsStore.setDangerWordAutoKick(squareMid, enabled, actorMid);
 		lines.push(flagChangeText("初参加・危険語処分", result, enabled));
 	};
+	const applyDangerWordReport = (enabled: boolean): void => {
+		const result = ocModerationSettingsStore.setDangerWordAutoReport(squareMid, enabled, actorMid);
+		lines.push(flagChangeText("危険語処分時のLINE自動通報", result, enabled));
+	};
 	const applyJoinCohort = (enabled: boolean): void => {
 		const result = ocModerationSettingsStore.setJoinCohortWatch(squareMid, enabled, actorMid);
 		lines.push(flagChangeText("短時間一斉参加監視", result, enabled));
@@ -1154,6 +1164,7 @@ async function applySetupSelection(
 		else if (number === 4) applyLeftSoon(!disable);
 		else if (number === 5) applyDangerWord(!disable);
 		else if (number === 6) applyJoinCohort(!disable);
+		else if (number === 10) applyDangerWordReport(!disable);
 		else if (number === 7) {
 			if (disable) {
 				applyLinkDelete(false);
@@ -1174,6 +1185,7 @@ async function applySetupSelection(
 			applyMediaDelete(false);
 			applyLeftSoon(false);
 			applyDangerWord(false);
+			applyDangerWordReport(false);
 			applyJoinCohort(false);
 		} else if (number === 9) {
 			lines.push("", "現在:", ...setupStatusLines(squareMid));

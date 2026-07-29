@@ -28,6 +28,7 @@ import {
 	type ParsedOcUrl,
 } from "./ocUrlPolicy.js";
 import { isMainSquareChat, resolveMainSquareChatMid } from "./ocMainChat.js";
+import { reportOcMessage } from "./ocReport.js";
 import { banSquareMember } from "./ocSquareBan.js";
 
 type SquareRole = string | number | undefined;
@@ -42,6 +43,7 @@ export interface OpenChatModerationMessage {
 	contentType?: string | number;
 	contentMetadata?: Record<string, string>;
 	createdAt?: number;
+	threadMid?: string;
 }
 
 export interface OpenChatPostModerationEvent {
@@ -1094,11 +1096,11 @@ async function sendLeftSoonMainNotice(
 		return;
 	}
 	try {
-		await lineApiQueue.run("oc-moderation:auto-kick-notice", () =>
+		await lineApiQueue.run("oc-moderation:auto-ban-notice", () =>
 			event.client.base.square.sendMessage({
 				squareChatMid,
 				text: [
-					"自動強制退会が実行されました。",
+					"自動再参加禁止が実行されました。",
 					"判断理由: 参加から5分以内の即抜け",
 					`参加時間: ${formatParticipationDuration(info.stayMs)}`,
 				].join("\n"),
@@ -1152,6 +1154,7 @@ async function sendDangerWordMainNotice(
 async function handleDangerWordAutoKick(
 	message: OpenChatModerationMessage,
 	activity: OcMemberActivity,
+	autoReportEnabled: boolean,
 ): Promise<boolean> {
 	const word = dangerWord(message.text);
 	if (!word) return false;
@@ -1159,6 +1162,29 @@ async function handleDangerWordAutoKick(
 	if (elapsedMs === undefined || elapsedMs > DANGER_WORD_WINDOW_MS) return false;
 
 	const targetName = activity.displayName ?? (await getSquareMemberSummary(message.client, message.senderMid).catch(() => undefined))?.displayName;
+	let reportError: string | undefined;
+	if (autoReportEnabled) {
+		try {
+			await lineApiQueue.run("oc-moderation:report-danger-word", () =>
+				reportOcMessage(message.client, {
+					squareMid: message.squareMid,
+					squareChatMid: message.squareChatMid,
+					messageId: message.messageId,
+					reportType: "SCAM",
+					threadMid: message.threadMid,
+				}),
+				{ priority: "high", scope: `square:${message.squareChatMid}` },
+			);
+		} catch (error) {
+			reportError = compactError(error);
+			console.warn("[oc-moderation] danger word auto report failed", {
+				squareMid: message.squareMid,
+				squareChatMid: message.squareChatMid,
+				messageId: message.messageId,
+				error: reportError,
+			});
+		}
+	}
 	await deleteSquareMessage(message, "danger-word");
 	const kickResult = await kickFromSquare(
 		message.client,
@@ -1180,6 +1206,7 @@ async function handleDangerWordAutoKick(
 			`検出語: ${word}`,
 			`本文: ${message.text?.replace(/\s+/g, " ").trim().slice(0, 300) ?? "(本文なし)"}`,
 			`処分: ${kickResult.ok ? "メッセージ削除 + 強制退会（再参加禁止は未実行）" : "メッセージ削除 + 強制退会失敗"}`,
+			`LINE通報: ${autoReportEnabled ? (reportError ? `失敗（${reportError}）` : "成功（SCAM）") : "未実行"}`,
 			kickResult.error ? `エラー: ${kickResult.error}` : "",
 			"",
 			"理由:",
@@ -1199,6 +1226,8 @@ async function handleDangerWordAutoKick(
 				word,
 				text: message.text,
 				elapsedMs,
+				reportType: autoReportEnabled ? "SCAM" : undefined,
+				reportError,
 				error: kickResult.error,
 			},
 		},
@@ -1342,7 +1371,7 @@ async function handleLeftSoonDecision(
 				`最後の発言: ${lastMessageLine(info)}`,
 				"処分: 未実行",
 				"",
-				"初参加ではないため、自動強制退会や確認待ち処分は行いませんでした。",
+				"初参加ではないため、自動再参加禁止や確認待ち処分は行いませんでした。",
 			].join("\n"),
 			{
 				type: "left_soon_log",
@@ -1396,14 +1425,14 @@ async function handleLeftSoonDecision(
 		return;
 	}
 
-	const kickResult = await kickFromSquare(
+	const banResult = await banFromSquare(
 		event.client,
 		event.squareMid,
 		event.memberMid,
 		targetName,
 		"即抜け: 参加後5分以内の退会",
 	);
-	if (kickResult.ok) {
+	if (banResult.ok) {
 		await sendLeftSoonMainNotice(event, info, settings.modRoomChatMid);
 	}
 	await sendModRoomLog(
@@ -1416,29 +1445,26 @@ async function handleLeftSoonDecision(
 			`参加時間: ${formatParticipationDuration(info.stayMs)}`,
 			`発言数: ${info.messageCount}`,
 			`最後の発言: ${lastMessageLine(info)}`,
-			`処分: ${kickResult.ok ? "強制退会（再参加禁止は未実行）" : "強制退会失敗"}`,
-			kickResult.error ? `エラー: ${kickResult.error}` : "",
+			`処分: ${banResult.ok ? "再参加禁止" : "再参加禁止失敗"}`,
+			banResult.error ? `エラー: ${banResult.error}` : "",
 			"",
 			"理由:",
 			"参加後5分以内に本OCから退室したため、",
-			"即抜け荒らし対策として自動的に強制退会しました。",
-			"",
-			"再参加禁止にする場合は、このログに「再参加禁止」と返信してください。",
-			"追加処分しない場合は「無視」と返信してください。",
+			"即抜け荒らし対策として自動的に再参加禁止にしました。",
 		].filter(Boolean).join("\n"),
 		{
-			type: "left_soon_auto_kick",
-			status: kickResult.ok ? "pending_ban" : "kick_failed",
+			type: "left_soon_auto_ban",
+			status: banResult.ok ? "auto_banned" : "ban_failed",
 			targetMid: event.memberMid,
 			targetName,
-			reason: "left-soon-auto-kick",
+			reason: "left-soon-auto-ban",
 			payload: {
 				stayMs: info.stayMs,
 				messageCount: info.messageCount,
 				joinedAt: info.joinedAt,
 				lastMessageAt: info.lastMessageAt,
 				lastMessageText: info.lastMessageText,
-				error: kickResult.error,
+				error: banResult.error,
 			},
 		},
 	);
@@ -1506,7 +1532,10 @@ export async function handleOpenChatModeration(message: OpenChatModerationMessag
 	}
 
 	if (settings.joinCohortWatchEnabled) await handleCohortSuspiciousMessage(message, activity);
-	if (settings.dangerWordAutoKickEnabled && await handleDangerWordAutoKick(message, activity)) return true;
+	if (
+		settings.dangerWordAutoKickEnabled &&
+		await handleDangerWordAutoKick(message, activity, settings.dangerWordAutoReportEnabled)
+	) return true;
 
 	if (settings.mediaBurstDeleteEnabled) logMediaModerationCandidate(message);
 	if (settings.mediaBurstDeleteEnabled && isImageOrVideo(message.contentType)) {

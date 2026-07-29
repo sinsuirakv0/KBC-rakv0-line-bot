@@ -856,6 +856,7 @@ async function handleSquareMessage(
 			contentType: rawMessage.contentType,
 			contentMetadata: rawMessage.contentMetadata,
 			createdAt: rawMessage.createdTime === undefined ? undefined : Number(rawMessage.createdTime),
+			threadMid,
 		})
 	) return;
 	const squareText = typeof message.text === "string" ? message.text : rawMessage?.text;
@@ -2400,7 +2401,7 @@ async function main(): Promise<void> {
 			console.log(`[startup] ${name} ${state}`);
 		},
 	});
-	startEventPushScheduler(() => activeClient, shutdownController.signal);
+	const eventPushScheduler = startEventPushScheduler(() => activeClient, shutdownController.signal);
 	startPushReminderScheduler(() => activeClient, shutdownController.signal);
 	startMessageLogAutoHistoryScheduler(() => activeClient, shutdownController.signal);
 	startMessageLogRemoteSyncScheduler(shutdownController.signal);
@@ -2421,6 +2422,7 @@ async function main(): Promise<void> {
 		run: (client, signal) => runSession(client, storage, signal),
 		onActiveChange(client) {
 			activeClient = client;
+			if (client) eventPushScheduler.wake();
 		},
 		onRetry(retry) {
 			console.error("[line] session stopped; automatic login will retry", {
