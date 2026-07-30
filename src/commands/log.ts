@@ -113,7 +113,7 @@ interface MemberRefreshResult {
 
 const MAX_LOG_ROWS = 1000;
 const LOG_PAGE_SIZE = 10;
-const DEFAULT_LOG_LOOKBACK_DAYS = 30;
+const DEFAULT_LOG_LOOKBACK_DAYS = appConfig.messageLogSearchLookbackDays;
 const DEFAULT_LOG_LOOKBACK_MS = DEFAULT_LOG_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
 const MEMBER_UPDATE_HISTORY_LOOKBACK_DAYS = 183;
 const MEMBER_UPDATE_HISTORY_LOOKBACK_MS = MEMBER_UPDATE_HISTORY_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
@@ -1622,9 +1622,9 @@ export const logCommand: LineCommand = {
 		if (args[0]?.toLowerCase() === "help") {
 			await message.send([
 				"!log <検索語>",
-				"  このトークの直近30日から検索語を含む発言を表示します。",
+				`  このトークの直近${DEFAULT_LOG_LOOKBACK_DAYS}日から検索語を含む発言を表示します。`,
 				"!log <検索語> <メンバー名>",
-				"  その人の直近30日の発言から検索語を含むものだけ表示します。",
+				`  その人の直近${DEFAULT_LOG_LOOKBACK_DAYS}日の発言から検索語を含むものだけ表示します。`,
 				"!log <検索語> all",
 				"  全期間から検索します。重いので連打しないでください。",
 				"!log get",

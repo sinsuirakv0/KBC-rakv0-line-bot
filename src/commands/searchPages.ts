@@ -14,6 +14,7 @@ interface SearchPageSession {
 
 const sessions = new Map<string, SearchPageSession>();
 const recentSessions = new Map<string, SearchPageSession>();
+let cleanupTimer: NodeJS.Timeout | undefined;
 
 function destinationKey(message: ReplyableLineMessage): string {
 	return `${message.destination.kind}:${message.destination.chatMid}`;
@@ -31,6 +32,34 @@ function cleanup(): void {
 	for (const [key, session] of recentSessions) {
 		if (session.expiresAt <= now) recentSessions.delete(key);
 	}
+	scheduleCleanup();
+}
+
+function scheduleCleanup(): void {
+	if (cleanupTimer) {
+		clearTimeout(cleanupTimer);
+		cleanupTimer = undefined;
+	}
+	let nextExpiration = Number.POSITIVE_INFINITY;
+	for (const session of sessions.values()) {
+		nextExpiration = Math.min(nextExpiration, session.expiresAt);
+	}
+	for (const session of recentSessions.values()) {
+		nextExpiration = Math.min(nextExpiration, session.expiresAt);
+	}
+	if (!Number.isFinite(nextExpiration)) return;
+	cleanupTimer = setTimeout(cleanup, Math.max(1, nextExpiration - Date.now()));
+	cleanupTimer.unref();
+}
+
+function releaseSession(session: SearchPageSession): void {
+	for (const [messageId, stored] of sessions) {
+		if (stored.rows === session.rows) sessions.delete(messageId);
+	}
+	for (const [key, stored] of recentSessions) {
+		if (stored.rows === session.rows) recentSessions.delete(key);
+	}
+	scheduleCleanup();
 }
 
 function formatPage(session: SearchPageSession, page: number): string {
@@ -64,6 +93,7 @@ export async function sendSearchResults(
 	const messageId = await message.send(formatPage(temporarySession, 1));
 	if (messageId && rows.length > pageSize) sessions.set(messageId, temporarySession);
 	if (rows.length > pageSize) recentSessions.set(recentKey(message), temporarySession);
+	if (rows.length > pageSize) scheduleCleanup();
 }
 
 export async function handleSearchPageReply(
@@ -83,13 +113,16 @@ export async function handleSearchPageReply(
 		return true;
 	}
 	const messageId = await message.send(formatPage(session, page));
-	if (messageId && page < maxPage) sessions.set(messageId, {
+	if (page >= maxPage) {
+		releaseSession(session);
+		return true;
+	}
+	const refreshedSession: SearchPageSession = {
 		...session,
 		expiresAt: Date.now() + EXPIRES_MS,
-	});
-	if (page < maxPage) recentSessions.set(recentKey(message), {
-		...session,
-		expiresAt: Date.now() + EXPIRES_MS,
-	});
+	};
+	if (messageId) sessions.set(messageId, refreshedSession);
+	recentSessions.set(recentKey(message), refreshedSession);
+	scheduleCleanup();
 	return true;
 }

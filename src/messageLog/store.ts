@@ -60,12 +60,6 @@ export interface MessageLogFlushResult {
 	remotePending: number;
 }
 
-export interface MessageLogReconcileResult {
-	remoteFiles: number;
-	discoveredChats: number;
-	discoveredParts: number;
-}
-
 export interface MessageLogAutoHistoryState {
 	syncToken?: string;
 	continuationToken?: string;
@@ -225,6 +219,20 @@ function jstDateKey(createdAt: number): string {
 	return `${year}-${month}-${day}`;
 }
 
+function jstMonthKeysSince(sinceCreatedAt: number, now = Date.now()): string[] {
+	const start = new Date(sinceCreatedAt + JST_OFFSET_MS);
+	const end = new Date(now + JST_OFFSET_MS);
+	const startMonth = start.getUTCFullYear() * 12 + start.getUTCMonth();
+	const endMonth = end.getUTCFullYear() * 12 + end.getUTCMonth();
+	const keys: string[] = [];
+	for (let value = endMonth; value >= startMonth; value--) {
+		const year = Math.floor(value / 12);
+		const month = value % 12 + 1;
+		keys.push(`${year}-${String(month).padStart(2, "0")}`);
+	}
+	return keys;
+}
+
 function datePathParts(dateKey: string): { year: string; month: string } {
 	return {
 		year: dateKey.slice(0, 4),
@@ -251,45 +259,6 @@ function localPathFor(relativePath: string): string {
 
 function remotePathFor(relativePath: string): string {
 	return `${remoteRoot()}/${relativePath}`;
-}
-
-interface ParsedRemotePartPath {
-	relativePath: string;
-	kind: "talk" | "square";
-	chatMid: string;
-	chatType: "USER" | "GROUP" | "ROOM" | "SQUARE";
-	date: string;
-	part: number;
-	bytes: number;
-}
-
-function decodeSafeSegment(value: string): string {
-	try {
-		return decodeURIComponent(value.replace(/_([0-9a-f]{2})/gi, "%$1"));
-	} catch {
-		return value;
-	}
-}
-
-function parseRemotePartPath(remotePath: string, root: string, bytes: number): ParsedRemotePartPath | undefined {
-	const prefix = `${root.replace(/^\/+|\/+$/g, "")}/`;
-	if (!remotePath.startsWith(prefix)) return undefined;
-	const relativePath = remotePath.slice(prefix.length);
-	const match = relativePath.match(
-		/^(square|user|group|room)\/([^/]+)\/\d{4}\/\d{2}\/(\d{4}-\d{2}-\d{2})\.(\d+)\.json$/i,
-	);
-	if (!match) return undefined;
-	const folder = match[1].toLowerCase();
-	const chatType = folder === "square" ? "SQUARE" : folder.toUpperCase() as "USER" | "GROUP" | "ROOM";
-	return {
-		relativePath,
-		kind: folder === "square" ? "square" : "talk",
-		chatMid: decodeSafeSegment(match[2]),
-		chatType,
-		date: match[3],
-		part: Number(match[4]) || 1,
-		bytes,
-	};
 }
 
 function recoveredPartTimeRange(date: string): { firstCreatedAt?: number; lastCreatedAt?: number } {
@@ -454,7 +423,6 @@ class MessageLogStore {
 	private membersLoaded = new Set<string>();
 	private fileShas = new Map<string, string | undefined>();
 	private pendingRemotePaths = new Set<string>();
-	private recoveredRemotePaths = new Set<string>();
 	private dirtyMessages = new Map<string, Map<string, StoredMessageLog>>();
 	private dirtyMembers = new Set<string>();
 	private saveTimer: NodeJS.Timeout | undefined;
@@ -625,77 +593,6 @@ class MessageLogStore {
 			}));
 	}
 
-	async reconcileRemoteIndex(): Promise<MessageLogReconcileResult> {
-		if (!githubContentsClient.enabled) {
-			return { remoteFiles: 0, discoveredChats: 0, discoveredParts: 0 };
-		}
-		const root = remoteRoot();
-		const remoteFiles = await githubContentsClient.listFiles(root);
-		const remoteParts = remoteFiles.flatMap((file) => {
-			const parsed = parseRemotePartPath(file.path, root, file.size);
-			return parsed ? [parsed] : [];
-		});
-		const partsByKey = new Map<string, ParsedRemotePartPath[]>();
-		for (const part of remoteParts) {
-			const key = chatKey(part);
-			const parts = partsByKey.get(key) ?? [];
-			parts.push(part);
-			partsByKey.set(key, parts);
-		}
-
-		let discoveredChats = 0;
-		let discoveredParts = 0;
-		for (const [key, parts] of partsByKey) {
-			let manifestChat = this.manifestChatsByKey.get(key);
-			if (!manifestChat) {
-				const sample = [...parts].sort((left, right) => right.relativePath.localeCompare(left.relativePath))[0];
-				const raw = await this.readJson(sample.relativePath) as Partial<MessageLogPartFile> | undefined;
-				if (!raw || (raw.kind !== "talk" && raw.kind !== "square") ||
-					typeof raw.chatMid !== "string" || typeof raw.scopeMid !== "string" ||
-					!["USER", "GROUP", "ROOM", "SQUARE"].includes(String(raw.chatType))) {
-					console.warn("[message-log] skipped remote chat with unreadable sample", {
-						chatMid: sample.chatMid,
-						path: sample.relativePath,
-					});
-					continue;
-				}
-				const chat = this.ensureChat({
-					kind: raw.kind,
-					chatMid: raw.chatMid,
-					scopeMid: raw.scopeMid,
-					chatType: raw.chatType as StoredChat["chatType"],
-				});
-				manifestChat = this.getOrCreateManifestChat(chat);
-				discoveredChats += 1;
-			}
-
-			const knownPaths = new Set(manifestChat.parts.map((part) => part.path));
-			for (const part of parts) {
-				if (knownPaths.has(part.relativePath)) continue;
-				const timeRange = recoveredPartTimeRange(part.date);
-				manifestChat.parts.push({
-					path: part.relativePath,
-					date: part.date,
-					part: part.part,
-					count: 0,
-					firstCreatedAt: timeRange.firstCreatedAt,
-					lastCreatedAt: timeRange.lastCreatedAt,
-					bytes: part.bytes,
-				});
-				knownPaths.add(part.relativePath);
-				this.recoveredRemotePaths.add(part.relativePath);
-				discoveredParts += 1;
-			}
-			manifestChat.parts.sort((left, right) => left.path.localeCompare(right.path));
-		}
-
-		if (discoveredChats > 0 || discoveredParts > 0) {
-			this.dirty = true;
-			await this.flush();
-		}
-		return { remoteFiles: remoteFiles.length, discoveredChats, discoveredParts };
-	}
-
 	updateAutoHistoryState(
 		destination: Pick<LineDestination, "kind" | "chatMid" | "scopeMid" | "chatType">,
 		state: MessageLogAutoHistoryState,
@@ -805,19 +702,40 @@ class MessageLogStore {
 			if (rows.length >= limit) return rows;
 		}
 
-		const parts = [...(manifestChat?.parts ?? [])]
-			.sort((left, right) =>
-				(right.lastCreatedAt ?? 0) - (left.lastCreatedAt ?? 0) || right.part - left.part
-			);
-		for (const part of parts) {
-			if (sinceCreatedAt !== undefined && part.lastCreatedAt !== undefined && part.lastCreatedAt < sinceCreatedAt) break;
-			const file = await this.readPartFile(part.path, manifestChat);
-			if (!file) continue;
-			for (const message of sortMessagesDesc(file.messages)) {
-				if (sinceCreatedAt !== undefined && message.createdAt < sinceCreatedAt) break;
-				consider(message);
-				if (rows.length >= limit) return rows;
+		const base = manifestChat ?? chat;
+		if (!base) return rows;
+		const monthKeys = await this.listSearchMonthKeys(base, manifestChat, sinceCreatedAt);
+		try {
+			for (const monthKey of monthKeys) {
+				const parts = await this.listSearchPartsForMonth(base, manifestChat, monthKey);
+				for (const part of parts) {
+					if (
+						sinceCreatedAt !== undefined &&
+						part.lastCreatedAt !== undefined &&
+						part.lastCreatedAt < sinceCreatedAt
+					) {
+						continue;
+					}
+					const file = await this.readPartFile(part.path, manifestChat);
+					if (!file) continue;
+					try {
+						file.messages.sort((left, right) =>
+							right.createdAt - left.createdAt || right.id.localeCompare(left.id)
+						);
+						for (const message of file.messages) {
+							if (sinceCreatedAt !== undefined && message.createdAt < sinceCreatedAt) break;
+							consider(message);
+							if (rows.length >= limit) return rows;
+						}
+					} finally {
+						// パート本文を検索後すぐ解放し、次のファイルと同時に保持しない。
+						file.messages.length = 0;
+					}
+					await yieldToEventLoop();
+				}
 			}
+		} finally {
+			monthKeys.length = 0;
 		}
 		return rows;
 	}
@@ -935,7 +853,6 @@ class MessageLogStore {
 		this.manifestChatsByKey.clear();
 		this.messagesByChat.clear();
 		this.membersLoaded.clear();
-		this.recoveredRemotePaths.clear();
 		for (const manifestChat of manifest.chats) {
 			const chat: StoredChat = {
 				kind: manifestChat.kind,
@@ -1130,7 +1047,7 @@ class MessageLogStore {
 			if (relativePath === "manifest.json" && nonManifestFailed) continue;
 			try {
 				const content = relativePath === "manifest.json"
-					? encodeWrappedJson(this.remoteManifestSnapshot())
+					? encodeWrappedJson(this.manifest)
 					: await fs.readFile(localPathFor(relativePath), "utf8");
 				const filePath = remotePathFor(relativePath);
 				let sha = this.fileShas.get(filePath);
@@ -1189,6 +1106,86 @@ class MessageLogStore {
 			}
 		}
 		return parsed;
+	}
+
+	private async listSearchMonthKeys(
+		base: Pick<StoredChat, "kind" | "chatMid" | "chatType">,
+		manifestChat: MessageLogManifestChat | undefined,
+		sinceCreatedAt: number | undefined,
+	): Promise<string[]> {
+		if (sinceCreatedAt !== undefined) return jstMonthKeysSince(sinceCreatedAt);
+
+		const months = new Set(
+			(manifestChat?.parts ?? [])
+				.map((part) => part.date.slice(0, 7))
+				.filter((month) => /^\d{4}-\d{2}$/.test(month)),
+		);
+		if (!githubContentsClient.enabled) return [...months].sort().reverse();
+
+		const chatRootPath = remotePathFor(relativeChatRoot(base));
+		try {
+			const years = await githubContentsClient.listDirectory(chatRootPath);
+			for (const year of years) {
+				if (year.type !== "dir" || !/^\d{4}$/.test(year.name)) continue;
+				const entries = await githubContentsClient.listDirectory(`${chatRootPath}/${year.name}`);
+				for (const month of entries) {
+					if (month.type === "dir" && /^(0[1-9]|1[0-2])$/.test(month.name)) {
+						months.add(`${year.name}-${month.name}`);
+					}
+				}
+				await yieldToEventLoop();
+			}
+		} catch (error) {
+			console.warn("[message-log] remote month discovery failed; using manifest only", {
+				chatMid: base.chatMid,
+				error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+			});
+		}
+		return [...months].sort().reverse();
+	}
+
+	private async listSearchPartsForMonth(
+		base: Pick<StoredChat, "kind" | "chatMid" | "chatType">,
+		manifestChat: MessageLogManifestChat | undefined,
+		monthKey: string,
+	): Promise<MessageLogPartMeta[]> {
+		const partsByPath = new Map<string, MessageLogPartMeta>();
+		for (const part of manifestChat?.parts ?? []) {
+			if (part.date.startsWith(monthKey)) partsByPath.set(part.path, part);
+		}
+		if (githubContentsClient.enabled) {
+			const [year, month] = monthKey.split("-");
+			const relativeDirectory = `${relativeChatRoot(base)}/${year}/${month}`;
+			try {
+				const entries = await githubContentsClient.listDirectory(remotePathFor(relativeDirectory));
+				for (const entry of entries) {
+					if (entry.type !== "file") continue;
+					const match = entry.name.match(/^(\d{4}-\d{2}-\d{2})\.(\d+)\.json$/);
+					if (!match || !match[1].startsWith(monthKey)) continue;
+					const relativePath = `${relativeDirectory}/${entry.name}`;
+					if (partsByPath.has(relativePath)) continue;
+					const range = recoveredPartTimeRange(match[1]);
+					partsByPath.set(relativePath, {
+						path: relativePath,
+						date: match[1],
+						part: Number(match[2]) || 1,
+						count: 0,
+						firstCreatedAt: range.firstCreatedAt,
+						lastCreatedAt: range.lastCreatedAt,
+						bytes: entry.size,
+					});
+				}
+			} catch (error) {
+				console.warn("[message-log] remote part discovery failed; using local index only", {
+					chatMid: base.chatMid,
+					month: monthKey,
+					error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+				});
+			}
+		}
+		return [...partsByPath.values()].sort((left, right) =>
+			(right.lastCreatedAt ?? 0) - (left.lastCreatedAt ?? 0) || right.part - left.part
+		);
 	}
 
 	private async ensureMembersLoaded(chat: StoredChat): Promise<void> {
@@ -1298,16 +1295,6 @@ class MessageLogStore {
 	private async writeManifestLocal(): Promise<void> {
 		this.manifest.generatedAt = new Date().toISOString();
 		await this.writeLocalJson("manifest.json", this.manifest);
-	}
-
-	private remoteManifestSnapshot(): MessageLogManifest {
-		return {
-			...this.manifest,
-			chats: this.manifest.chats.map((chat) => ({
-				...chat,
-				parts: chat.parts.filter((part) => !this.recoveredRemotePaths.has(part.path)),
-			})),
-		};
 	}
 
 	private async writeLocalJson(relativePath: string, value: unknown): Promise<void> {

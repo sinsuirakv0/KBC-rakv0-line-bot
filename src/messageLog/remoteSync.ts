@@ -10,7 +10,6 @@ export function startMessageLogRemoteSyncScheduler(signal: AbortSignal): void {
 	let stopped = false;
 	let syncRunning = false;
 	let syncTimer: NodeJS.Timeout | undefined;
-	let reconcileTimer: NodeJS.Timeout | undefined;
 
 	const scheduleSync = (delayMs: number) => {
 		if (stopped || signal.aborted) return;
@@ -54,36 +53,9 @@ export function startMessageLogRemoteSyncScheduler(signal: AbortSignal): void {
 			});
 	};
 
-	if (appConfig.messageLogRemoteReconcileEnabled) {
-		const runReconcile = () => {
-			if (stopped || signal.aborted) return;
-			if (!runtimeWorkload.canRunBackground()) {
-				reconcileTimer = setTimeout(runReconcile, appConfig.backgroundRetryMs);
-				return;
-			}
-			void runtimeWorkload.runBackground("message-log-reconcile", async () => {
-				if (stopped || signal.aborted) {
-					return { remoteFiles: 0, discoveredChats: 0, discoveredParts: 0 };
-				}
-				return await messageLogStore.reconcileRemoteIndex();
-			})
-				.then((result) => {
-					console.log(
-						`[message-log:reconcile] remote=${result.remoteFiles} chats=${result.discoveredChats} parts=${result.discoveredParts}`,
-					);
-					scheduleSync(1_000);
-				})
-				.catch((error) => {
-					console.warn("[message-log:reconcile] failed", compactError(error));
-				});
-		};
-		reconcileTimer = setTimeout(runReconcile, Math.max(1_000, appConfig.messageLogRemoteReconcileDelayMs));
-	}
-
 	scheduleSync(appConfig.messageLogRemoteSyncIntervalMs);
 	signal.addEventListener("abort", () => {
 		stopped = true;
 		if (syncTimer) clearTimeout(syncTimer);
-		if (reconcileTimer) clearTimeout(reconcileTimer);
 	}, { once: true });
 }

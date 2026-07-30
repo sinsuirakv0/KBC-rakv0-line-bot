@@ -6,14 +6,12 @@ interface GithubFileResponse {
 	sha?: string;
 }
 
-interface GithubTreeResponse {
-	tree?: Array<{
-		path?: string;
-		type?: string;
-		sha?: string;
-		size?: number;
-	}>;
-	truncated?: boolean;
+interface GithubDirectoryEntryResponse {
+	name?: string;
+	path?: string;
+	type?: string;
+	sha?: string;
+	size?: number;
 }
 
 export interface GithubTextFile {
@@ -21,8 +19,10 @@ export interface GithubTextFile {
 	sha?: string;
 }
 
-export interface GithubTreeFile {
+export interface GithubDirectoryEntry {
+	name: string;
 	path: string;
+	type: "file" | "dir";
 	sha?: string;
 	size: number;
 }
@@ -61,29 +61,30 @@ export class GithubContentsClient {
 		return file?.sha;
 	}
 
-	async listFiles(prefix: string): Promise<GithubTreeFile[]> {
+	async listDirectory(directoryPath: string): Promise<GithubDirectoryEntry[]> {
 		if (!this.enabled) return [];
-		const branch = encodeURIComponent(appConfig.pushSubscriptionsGithubBranch);
-		const response = await fetch(
-			`https://api.github.com/repos/${appConfig.pushSubscriptionsGithubRepo}/git/trees/${branch}?recursive=1`,
-			{
-				headers: this.headers(),
-				signal: AbortSignal.timeout(appConfig.githubContentsTimeoutMs),
-			},
-		);
-		if (!response.ok) throw new Error(`GitHub tree read failed: HTTP ${response.status}`);
-		const result = await response.json() as GithubTreeResponse;
-		if (result.truncated) {
-			throw new Error("GitHub tree response was truncated; remote index reconciliation was skipped");
-		}
-		const normalizedPrefix = prefix.replace(/^\/+|\/+$/g, "");
-		const pathPrefix = normalizedPrefix ? `${normalizedPrefix}/` : "";
-		return (result.tree ?? []).flatMap((entry) => {
-			if (entry.type !== "blob" || typeof entry.path !== "string" || !entry.path.startsWith(pathPrefix)) {
+		const url = new URL(this.url(directoryPath));
+		url.searchParams.set("ref", appConfig.pushSubscriptionsGithubBranch);
+		const response = await fetch(url, {
+			headers: this.headers(),
+			signal: AbortSignal.timeout(appConfig.githubContentsTimeoutMs),
+		});
+		if (response.status === 404) return [];
+		if (!response.ok) throw new Error(`GitHub directory read failed: HTTP ${response.status}`);
+		const result = await response.json() as GithubDirectoryEntryResponse[] | GithubDirectoryEntryResponse;
+		if (!Array.isArray(result)) return [];
+		return result.flatMap((entry) => {
+			if (
+				(entry.type !== "file" && entry.type !== "dir") ||
+				typeof entry.name !== "string" ||
+				typeof entry.path !== "string"
+			) {
 				return [];
 			}
 			return [{
+				name: entry.name,
 				path: entry.path,
+				type: entry.type,
 				sha: entry.sha,
 				size: Number(entry.size) || 0,
 			}];

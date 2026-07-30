@@ -206,7 +206,6 @@ class MemberEventLogStore {
 	private readonly filesByPath = new Map<string, { chat: MemberEventManifestChat; meta: MemberEventFileMeta }>();
 	private readonly loadedFiles = new Map<string, MemberEventFile>();
 	private readonly fileShas = new Map<string, string | undefined>();
-	private readonly remoteKnownPaths = new Set<string>();
 	private readonly dirtyPaths = new Set<string>();
 	private readonly pendingRemotePaths = new Set<string>();
 	private operationQueue: Promise<void> = Promise.resolve();
@@ -217,19 +216,6 @@ class MemberEventLogStore {
 		await fs.mkdir(appConfig.memberEventLogDir, { recursive: true });
 		let loaded: MemberEventManifest | undefined;
 		if (githubContentsClient.enabled) {
-			try {
-				const root = normalizedRoot(appConfig.memberEventLogGithubPath);
-				const prefix = `${root}/`;
-				const files = await githubContentsClient.listFiles(root);
-				for (const file of files) {
-					if (file.path.startsWith(prefix)) {
-						this.remoteKnownPaths.add(file.path.slice(prefix.length));
-						this.fileShas.set(file.path, file.sha);
-					}
-				}
-			} catch (error) {
-				console.warn("[member-event-log] GitHub file index restore failed", error);
-			}
 			try {
 				const remote = await githubContentsClient.read(remotePath("manifest.json"));
 				if (remote) {
@@ -271,6 +257,7 @@ class MemberEventLogStore {
 		if (events.length === 0) return { read: 0, added: 0, duplicates: 0 };
 		return await this.enqueue(async () => {
 			let added = 0;
+			const loadedPaths = new Set<string>();
 			for (const original of events) {
 				const memberKey = `${original.scopeMid}:${original.mid}`;
 				const knownMember = this.membersByKey.get(memberKey);
@@ -281,6 +268,7 @@ class MemberEventLogStore {
 				const relativePath = eventPath(event);
 				const { chat, meta } = this.getOrCreateFileMeta(event, relativePath);
 				const file = await this.loadFile(relativePath, chat, meta);
+				loadedPaths.add(relativePath);
 				const key = memberEventIdentityKey(event);
 				const existing = file.events.find((item) => memberEventIdentityKey(item) === key);
 				if (existing) {
@@ -305,6 +293,9 @@ class MemberEventLogStore {
 				this.updateMemberIndex(event);
 				this.markFileDirty(relativePath);
 				added++;
+			}
+			for (const relativePath of loadedPaths) {
+				if (!this.dirtyPaths.has(relativePath)) this.loadedFiles.delete(relativePath);
 			}
 			if (events.length > 0) this.scheduleSave();
 			return {
@@ -468,11 +459,7 @@ class MemberEventLogStore {
 		} catch (error) {
 			if (!this.isNotFoundError(error)) throw error;
 		}
-		if (
-			!raw &&
-			githubContentsClient.enabled &&
-			(meta.count > 0 || this.remoteKnownPaths.has(relativePath))
-		) {
+		if (!raw && githubContentsClient.enabled) {
 			const remote = await githubContentsClient.read(remotePath(relativePath));
 			if (remote) {
 				raw = JSON.parse(remote.content) as unknown;
@@ -498,6 +485,7 @@ class MemberEventLogStore {
 			const file = this.loadedFiles.get(relativePath);
 			if (!file) continue;
 			await this.writeLocalJson(relativePath, file);
+			this.loadedFiles.delete(relativePath);
 			this.pendingRemotePaths.add(relativePath);
 			written++;
 		}
@@ -534,7 +522,6 @@ class MemberEventLogStore {
 					sha,
 				);
 				this.fileShas.set(target, nextSha);
-				this.remoteKnownPaths.add(relativePath);
 				this.pendingRemotePaths.delete(relativePath);
 				written++;
 			} catch (error) {
