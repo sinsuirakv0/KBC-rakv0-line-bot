@@ -79,6 +79,18 @@ export const appConfig = {
 	commandPrefix: process.env.COMMAND_PREFIX || "!",
 	commandMaxConcurrency: numberEnv("COMMAND_MAX_CONCURRENCY", 2, { min: 1, max: 4, integer: true }),
 	commandQueueLimit: numberEnv("COMMAND_QUEUE_LIMIT", 30, { min: 5, max: 100, integer: true }),
+	memoryRestartEnabled: boolEnv("MEMORY_RESTART_ENABLED", true),
+	memoryRestartRatio: numberEnv("MEMORY_RESTART_RATIO", 0.9, { min: 0.5, max: 0.98 }),
+	memoryWatchIntervalMs: numberEnv("MEMORY_WATCH_INTERVAL_MS", 5_000, {
+		min: 1_000,
+		max: 60_000,
+		integer: true,
+	}),
+	memoryRestartGraceMs: numberEnv("MEMORY_RESTART_GRACE_MS", 20_000, {
+		min: 5_000,
+		max: 60_000,
+		integer: true,
+	}),
 	lineApiQueueLimit: numberEnv("LINE_API_QUEUE_LIMIT", 100, { min: 20, max: 500, integer: true }),
 	lineApiHighPriorityReserve: numberEnv("LINE_API_HIGH_PRIORITY_RESERVE", 20, {
 		min: 1,

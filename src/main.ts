@@ -25,6 +25,7 @@ import { initializeLineStorage, type SyncedLineStorage } from "./storage/lineSto
 import { pushSubscriptionStore } from "./subscriptions/store.js";
 import { rankingStore } from "./ranking/store.js";
 import { runtimeStore } from "./runtime/store.js";
+import { startMemoryGuard, type MemoryPressureSnapshot } from "./runtime/memoryGuard.js";
 import { lineHealth } from "./runtime/lineHealth.js";
 import {
 	compactLineError,
@@ -2349,6 +2350,8 @@ async function runSession(
 async function main(): Promise<void> {
 	let activeClient: Client | null = null;
 	const shutdownController = new AbortController();
+	let memoryRestartRequested = false;
+	let memoryForceExitTimer: NodeJS.Timeout | undefined;
 	const eventUpdateServer = startEventUpdateServer(() => activeClient);
 	const shutdown = () => {
 		if (shutdownController.signal.aborted) return;
@@ -2357,6 +2360,33 @@ async function main(): Promise<void> {
 	};
 	process.once("SIGINT", shutdown);
 	process.once("SIGTERM", shutdown);
+	if (appConfig.memoryRestartEnabled) {
+		startMemoryGuard({
+			signal: shutdownController.signal,
+			thresholdRatio: appConfig.memoryRestartRatio,
+			intervalMs: appConfig.memoryWatchIntervalMs,
+			onThreshold(snapshot: MemoryPressureSnapshot) {
+				if (memoryRestartRequested || shutdownController.signal.aborted) return;
+				memoryRestartRequested = true;
+				console.error("[memory-guard] restart threshold reached", {
+					ratio: Number((snapshot.ratio * 100).toFixed(1)),
+					currentMiB: Number((snapshot.currentBytes / 1024 / 1024).toFixed(1)),
+					limitMiB: Number((snapshot.limitBytes / 1024 / 1024).toFixed(1)),
+					rssMiB: Number((snapshot.rssBytes / 1024 / 1024).toFixed(1)),
+					heapUsedMiB: Number((snapshot.heapUsedBytes / 1024 / 1024).toFixed(1)),
+					externalMiB: Number((snapshot.externalBytes / 1024 / 1024).toFixed(1)),
+					arrayBuffersMiB: Number((snapshot.arrayBuffersBytes / 1024 / 1024).toFixed(1)),
+				});
+				memoryForceExitTimer = setTimeout(() => {
+					console.error("[memory-guard] graceful restart timed out; forcing process exit");
+					process.exit(75);
+				}, appConfig.memoryRestartGraceMs);
+				shutdownController.abort(new Error(
+					`Container memory usage reached ${(snapshot.ratio * 100).toFixed(1)}%`,
+				));
+			},
+		});
+	}
 
 	await runStartupStages([
 		{
@@ -2456,6 +2486,11 @@ async function main(): Promise<void> {
 	await messageLogStore.flush().catch(() => {});
 	await memberEventLogStore.flush().catch(() => {});
 	await new Promise<void>((resolve) => eventUpdateServer.close(() => resolve()));
+	if (memoryForceExitTimer) clearTimeout(memoryForceExitTimer);
+	if (memoryRestartRequested) {
+		console.error("[memory-guard] graceful restart completed");
+		process.exitCode = 75;
+	}
 }
 
 main().catch((error) => {
