@@ -47,6 +47,8 @@ import {
 	type TalkSyncResponse,
 } from "./runtime/talkSync.js";
 import { lineApiQueue } from "./runtime/lineApiQueue.js";
+import { ocPollingActivity } from "./runtime/ocPollingPolicy.js";
+import { ocProfileStatusManager } from "./runtime/ocProfileStatus.js";
 import { ForegroundQueueFullError, runtimeWorkload } from "./runtime/workload.js";
 import { recordSquareEventDebug, recordSquareHandlerDebug } from "./runtime/squareEventDebug.js";
 import { ocIdentitySnapshotsStore } from "./moderation/ocIdentitySnapshots.js";
@@ -828,6 +830,13 @@ async function handleSquareMessage(
 		threadMid,
 		chatMid,
 	);
+	const sourceCreatedAt = rawMessage?.createdTime === undefined
+		? Date.now()
+		: Number(rawMessage.createdTime);
+	ocPollingActivity.recordMessage(
+		target.destination.scopeMid,
+		Number.isFinite(sourceCreatedAt) ? sourceCreatedAt : Date.now(),
+	);
 	ocModerationSettingsStore.rememberLeftSoonSourceChat(
 		target.destination.scopeMid,
 		target.destination.chatMid,
@@ -890,6 +899,7 @@ async function handleSquareMessage(
 		return;
 	}
 	if (threadMid) recordSquareHandlerDebug(`square command dispatch id=${rawMessage?.id ?? "(none)"} text=${shortDebugText(squareText)}`);
+	ocPollingActivity.recordCommand(target.destination.scopeMid);
 	await dispatchText("square", squareText, target);
 	void resolveSenderName(client, "square", message.from.id)
 		.then((name) => {
@@ -2066,6 +2076,11 @@ async function runSession(
 	const refreshTokenAvailable = typeof storedRefreshToken === "string" &&
 		Boolean(storedRefreshToken.trim());
 	lineHealth.startSession(sessionStartedAt, refreshTokenAvailable);
+	await ocProfileStatusManager.bind(
+		client,
+		storage,
+		permissionStore.isBotGloballyStopped() ? "stopped" : undefined,
+	);
 	console.log(`[line] refresh token: ${refreshTokenAvailable ? "available" : "not available"}`);
 	void runtimeStore.startSession(sessionStartedAt).catch((error) => {
 		console.warn("[runtime] session start save failed", error);
@@ -2336,6 +2351,12 @@ async function runSession(
 			error: undefined,
 		};
 		const finalReason = finalStop.error === undefined ? "正常終了" : compactError(finalStop.error);
+		if (!shutdownSignal.aborted) {
+			await Promise.race([
+				ocProfileStatusManager.setGlobalStatus("restarting"),
+				sleep(5_000),
+			]);
+		}
 		lineHealth.endSession(finalStop.source, finalStop.error, endedAt);
 		shutdownSignal.removeEventListener("abort", relayShutdown);
 		void runtimeStore.endSession({
@@ -2350,16 +2371,27 @@ async function runSession(
 async function main(): Promise<void> {
 	let activeClient: Client | null = null;
 	const shutdownController = new AbortController();
+	let shutdownRequested = false;
 	let memoryRestartRequested = false;
 	let memoryForceExitTimer: NodeJS.Timeout | undefined;
 	const eventUpdateServer = startEventUpdateServer(() => activeClient);
-	const shutdown = () => {
-		if (shutdownController.signal.aborted) return;
-		console.log("[app] shutting down");
-		shutdownController.abort();
+	const requestShutdown = (
+		status: "restarting" | "stopped",
+		reason?: unknown,
+	) => {
+		if (shutdownRequested || shutdownController.signal.aborted) return;
+		shutdownRequested = true;
+		console.log("[app] shutting down", { status });
+		void (async () => {
+			await Promise.race([
+				ocProfileStatusManager.setGlobalStatus(status),
+				sleep(5_000),
+			]);
+			shutdownController.abort(reason);
+		})();
 	};
-	process.once("SIGINT", shutdown);
-	process.once("SIGTERM", shutdown);
+	process.once("SIGINT", () => requestShutdown("stopped"));
+	process.once("SIGTERM", () => requestShutdown("restarting"));
 	if (appConfig.memoryRestartEnabled) {
 		startMemoryGuard({
 			signal: shutdownController.signal,
@@ -2381,9 +2413,10 @@ async function main(): Promise<void> {
 					console.error("[memory-guard] graceful restart timed out; forcing process exit");
 					process.exit(75);
 				}, appConfig.memoryRestartGraceMs);
-				shutdownController.abort(new Error(
-					`Container memory usage reached ${(snapshot.ratio * 100).toFixed(1)}%`,
-				));
+				requestShutdown(
+					"restarting",
+					new Error(`Container memory usage reached ${(snapshot.ratio * 100).toFixed(1)}%`),
+				);
 			},
 		});
 	}
@@ -2457,7 +2490,9 @@ async function main(): Promise<void> {
 		create: () => createLineClient(storage),
 		run: (client, signal) => runSession(client, storage, signal),
 		onActiveChange(client) {
+			const previousClient = activeClient;
 			activeClient = client;
+			if (!client && previousClient) ocProfileStatusManager.unbind(previousClient);
 			if (client) eventPushScheduler.wake();
 		},
 		onRetry(retry) {
@@ -2493,7 +2528,11 @@ async function main(): Promise<void> {
 	}
 }
 
-main().catch((error) => {
+main().catch(async (error) => {
 	console.error("[app] fatal error", error);
+	await Promise.race([
+		ocProfileStatusManager.setGlobalStatus("stopped"),
+		sleep(5_000),
+	]);
 	process.exitCode = 1;
 });

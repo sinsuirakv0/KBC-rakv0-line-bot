@@ -19,6 +19,7 @@ import { runtimeStore } from "../runtime/store.js";
 import { lineHealth, type LineHealthChannelSnapshot } from "../runtime/lineHealth.js";
 import { lineApiQueue } from "../runtime/lineApiQueue.js";
 import { runtimeWorkload } from "../runtime/workload.js";
+import { ocProfileStatusManager } from "../runtime/ocProfileStatus.js";
 import { githubContentsClient } from "../storage/githubContents.js";
 import { collectRuntimeEnvironment, formatRuntimeEnvironment } from "../runtime/environment.js";
 import { argValue, parseTarget, targetLabel } from "./permissionArgs.js";
@@ -480,6 +481,7 @@ async function executeBotControl(
 		if (action === "stop") {
 			const result = permissionStore.stopBotAll(message.destination.senderMid);
 			await permissionStore.flush();
+			await ocProfileStatusManager.setGlobalStatus("stopped");
 			await message.send(result === "stopped"
 				? "全体停止しました。全てのトークルーム/個人チャットでbotは動作しません。"
 				: "すでに全体停止中です。");
@@ -488,6 +490,7 @@ async function executeBotControl(
 
 		const result = permissionStore.startBotAll();
 		await permissionStore.flush();
+		await ocProfileStatusManager.setGlobalStatus(undefined);
 		await message.send(result === "started"
 			? "全体停止を解除しました。個別に停止していたトークは停止したままです。"
 			: "全体停止は有効ではありません。個別停止は変更していません。");

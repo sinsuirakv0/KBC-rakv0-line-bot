@@ -1,6 +1,8 @@
 ﻿import type { Client } from "@evex/linejs";
 import type { SyncedLineStorage } from "../storage/lineStorage.js";
 import { lineHealth } from "../runtime/lineHealth.js";
+import { ocPollingActivity, type OcPollingMode } from "../runtime/ocPollingPolicy.js";
+import { ocProfileStatusManager } from "../runtime/ocProfileStatus.js";
 import { resolveMainSquareChatMid } from "./ocMainChat.js";
 import { ocMemberSignalDispatcher } from "./ocMemberSignals.js";
 import { ocModerationSettingsStore, type OcMemberMessageSetting } from "./ocModerationSettings.js";
@@ -19,19 +21,22 @@ interface ChatPollingState {
 	syncToken?: string;
 	ignoreBefore: number;
 	retryAfter: number;
+	nextPollAt: number;
+	mode?: OcPollingMode;
+	intervalMs?: number;
 }
 
 interface WatchedMemberMessageChat {
 	squareMid: string;
 	squareChatMid: string;
 	updatedAt: string;
+	featuresEnabled: boolean;
 }
 
-const POLLING_INTERVAL_MS = 1_000;
 const ERROR_RETRY_MS = 30_000;
 const WATCH_SETTINGS_REFRESH_MS = 60_000;
-// 1つのOCの過去イベント取得で、他のOCの参加通知監視を止めない。
-const MAX_CATCH_UP_PAGES_PER_TURN = 3;
+const LOOP_MAX_SLEEP_MS = 1_000;
+const LOOP_MIN_SLEEP_MS = 100;
 
 function rawObject(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value)
@@ -272,49 +277,41 @@ async function pollChat(
 	state: ChatPollingState,
 ): Promise<void> {
 	if (Date.now() < state.retryAfter) return;
-	for (let page = 0; page < MAX_CATCH_UP_PAGES_PER_TURN; page++) {
-		const previousSyncToken = state.syncToken;
-		try {
-			const response = await client.base.square.fetchSquareChatEvents({
-				squareChatMid: setting.squareChatMid,
-				syncToken: state.syncToken,
-				limit: 100,
-				direction: "FORWARD",
-				fetchType: "DEFAULT",
-			} as never);
-			state.syncToken = response.syncToken || state.syncToken;
-			const events = (response.events ?? []) as unknown as RawSquareEvent[];
-			lineHealth.markSuccess("member-message", events.length);
-			for (const event of events) {
-				await handleMemberMessageEvent(client, setting, event, state.ignoreBefore);
-			}
-			if (events.length === 0 || !state.syncToken || state.syncToken === previousSyncToken) {
-				if (state.syncToken) storage.scheduleSquareChatSyncToken(setting.squareChatMid, state.syncToken);
-				return;
-			}
-		} catch (error) {
-			lineHealth.markError("member-message", error);
-			const detail = compactError(error);
-			if (state.syncToken && /ILLEGAL_ARGUMENT|INVALID_ARGUMENT/i.test(detail)) {
-				console.warn("[oc-member-message:chat-poll] saved sync token rejected", {
-					squareChatMid: setting.squareChatMid,
-				});
-				state.syncToken = undefined;
-				await storage.clearSquareChatSyncToken(setting.squareChatMid).catch(() => {});
-			} else {
-				console.warn("[oc-member-message:chat-poll] failed", {
-					squareChatMid: setting.squareChatMid,
-					error: detail,
-				});
-			}
-			state.retryAfter = Date.now() + ERROR_RETRY_MS;
-			return;
+	const previousSyncToken = state.syncToken;
+	try {
+		const response = await client.base.square.fetchSquareChatEvents({
+			squareChatMid: setting.squareChatMid,
+			syncToken: state.syncToken,
+			limit: 100,
+			direction: "FORWARD",
+			fetchType: "DEFAULT",
+		} as never);
+		state.syncToken = response.syncToken || state.syncToken;
+		const events = (response.events ?? []) as unknown as RawSquareEvent[];
+		lineHealth.markSuccess("member-message", events.length);
+		for (const event of events) {
+			await handleMemberMessageEvent(client, setting, event, state.ignoreBefore);
 		}
+		if (state.syncToken && state.syncToken !== previousSyncToken) {
+			storage.scheduleSquareChatSyncToken(setting.squareChatMid, state.syncToken);
+		}
+	} catch (error) {
+		lineHealth.markError("member-message", error);
+		const detail = compactError(error);
+		if (state.syncToken && /ILLEGAL_ARGUMENT|INVALID_ARGUMENT/i.test(detail)) {
+			console.warn("[oc-member-message:chat-poll] saved sync token rejected", {
+				squareChatMid: setting.squareChatMid,
+			});
+			state.syncToken = undefined;
+			await storage.clearSquareChatSyncToken(setting.squareChatMid).catch(() => {});
+		} else {
+			console.warn("[oc-member-message:chat-poll] failed", {
+				squareChatMid: setting.squareChatMid,
+				error: detail,
+			});
+		}
+		state.retryAfter = Date.now() + ERROR_RETRY_MS;
 	}
-	console.log("[oc-member-message:chat-poll] catch-up will continue on the next turn", {
-		squareChatMid: setting.squareChatMid,
-		pages: MAX_CATCH_UP_PAGES_PER_TURN,
-	});
 }
 
 function mergeWatchedChats(settings: WatchedMemberMessageChat[]): WatchedMemberMessageChat[] {
@@ -323,9 +320,18 @@ function mergeWatchedChats(settings: WatchedMemberMessageChat[]): WatchedMemberM
 		const current = byChatMid.get(setting.squareChatMid);
 		const currentAt = current ? Date.parse(current.updatedAt) : Number.NEGATIVE_INFINITY;
 		const nextAt = Date.parse(setting.updatedAt);
-		if (!current || (Number.isFinite(nextAt) && nextAt > currentAt)) {
+		if (!current) {
 			byChatMid.set(setting.squareChatMid, setting);
+			continue;
 		}
+		if (Number.isFinite(nextAt) && nextAt > currentAt) {
+			byChatMid.set(setting.squareChatMid, {
+				...setting,
+				featuresEnabled: current.featuresEnabled || setting.featuresEnabled,
+			});
+			continue;
+		}
+		current.featuresEnabled = current.featuresEnabled || setting.featuresEnabled;
 	}
 	return [...byChatMid.values()];
 }
@@ -337,9 +343,10 @@ function configuredMemberMessageChats(): WatchedMemberMessageChat[] {
 	];
 	return mergeWatchedChats(
 		settings.map((setting) => ({
-				squareMid: setting.squareMid,
-				squareChatMid: setting.squareChatMid,
-				updatedAt: setting.updatedAt,
+			squareMid: setting.squareMid,
+			squareChatMid: setting.squareChatMid,
+			updatedAt: setting.updatedAt,
+			featuresEnabled: true,
 		})),
 	);
 }
@@ -388,11 +395,11 @@ function leftSoonSourceChatMids(
 	return [...mids];
 }
 
-async function discoverLeftSoonMonitoringChats(
+async function discoverModerationMonitoringChats(
 	client: Client,
 	configured: WatchedMemberMessageChat[],
 ): Promise<WatchedMemberMessageChat[]> {
-	const monitoringSettings = ocModerationSettingsStore.leftSoonMonitoringSettings();
+	const monitoringSettings = ocModerationSettingsStore.memberPollingSettings();
 	if (monitoringSettings.length === 0) return [];
 	const found: WatchedMemberMessageChat[] = [];
 	for (const setting of monitoringSettings) {
@@ -407,6 +414,7 @@ async function discoverLeftSoonMonitoringChats(
 				squareMid: setting.squareMid,
 				squareChatMid,
 				updatedAt: setting.updatedAt,
+				featuresEnabled: setting.leftSoonMonitoringEnabled || Boolean(setting.modRoomChatMid),
 			});
 			continue;
 		}
@@ -421,7 +429,7 @@ async function discoverLeftSoonMonitoringChats(
 async function resolveWatchedChats(client: Client): Promise<WatchedMemberMessageChat[]> {
 	const configured = configuredMemberMessageChats();
 	const confirmed = await confirmConfiguredChats(client, configured);
-	const monitoring = await discoverLeftSoonMonitoringChats(client, confirmed);
+	const monitoring = await discoverModerationMonitoringChats(client, confirmed);
 	const watched = mergeWatchedChats([...confirmed, ...monitoring]);
 	console.log("[oc-member-message:chat-poll] watch targets refreshed", {
 		configuredChatCount: configured.length,
@@ -460,6 +468,18 @@ export async function listenOpenChatJoinMessageEvents(
 			states.delete(squareChatMid);
 			await storage.clearSquareChatSyncToken(squareChatMid).catch(() => {});
 		}
+		const energyBySquare = new Map<string, boolean>();
+		for (const setting of settings) {
+			const decision = ocPollingActivity.decision(setting.squareMid, setting.featuresEnabled);
+			const current = energyBySquare.get(setting.squareMid);
+			energyBySquare.set(
+				setting.squareMid,
+				current === undefined ? decision.energySaving : current && decision.energySaving,
+			);
+		}
+		for (const [squareMid, energySaving] of energyBySquare) {
+			ocProfileStatusManager.setEnergySaving(squareMid, energySaving);
+		}
 		for (const setting of settings) {
 			let state = states.get(setting.squareChatMid);
 			if (!state) {
@@ -468,6 +488,7 @@ export async function listenOpenChatJoinMessageEvents(
 					syncToken: await storage.getSquareChatSyncToken(setting.squareChatMid),
 					ignoreBefore: Math.max(sessionStartedAt, Number.isFinite(updatedAt) ? updatedAt : sessionStartedAt),
 					retryAfter: 0,
+					nextPollAt: 0,
 				};
 				states.set(setting.squareChatMid, state);
 				console.log("[oc-member-message:chat-poll] watching", {
@@ -475,9 +496,37 @@ export async function listenOpenChatJoinMessageEvents(
 					persistedSyncToken: Boolean(state.syncToken),
 				});
 			}
-			await pollChat(client, storage, setting, state);
+			const decision = ocPollingActivity.decision(
+				setting.squareMid,
+				setting.featuresEnabled,
+			);
+			if (state.mode !== decision.mode) {
+				if (state.intervalMs === undefined || decision.intervalMs < state.intervalMs) {
+					state.nextPollAt = 0;
+				}
+				console.log("[oc-member-message:chat-poll] mode changed", {
+					squareMid: setting.squareMid,
+					squareChatMid: setting.squareChatMid,
+					mode: decision.mode,
+					intervalMs: decision.intervalMs,
+					recentMessageCount: decision.recentMessageCount,
+				});
+				state.mode = decision.mode;
+				state.intervalMs = decision.intervalMs;
+			}
+			if (Date.now() >= state.nextPollAt) {
+				await pollChat(client, storage, setting, state);
+				state.nextPollAt = Date.now() + decision.intervalMs;
+			}
 			if (signal.aborted) break;
 		}
-		await wait(POLLING_INTERVAL_MS, signal);
+		const now = Date.now();
+		const nextDueAt = [...states.values()]
+			.reduce((nearest, state) => Math.min(nearest, state.nextPollAt), now + LOOP_MAX_SLEEP_MS);
+		const sleepMs = Math.max(
+			LOOP_MIN_SLEEP_MS,
+			Math.min(LOOP_MAX_SLEEP_MS, nextDueAt - now),
+		);
+		await wait(sleepMs, signal);
 	}
 }

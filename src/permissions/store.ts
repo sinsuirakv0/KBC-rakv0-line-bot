@@ -354,6 +354,10 @@ class PermissionStore {
 		return this.botStopStatus(target).stopped;
 	}
 
+	isBotGloballyStopped(): boolean {
+		return Boolean(this.data.globalBotStop);
+	}
+
 	stopBot(target: BotStopTarget, createdBy: string): "stopped" | "already" {
 		if (this.isBotTargetStopped(target)) return "already";
 		this.data.botStops.push({ ...target, createdAt: nowIso(), createdBy });

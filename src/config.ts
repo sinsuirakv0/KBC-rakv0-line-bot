@@ -201,6 +201,37 @@ export const appConfig = {
 		integer: true,
 	}),
 	ocMemberMessageRetryMs: Number(process.env.OC_MEMBER_MESSAGE_RETRY_MS || 5_000),
+	ocMemberPollActiveMs: numberEnv("OC_MEMBER_POLL_ACTIVE_MS", 2_000, {
+		min: 1_000,
+		max: 60_000,
+		integer: true,
+	}),
+	ocMemberPollEcoMs: numberEnv("OC_MEMBER_POLL_ECO_MS", 5_000, {
+		min: 2_000,
+		max: 5 * 60_000,
+		integer: true,
+	}),
+	ocMemberPollInactiveMs: numberEnv("OC_MEMBER_POLL_INACTIVE_MS", 60_000, {
+		min: 5_000,
+		max: 30 * 60_000,
+		integer: true,
+	}),
+	ocMemberPollCommandBoostMs: numberEnv("OC_MEMBER_POLL_COMMAND_BOOST_MS", 5 * 60_000, {
+		min: 60_000,
+		max: 60 * 60_000,
+		integer: true,
+	}),
+	ocMemberPollQuietWindowMs: numberEnv("OC_MEMBER_POLL_QUIET_WINDOW_MS", 10 * 60_000, {
+		min: 60_000,
+		max: 60 * 60_000,
+		integer: true,
+	}),
+	ocMemberPollQuietMessageThreshold: numberEnv("OC_MEMBER_POLL_QUIET_MESSAGE_THRESHOLD", 5, {
+		min: 1,
+		max: 1_000,
+		integer: true,
+	}),
+	ocProfileStatusEnabled: boolEnv("OC_PROFILE_STATUS_ENABLED", true),
 	eventPushSubscriptionsFile: path.resolve(
 		process.env.EVENT_PUSH_SUBSCRIPTIONS_FILE || "./storage/event-push-subscriptions.json",
 	),

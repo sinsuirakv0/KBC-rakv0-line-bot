@@ -225,6 +225,13 @@ class OcModerationSettingsStore {
 			}));
 	}
 
+	memberPollingSettings(): OcModerationSetting[] {
+		return this.data.settings.map((setting) => ({
+			...setting,
+			urlAllowRules: setting.urlAllowRules.map((rule) => ({ ...rule })),
+		}));
+	}
+
 	urlAllowRules(squareMid: string): OcUrlAllowRule[] {
 		return this.snapshot(squareMid).urlAllowRules;
 	}
