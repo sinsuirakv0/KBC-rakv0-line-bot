@@ -3,6 +3,11 @@ import type { SyncedLineStorage } from "../storage/lineStorage.js";
 import { lineHealth } from "../runtime/lineHealth.js";
 import { ocPollingActivity, type OcPollingMode } from "../runtime/ocPollingPolicy.js";
 import { ocProfileStatusManager } from "../runtime/ocProfileStatus.js";
+import {
+	isSquareChatAccessPaused,
+	markSquareChatAccessible,
+	pauseSquareChatAccess,
+} from "../runtime/squareChatAccess.js";
 import { resolveMainSquareChatMid } from "./ocMainChat.js";
 import { ocMemberSignalDispatcher } from "./ocMemberSignals.js";
 import { ocModerationSettingsStore, type OcMemberMessageSetting } from "./ocModerationSettings.js";
@@ -72,11 +77,6 @@ function compactError(error: unknown): string {
 	} catch {
 		return String(error);
 	}
-}
-
-function isNotJoinedSquareChatError(error: unknown): boolean {
-	const detail = compactError(error);
-	return /NOT_FOUND|NOT_A_MEMBER|not a member|メンバーではありません|status=404/i.test(detail);
 }
 
 function wait(ms: number, signal: AbortSignal): Promise<void> {
@@ -288,6 +288,7 @@ async function pollChat(
 		} as never);
 		state.syncToken = response.syncToken || state.syncToken;
 		const events = (response.events ?? []) as unknown as RawSquareEvent[];
+		markSquareChatAccessible(client, setting.squareChatMid);
 		lineHealth.markSuccess("member-message", events.length);
 		for (const event of events) {
 			await handleMemberMessageEvent(client, setting, event, state.ignoreBefore);
@@ -297,6 +298,15 @@ async function pollChat(
 		}
 	} catch (error) {
 		lineHealth.markError("member-message", error);
+		if (pauseSquareChatAccess(
+			client,
+			setting.squareChatMid,
+			error,
+			"oc-member-message:poll",
+		)) {
+			state.retryAfter = Date.now() + 6 * 60 * 60_000;
+			return;
+		}
 		const detail = compactError(error);
 		if (state.syncToken && /ILLEGAL_ARGUMENT|INVALID_ARGUMENT/i.test(detail)) {
 			console.warn("[oc-member-message:chat-poll] saved sync token rejected", {
@@ -357,6 +367,7 @@ async function confirmConfiguredChats(
 ): Promise<WatchedMemberMessageChat[]> {
 	const joined: WatchedMemberMessageChat[] = [];
 	for (const setting of settings) {
+		if (isSquareChatAccessPaused(client, setting.squareChatMid)) continue;
 		try {
 			const response = await client.base.square.getSquareChat({
 				squareChatMid: setting.squareChatMid,
@@ -364,13 +375,16 @@ async function confirmConfiguredChats(
 			if (response.squareChat.squareChatMid !== setting.squareChatMid) {
 				throw new Error("getSquareChat returned a different squareChatMid");
 			}
+			markSquareChatAccessible(client, setting.squareChatMid);
 			joined.push(setting);
 		} catch (error) {
 			const detail = compactError(error);
-			if (isNotJoinedSquareChatError(error)) {
-				console.log("[oc-member-message:chat-poll] configured chat skipped because this bot is not a member", {
-					squareChatMid: setting.squareChatMid,
-				});
+			if (pauseSquareChatAccess(
+				client,
+				setting.squareChatMid,
+				error,
+				"oc-member-message:confirm",
+			)) {
 				continue;
 			}
 			console.warn("[oc-member-message:chat-poll] configured chat confirmation failed; skipping this target", {
@@ -416,6 +430,12 @@ async function discoverModerationMonitoringChats(
 				updatedAt: setting.updatedAt,
 				featuresEnabled: setting.leftSoonMonitoringEnabled || Boolean(setting.modRoomChatMid),
 			});
+			continue;
+		}
+		if (
+			sourceChatMids.length > 0 &&
+			sourceChatMids.every((chatMid) => isSquareChatAccessPaused(client, chatMid))
+		) {
 			continue;
 		}
 		console.warn("[oc-member-message:chat-poll] left-soon main chat could not be resolved", {

@@ -48,3 +48,29 @@ test("recognizes a known chat as the main OpenChat without listing joined chats"
 
 	assert.equal(await isMainSquareChat(client, "s-main-2", "m-main-2"), true);
 });
+
+test("does not repeatedly resolve a chat after a membership error", async () => {
+	let livetalkCalls = 0;
+	let squareCalls = 0;
+	const client = {
+		base: {
+			livetalk: {
+				async getSquareInfoByChatMid() {
+					livetalkCalls += 1;
+					throw new Error("このオープンチャットのメンバーではありません");
+				},
+			},
+			square: {
+				async getSquareChat() {
+					squareCalls += 1;
+					throw new Error("unexpected request");
+				},
+			},
+		},
+	} as unknown as Client;
+
+	assert.equal(await resolveMainSquareChatMid(client, "s-old", "m-old"), undefined);
+	assert.equal(await resolveMainSquareChatMid(client, "s-old", "m-old"), undefined);
+	assert.equal(livetalkCalls, 1);
+	assert.equal(squareCalls, 0);
+});

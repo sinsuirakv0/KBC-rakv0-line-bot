@@ -14,6 +14,12 @@ interface MemberInfo {
 	name: string;
 }
 
+interface JoinedSquareChatInfo {
+	mid: string;
+	name: string;
+	isMain: boolean;
+}
+
 type OldSearchMembershipState = "LEFT" | "KICK_OUT" | "BANNED" | "JOINED";
 
 class DebugLog {
@@ -147,6 +153,56 @@ async function resolveTalkMember(client: Client, mid: string): Promise<MemberInf
 		console.warn(`[id] failed to resolve talk member ${mid}`, error);
 		return { mid, name: mid };
 	}
+}
+
+function joinedSquareChatInfo(value: unknown): JoinedSquareChatInfo | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const chat = value as {
+		squareChatMid?: unknown;
+		name?: unknown;
+		type?: unknown;
+	};
+	const mid = typeof chat.squareChatMid === "string" ? chat.squareChatMid.trim() : "";
+	if (!mid) return undefined;
+	const name = typeof chat.name === "string" ? chat.name.trim() : "";
+	return {
+		mid,
+		name: cleanDisplayName(name) ?? "名前未取得",
+		isMain: chat.type === 4 || chat.type === "SQUARE_DEFAULT",
+	};
+}
+
+function isJoinedSquareChatMember(value: unknown): boolean {
+	if (!value || typeof value !== "object") return true;
+	const member = value as { membershipState?: unknown };
+	return member.membershipState === undefined || member.membershipState === 1 || member.membershipState === "JOINED";
+}
+
+async function listJoinedSquareChats(client: Client): Promise<JoinedSquareChatInfo[]> {
+	const chats = new Map<string, JoinedSquareChatInfo>();
+	let continuationToken = "";
+	for (let page = 0; page < 50; page++) {
+		const response = await client.base.square.getJoinedSquareChats({
+			request: { continuationToken, limit: 100 },
+		});
+		const rawResponse = response as {
+			chats?: unknown[];
+			chatMembers?: Record<string, unknown>;
+			continuationToken?: string;
+		};
+		for (const rawChat of rawResponse.chats ?? []) {
+			const chat = joinedSquareChatInfo(rawChat);
+			if (!chat || !isJoinedSquareChatMember(rawResponse.chatMembers?.[chat.mid])) continue;
+			chats.set(chat.mid, chat);
+		}
+		continuationToken = rawResponse.continuationToken || "";
+		if (!continuationToken) break;
+	}
+	return [...chats.values()].sort((left, right) =>
+		Number(right.isMain) - Number(left.isMain) ||
+		left.name.localeCompare(right.name, "ja") ||
+		left.mid.localeCompare(right.mid)
+	);
 }
 
 async function listMembers(client: Client, destination: LineDestination): Promise<MemberInfo[]> {
@@ -426,6 +482,8 @@ export const idCommand: LineCommand = {
 				"  メンションした相手の名前とMIDを表示します。",
 				"!id talk",
 				"  このトークの名前とMIDを表示します。",
+				"!id talk oc",
+				"  Botが参加中の全OpenChatの名前とMIDを表示します（管理者のみ）。",
 				"!id <メンバー名>",
 				"  このトーク内のメンバー名を検索します。1人だけ見つかった場合は、その人のMIDを表示します。",
 				"!id old <メンバー名>",
@@ -449,6 +507,35 @@ export const idCommand: LineCommand = {
 				return;
 			}
 			await startMemberEventBackfill(message);
+			return;
+		}
+
+		if (action === "talk" && args[1]?.toLowerCase() === "oc") {
+			const target = targetFromDestination(message.destination);
+			if (!permissionStore.hasAtLeast(target, message.destination.senderMid, "admin")) {
+				await message.send(permissionDeniedText("admin"));
+				return;
+			}
+
+			try {
+				const chats = await listJoinedSquareChats(message.client);
+				if (chats.length === 0) {
+					await message.send("参加中のOpenChatは見つかりませんでした。");
+					return;
+				}
+				await sendLong(message, [
+					"参加中OpenChat一覧",
+					`件数: ${chats.length}`,
+					"",
+					...chats.map((chat, index) => [
+						`${index + 1}. ${chat.isMain ? "本OC" : "サブOC"}: ${chat.name}`,
+						`MID: ${chat.mid}`,
+					].join("\n")),
+				].join("\n\n"));
+			} catch (error) {
+				console.warn("[id] failed to list joined square chats", error);
+				await message.send("参加中OpenChat一覧の取得に失敗しました。しばらくしてからもう一度お試しください。");
+			}
 			return;
 		}
 

@@ -20,6 +20,7 @@ import { pushCommand } from "./push.js";
 import { rankingCommand } from "./ranking.js";
 import { saleCommand } from "./sale.js";
 import { stageCommand } from "./stage.js";
+import { syoukyoCommand } from "./syoukyo.js";
 import { testCommand } from "./test.js";
 import { unitCommand } from "./unit.js";
 import { rankingStore } from "../ranking/store.js";
@@ -41,6 +42,7 @@ for (const command of [
 	enemyCommand,
 	eventCommand,
 	stageCommand,
+	syoukyoCommand,
 	ocCommand,
 	pushCommand,
 	rankingCommand,

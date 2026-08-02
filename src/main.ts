@@ -10,6 +10,7 @@ import {
 } from "./commands/shared.js";
 import { handleSearchPageReply } from "./commands/searchPages.js";
 import { handleLogTargetSelectionReply } from "./commands/log.js";
+import { handleSyoukyoStopReply } from "./commands/syoukyo.js";
 import { handlePing } from "./handlers/ping.js";
 import {
 	createLineClient,
@@ -49,6 +50,7 @@ import {
 import { lineApiQueue } from "./runtime/lineApiQueue.js";
 import { ocPollingActivity } from "./runtime/ocPollingPolicy.js";
 import { ocProfileStatusManager } from "./runtime/ocProfileStatus.js";
+import { markSquareChatAccessible } from "./runtime/squareChatAccess.js";
 import { ForegroundQueueFullError, runtimeWorkload } from "./runtime/workload.js";
 import { recordSquareEventDebug, recordSquareHandlerDebug } from "./runtime/squareEventDebug.js";
 import { ocIdentitySnapshotsStore } from "./moderation/ocIdentitySnapshots.js";
@@ -806,6 +808,7 @@ async function handleSquareMessage(
 	chatMidOverride?: string,
 ): Promise<void> {
 	const chatMid = chatMidOverride ?? message.to.id;
+	markSquareChatAccessible(client, chatMid);
 	const rawMessage = (message.raw as RawSquareMessage).message;
 	const senderMid = rawMessage?.from ?? message.from.id;
 	if (threadMid || rawMessage?.text?.startsWith(appConfig.commandPrefix)) {
@@ -892,6 +895,7 @@ async function handleSquareMessage(
 		return;
 	}
 	if (!squareText.startsWith(appConfig.commandPrefix)) {
+		if (await handleSyoukyoStopReply(squareText, target)) return;
 		if (await handleOcSetupReply(squareText, target)) return;
 		if (await handleOpenChatModerationCaseReply(squareText, target)) return;
 		if (await handleLogTargetSelectionReply(squareText, target)) return;
@@ -1592,6 +1596,7 @@ async function handleRawTalkEvent(client: Client, ownMid: string, event: RawTalk
 	recordTalkMessage(raw, target.destination, parsed);
 	if (shouldIgnoreStoppedText(parsed.text, target)) return;
 	if (!parsed.text.startsWith(appConfig.commandPrefix)) {
+		if (await handleSyoukyoStopReply(parsed.text, target)) return;
 		if (await handleLogTargetSelectionReply(parsed.text, target)) return;
 		await handleSearchPageReply(parsed.text, target);
 		return;

@@ -2,6 +2,11 @@
 import { appConfig } from "../config.js";
 import { permissionStore } from "../permissions/store.js";
 import { lineApiQueue } from "../runtime/lineApiQueue.js";
+import {
+	isSquareChatAccessPaused,
+	markSquareChatAccessible,
+	pauseSquareChatAccess,
+} from "../runtime/squareChatAccess.js";
 import { loadEventCatalog } from "./catalog.js";
 import {
 	dailyDeliveryInWindow,
@@ -29,7 +34,9 @@ async function prepareSquareTarget(client: Client, squareChatMid: string): Promi
 	if (current) return await current;
 
 	const pending = client.base.square.getSquareChat({ squareChatMid })
-		.then(() => undefined)
+		.then(() => {
+			markSquareChatAccessible(client, squareChatMid);
+		})
 		.catch((error) => {
 			targets?.delete(squareChatMid);
 			throw error;
@@ -38,12 +45,17 @@ async function prepareSquareTarget(client: Client, squareChatMid: string): Promi
 	await pending;
 }
 
-async function prepareSquareTargetBestEffort(client: Client, squareChatMid: string): Promise<void> {
+async function prepareSquareTargetBestEffort(client: Client, squareChatMid: string): Promise<boolean> {
+	if (isSquareChatAccessPaused(client, squareChatMid)) return false;
 	try {
 		await prepareSquareTarget(client, squareChatMid);
+		return true;
 	} catch (error) {
-		// 読み取りに失敗しても、従来どおり送信自体は試す。
+		if (pauseSquareChatAccess(client, squareChatMid, error, "event-push:prepare")) {
+			return false;
+		}
 		console.warn(`[push:event] square target preparation failed for ${squareChatMid}`, error);
+		return true;
 	}
 }
 
@@ -51,13 +63,21 @@ async function sendToTarget(
 	client: Client,
 	target: EventPushSubscription,
 	text: string,
-): Promise<"sent" | "stopped"> {
+): Promise<"sent" | "stopped" | "unavailable"> {
 	if (permissionStore.isBotStopped(target)) return "stopped";
 	if (target.kind === "square") {
-		await prepareSquareTargetBestEffort(client, target.chatMid);
-		await lineApiQueue.run("event-push:square", () =>
-			client.base.square.sendMessage({ squareChatMid: target.chatMid, text })
-		);
+		if (!await prepareSquareTargetBestEffort(client, target.chatMid)) return "unavailable";
+		try {
+			await lineApiQueue.run("event-push:square", () =>
+				client.base.square.sendMessage({ squareChatMid: target.chatMid, text })
+			);
+			markSquareChatAccessible(client, target.chatMid);
+		} catch (error) {
+			if (pauseSquareChatAccess(client, target.chatMid, error, "event-push:send")) {
+				return "unavailable";
+			}
+			throw error;
+		}
 		return "sent";
 	}
 	await lineApiQueue.run("event-push:talk", () =>
@@ -144,7 +164,7 @@ export async function checkEventStarts(client: Client, now: Date): Promise<void>
 			).join("\n");
 			try {
 				const result = await sendToTarget(client, target, text);
-				if (result === "stopped") continue;
+				if (result !== "sent") continue;
 				for (const { eventId } of matchingEvents) {
 					deliveredKeys.push(
 						notificationKey(
@@ -173,10 +193,14 @@ export async function checkEventStarts(client: Client, now: Date): Promise<void>
 			const key = `${target.kind}:${target.chatMid}|daily|${dailyDelivery.dateKey}`;
 			if (eventPushStore.hasNotified(key) || permissionStore.isBotStopped(target)) continue;
 			try {
-				await prepareSquareTargetBestEffort(client, target.chatMid);
+				if (!await prepareSquareTargetBestEffort(client, target.chatMid)) continue;
 				await sendSquareThreadWithRoot(client, target.chatMid, rootText, bodyText);
+				markSquareChatAccessible(client, target.chatMid);
 				deliveredKeys.push(key);
 			} catch (error) {
+				if (pauseSquareChatAccess(client, target.chatMid, error, "event-push:daily")) {
+					continue;
+				}
 				console.error(`[push:event:daily] delivery failed for ${target.kind}:${target.chatMid}`, error);
 			}
 		}

@@ -14,6 +14,7 @@ const COMMAND_LINES = [
 	"!id/ID確認",
 	"!log/メンバー発言履歴",
 	"!ban/BOT管理BAN",
+	"!syoukyo/OC緊急強制退会",
 	"!oc/OpenChat調査",
 	"!push/プッシュ通知",
 	"!bot/bot状態確認",

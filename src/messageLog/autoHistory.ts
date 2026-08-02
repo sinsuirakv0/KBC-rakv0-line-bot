@@ -1,6 +1,11 @@
 ﻿import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
 import { runtimeWorkload } from "../runtime/workload.js";
+import {
+	isSquareChatAccessPaused,
+	markSquareChatAccessible,
+	pauseSquareChatAccess,
+} from "../runtime/squareChatAccess.js";
 import { memberNameHistoryStore } from "../nameHistory/store.js";
 import { memberEventLogStore } from "../memberEventLog/store.js";
 import { extractMemberEvents } from "../memberEventLog/events.js";
@@ -481,10 +486,17 @@ async function runAutoHistoryOnce(client: Client): Promise<void> {
 	const quiet = isQuietHour();
 	const idle = isIdleEnough();
 	const completed = chats
-		.filter((chat) => chat.backfillCompletedAt)
+		.filter((chat) =>
+			chat.backfillCompletedAt &&
+			!isSquareChatAccessPaused(client, chat.chatMid)
+		)
 		.sort((left, right) => autoHistorySortTime(left) - autoHistorySortTime(right));
 	const incomplete = chats
-		.filter((chat) => !chat.backfillCompletedAt && !chat.autoHistory?.finishedAt)
+		.filter((chat) =>
+			!chat.backfillCompletedAt &&
+			!chat.autoHistory?.finishedAt &&
+			!isSquareChatAccessPaused(client, chat.chatMid)
+		)
 		.sort((left, right) => autoHistorySortTime(left) - autoHistorySortTime(right));
 	const target = (quiet || idle) && incomplete.length > 0
 		? incomplete[0]
@@ -499,10 +511,22 @@ async function runAutoHistoryOnce(client: Client): Promise<void> {
 		type: "auto",
 	})) return;
 	try {
-		if (target.backfillCompletedAt) {
-			await catchUpRecent(client, target);
-		} else {
-			await incrementalBackfill(client, target);
+		try {
+			if (target.backfillCompletedAt) {
+				await catchUpRecent(client, target);
+			} else {
+				await incrementalBackfill(client, target);
+			}
+			markSquareChatAccessible(client, target.chatMid);
+		} catch (error) {
+			if (!pauseSquareChatAccess(
+				client,
+				target.chatMid,
+				error,
+				"message-log:auto-history",
+			)) {
+				throw error;
+			}
 		}
 	} finally {
 		finishHistoryJob(jobId);
