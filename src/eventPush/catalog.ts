@@ -86,6 +86,16 @@ export function eventDetailsFromCatalog(catalog: EventCatalog, eventId: number):
 	};
 }
 
+/** CSVに登録されたイベント名を部分一致で検索し、該当するIDを返す。 */
+export function eventIdsByName(catalog: EventCatalog, query: string): number[] {
+	const normalizedQuery = query.trim().toLowerCase();
+	if (!normalizedQuery) return [];
+	return [...catalog.names.entries()]
+		.filter(([, name]) => name.toLowerCase().includes(normalizedQuery))
+		.map(([eventId]) => eventId)
+		.sort((left, right) => left - right);
+}
+
 export function formatEventDetailsLines(
 	details: EventDetails,
 	now = new Date(),

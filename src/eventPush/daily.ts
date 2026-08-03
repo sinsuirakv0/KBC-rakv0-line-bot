@@ -130,7 +130,7 @@ export function formatDailyScheduleBody(
 		for (const { eventId, suffix } of [...rows.values()].sort((left, right) =>
 			left.eventId - right.eventId
 		)) {
-			lines.push(`${names.get(eventId) || "名称不明"} ${suffix}`);
+			lines.push(`${names.get(eventId) || eventId} ${suffix}`);
 		}
 	}
 	return lines.length > 0 ? lines.join("\n") : "予定なし";

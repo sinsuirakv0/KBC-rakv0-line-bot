@@ -2,6 +2,7 @@
 import { isExactInteger, sendError, sendLong } from "./shared.js";
 import {
 	eventDetailsFromCatalog,
+	eventIdsByName,
 	formatEventDetailsLines,
 	loadEventCatalog,
 } from "../eventPush/catalog.js";
@@ -20,6 +21,8 @@ function eventHelpText(): string {
 		"",
 		"!event <イベントID>",
 		"  イベント名、開催期間、次の開催日時を表示します。",
+		"!event <イベント名>",
+		"  CSVに登録されたイベント名を部分一致で検索します。",
 		"!event daily",
 		"  翌日24時間のイベント予定を表示します。",
 		"!event daily 7/11",
@@ -75,18 +78,42 @@ export const eventCommand: LineCommand = {
 				return;
 			}
 
-			if (!isExactInteger(action) || args.length > 1) {
-				await message.send("使い方: !event <イベントID> / !event daily [日付]");
-				return;
-			}
-			const eventId = Number.parseInt(action, 10);
 			const catalog = await loadEventCatalog();
-			const details = eventDetailsFromCatalog(catalog, eventId);
-			if (details.entries.length === 0) {
-				await sendError(message, `ID ${eventId} は通知対象の sale.json に存在しません`);
+			const query = args.join(" ").trim();
+			if (isExactInteger(action) && args.length === 1) {
+				const eventId = Number.parseInt(action, 10);
+				const details = eventDetailsFromCatalog(catalog, eventId);
+				if (details.entries.length === 0) {
+					await sendError(message, `ID ${eventId} はイベントスケジュールにデータが存在しません。`);
+					return;
+				}
+				await sendLong(message, formatEventDetailsLines(details).join("\n"));
 				return;
 			}
-			await sendLong(message, formatEventDetailsLines(details).join("\n"));
+
+			if (!query) {
+				await message.send("使い方: !event <イベントID|イベント名> / !event daily [日付]");
+				return;
+			}
+			const matchingIds = eventIdsByName(catalog, query);
+			const matchingDetails = matchingIds
+				.map((eventId) => eventDetailsFromCatalog(catalog, eventId))
+				.filter((details) => details.entries.length > 0);
+			if (matchingDetails.length === 0) {
+				if (matchingIds.length > 0) {
+					const ids = matchingIds.join(", ");
+					await sendError(message, `ID ${ids} はイベントスケジュールにデータが存在しません。`);
+					return;
+				}
+				await sendError(message, `「${query}」が見つかりませんでした\n名称未登録の可能性があります`);
+				return;
+			}
+			await sendLong(
+				message,
+				matchingDetails
+					.map((details) => formatEventDetailsLines(details).join("\n"))
+					.join("\n\n"),
+			);
 		} catch (error) {
 			console.error("[event] command failed", error);
 			await sendError(message, "イベントデータの取得または表示に失敗しました");
