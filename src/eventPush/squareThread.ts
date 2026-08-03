@@ -12,9 +12,13 @@ export interface SquareThreadDestination {
 	threadMid: string;
 }
 
+export interface SquareThreadSendOptions extends LineApiQueueRunOptions {
+	waitAfterRequest?: () => Promise<void>;
+}
+
 function threadQueueOptions(
 	chatMid: string,
-	options?: LineApiQueueRunOptions,
+	options?: SquareThreadSendOptions,
 ): LineApiQueueRunOptions {
 	return {
 		priority: options?.priority ?? "high",
@@ -90,7 +94,7 @@ export async function createSquareThreadWithRoot(
 	client: Client,
 	chatMid: string,
 	rootText: string,
-	options?: LineApiQueueRunOptions,
+	options?: SquareThreadSendOptions,
 ): Promise<SquareThreadDestination> {
 	const queueOptions = threadQueueOptions(chatMid, options);
 	const root = await lineApiQueue.run(
@@ -98,6 +102,7 @@ export async function createSquareThreadWithRoot(
 		() => client.base.square.sendMessage({ squareChatMid: chatMid, text: rootText }),
 		queueOptions,
 	);
+	await options?.waitAfterRequest?.();
 	const rootMessageId = messageIdFromSquareSendResult(root);
 	if (!rootMessageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
 	const response = await lineApiQueue.run(
@@ -107,6 +112,7 @@ export async function createSquareThreadWithRoot(
 		}),
 		queueOptions,
 	);
+	await options?.waitAfterRequest?.();
 	const threadMid = response.threadMid;
 	if (!threadMid) throw new Error("スレッドMIDを取得できませんでした");
 	try {
@@ -117,6 +123,8 @@ export async function createSquareThreadWithRoot(
 		);
 	} catch (error) {
 		console.warn("[push:event:daily] joinSquareThread failed; trying thread send anyway", error);
+	} finally {
+		await options?.waitAfterRequest?.();
 	}
 	return { chatMid, threadMid };
 }
@@ -125,7 +133,7 @@ export async function sendSquareThreadText(
 	client: Client,
 	destination: SquareThreadDestination,
 	text: string,
-	options?: LineApiQueueRunOptions,
+	options?: SquareThreadSendOptions,
 ): Promise<void> {
 	const queueOptions = threadQueueOptions(destination.chatMid, options);
 	for (const chunk of splitText(text)) {
@@ -148,6 +156,7 @@ export async function sendSquareThreadText(
 			}),
 			queueOptions,
 		);
+		await options?.waitAfterRequest?.();
 	}
 }
 
@@ -156,7 +165,7 @@ export async function sendSquareThreadWithRoot(
 	chatMid: string,
 	rootText: string,
 	bodyText: string,
-	options?: LineApiQueueRunOptions,
+	options?: SquareThreadSendOptions,
 ): Promise<void> {
 	const destination = await createSquareThreadWithRoot(client, chatMid, rootText, options);
 	await sendSquareThreadText(client, destination, bodyText, options);

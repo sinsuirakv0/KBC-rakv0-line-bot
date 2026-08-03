@@ -5,6 +5,10 @@ import { formatSquareEventDebugLog } from "../runtime/squareEventDebug.js";
 import { probeRecentSquareHistory } from "../runtime/squareHistoryProbe.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
 import { createSquareThreadWithRoot, sendSquareThreadText } from "../eventPush/squareThread.js";
+import {
+	scheduleUpdateDeliveryCoordinator,
+	waitScheduleUpdateSendInterval,
+} from "../scheduleUpdates/delivery.js";
 import { buildScheduleUpdatePreview } from "../scheduleUpdates/preview.js";
 
 const EVENT_REPO_TREE_API =
@@ -76,13 +80,24 @@ async function sendScheduleUpdatePreview(
 		message.client,
 		message.destination.chatMid,
 		testPreviewRootText(preview),
+		{ waitAfterRequest: waitScheduleUpdateSendInterval },
 	);
 	if (preview.sections.length === 0) {
-		await sendSquareThreadText(message.client, thread, "追加されたイベント\n\n追加は見つかりませんでした。");
+		await sendSquareThreadText(
+			message.client,
+			thread,
+			"追加されたイベント\n\n追加は見つかりませんでした。",
+			{ waitAfterRequest: waitScheduleUpdateSendInterval },
+		);
 	} else {
 		for (const [index, section] of preview.sections.entries()) {
 			const title = index === 0 ? "追加されたイベント\n\n" : "";
-			await sendSquareThreadText(message.client, thread, `${title}${section.text}`);
+			await sendSquareThreadText(
+				message.client,
+				thread,
+				`${title}${section.text}`,
+				{ waitAfterRequest: waitScheduleUpdateSendInterval },
+			);
 		}
 	}
 	await message.send(
@@ -120,7 +135,17 @@ export const testCommand: LineCommand = {
 				return;
 			}
 			try {
-				await sendScheduleUpdatePreview(message, unixText ? Number.parseInt(unixText, 10) : undefined);
+				const result = await scheduleUpdateDeliveryCoordinator.tryRunTest(
+					() => sendScheduleUpdatePreview(
+						message,
+						unixText ? Number.parseInt(unixText, 10) : undefined,
+					),
+				);
+				if (!result.accepted) {
+					await message.reply(
+						"スケジュール更新の通知または表示テストを処理中です。完了後にもう一度実行してください。",
+					);
+				}
 			} catch (error) {
 				const reason = error instanceof Error ? error.message : String(error);
 				console.error("[test-schedule-update] failed", error);

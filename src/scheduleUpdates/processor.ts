@@ -7,6 +7,10 @@ import { createSquareThreadWithRoot, sendSquareThreadText } from "../eventPush/s
 import { permissionStore } from "../permissions/store.js";
 import { lineApiNotificationScope, lineApiQueue } from "../runtime/lineApiQueue.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
+import {
+	scheduleUpdateDeliveryCoordinator,
+	waitScheduleUpdateSendInterval,
+} from "./delivery.js";
 import { fetchCurrentEventTsv } from "./ponos.js";
 import {
 	buildScheduleUpdatePreviewFromTsv,
@@ -103,14 +107,18 @@ async function sendTalkText(
 	target: { chatMid: string; encrypted: boolean },
 	text: string,
 ): Promise<void> {
-	await lineApiQueue.run(
-		"schedule-update-details:talk",
-		() => client.base.talk.sendMessage({ to: target.chatMid, text, e2ee: target.encrypted }),
-		{
-			priority: "critical",
-			scope: lineApiNotificationScope("talk", target.chatMid),
-		},
-	);
+	try {
+		await lineApiQueue.run(
+			"schedule-update-details:talk",
+			() => client.base.talk.sendMessage({ to: target.chatMid, text, e2ee: target.encrypted }),
+			{
+				priority: "critical",
+				scope: lineApiNotificationScope("talk", target.chatMid),
+			},
+		);
+	} finally {
+		await waitScheduleUpdateSendInterval();
+	}
 }
 
 async function deliverDetails(client: Client, preview: ScheduleUpdatePreview): Promise<number> {
@@ -124,6 +132,7 @@ async function deliverDetails(client: Client, preview: ScheduleUpdatePreview): P
 				const queueOptions = {
 					priority: "critical" as const,
 					scope: lineApiNotificationScope("square", target.chatMid),
+					waitAfterRequest: waitScheduleUpdateSendInterval,
 				};
 				const thread = await createSquareThreadWithRoot(
 					client,
@@ -141,6 +150,7 @@ async function deliverDetails(client: Client, preview: ScheduleUpdatePreview): P
 			sent++;
 		} catch (error) {
 			console.error(`[schedule-update] detail delivery failed: ${target.kind}:${target.chatMid}`, error);
+			await waitScheduleUpdateSendInterval();
 		}
 	}
 	return sent;
@@ -192,7 +202,9 @@ export function enqueueScheduleUpdateDetails(
 	const historyUnix = historyUnixFromRequest(request);
 	if (!historyUnix || isNearbyHandled(historyUnix)) return false;
 	activeHistoryUnix.add(historyUnix);
-	void processDetails(client, request, historyUnix)
+	void scheduleUpdateDeliveryCoordinator.runNotification(
+		() => processDetails(client, request, historyUnix),
+	)
 		.then(() => rememberCompleted(historyUnix))
 		.catch((error) => console.error("[schedule-update] detail processing failed", error))
 		.finally(() => activeHistoryUnix.delete(historyUnix));

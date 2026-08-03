@@ -142,6 +142,11 @@ export const appConfig = {
 		max: 120_000,
 		integer: true,
 	}),
+	scheduleUpdateSendIntervalMs: numberEnv("SCHEDULE_UPDATE_SEND_INTERVAL_MS", 500, {
+		min: 0,
+		max: 5_000,
+		integer: true,
+	}),
 	pushSubscriptionsFile: path.resolve(
 		process.env.PUSH_SUBSCRIPTIONS_FILE || "./storage/push-subscriptions.json",
 	),
