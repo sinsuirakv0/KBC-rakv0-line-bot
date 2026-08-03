@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { LineDestination } from "../commands/shared.js";
 import { appConfig } from "../config.js";
+import { DeferredSync } from "../storage/deferredSync.js";
 import { githubContentsClient } from "../storage/githubContents.js";
 
 export interface PushReminder {
@@ -63,6 +64,10 @@ class PushReminderStore {
 	private data: ReminderFile = structuredClone(EMPTY);
 	private githubSha: string | undefined;
 	private saveQueue: Promise<void> = Promise.resolve();
+	private readonly remoteSync = new DeferredSync({
+		label: "push-reminders",
+		operation: () => this.writeGithub(),
+	});
 
 	async initialize(): Promise<void> {
 		await fs.mkdir(path.dirname(appConfig.pushRemindersFile), { recursive: true });
@@ -131,15 +136,18 @@ class PushReminderStore {
 	private async save(): Promise<void> {
 		await this.enqueue(async () => {
 			await this.writeLocal();
-			if (githubContentsClient.enabled) {
-				this.githubSha = await githubContentsClient.write(
-					appConfig.pushRemindersGithubPath,
-					`${JSON.stringify(this.data, null, 2)}\n`,
-					"Update LINE push reminders",
-					this.githubSha,
-				);
-			}
 		});
+		this.remoteSync.schedule();
+	}
+
+	private async writeGithub(): Promise<void> {
+		if (!githubContentsClient.enabled) return;
+		this.githubSha = await githubContentsClient.write(
+			appConfig.pushRemindersGithubPath,
+			`${JSON.stringify(this.data, null, 2)}\n`,
+			"Update LINE push reminders",
+			this.githubSha,
+		);
 	}
 
 	private async enqueue(operation: () => Promise<void>): Promise<void> {

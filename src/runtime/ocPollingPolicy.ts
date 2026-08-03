@@ -33,7 +33,7 @@ export class OcPollingActivityTracker {
 		if (!squareMid || !Number.isFinite(at) || at <= 0) return;
 		const activity = this.getActivity(squareMid);
 		activity.messageTimes.push(at);
-		this.prune(activity, Date.now());
+		this.prune(activity, at);
 	}
 
 	recordCommand(squareMid: string, at = Date.now()): void {

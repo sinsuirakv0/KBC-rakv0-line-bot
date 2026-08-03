@@ -68,8 +68,10 @@ async function sendToTarget(
 	if (target.kind === "square") {
 		if (!await prepareSquareTargetBestEffort(client, target.chatMid)) return "unavailable";
 		try {
-			await lineApiQueue.run("event-push:square", () =>
-				client.base.square.sendMessage({ squareChatMid: target.chatMid, text })
+			await lineApiQueue.run(
+				"event-push:square",
+				() => client.base.square.sendMessage({ squareChatMid: target.chatMid, text }),
+				{ priority: "high", scope: `square:${target.chatMid}` },
 			);
 			markSquareChatAccessible(client, target.chatMid);
 		} catch (error) {
@@ -80,12 +82,14 @@ async function sendToTarget(
 		}
 		return "sent";
 	}
-	await lineApiQueue.run("event-push:talk", () =>
-		client.base.talk.sendMessage({
+	await lineApiQueue.run(
+		"event-push:talk",
+		() => client.base.talk.sendMessage({
 			to: target.chatMid,
 			text,
 			e2ee: target.encrypted,
-		})
+		}),
+		{ priority: "high", scope: `talk:${target.chatMid}` },
 	);
 	return "sent";
 }
@@ -113,6 +117,22 @@ function notificationLine(
 	if (phase === "before-start") return `${eventId} ${name}の開催${minutesBeforeStart}分前です`;
 	if (phase === "end-10m") return `${eventId} ${name}の終了10分前です`;
 	return `${eventId} ${name} <${formatEventDuration(durationMs)}>`;
+}
+
+function warnNotificationDelay(
+	target: EventPushSubscription,
+	kind: string,
+	scheduledAt: Date,
+	checkedAt: Date,
+): void {
+	const delayMs = checkedAt.getTime() - scheduledAt.getTime();
+	if (delayMs < 60_000) return;
+	console.warn("[push:event] delayed notification detected", {
+		target: `${target.kind}:${target.chatMid}`,
+		kind,
+		scheduledAt: scheduledAt.toISOString(),
+		delayMs,
+	});
 }
 
 export async function checkEventStarts(client: Client, now: Date): Promise<void> {
@@ -163,6 +183,7 @@ export async function checkEventStarts(client: Client, now: Date): Promise<void>
 				)
 			).join("\n");
 			try {
+				warnNotificationDelay(target, notification.phase, notification.notifyAt, now);
 				const result = await sendToTarget(client, target, text);
 				if (result !== "sent") continue;
 				for (const { eventId } of matchingEvents) {
@@ -193,6 +214,7 @@ export async function checkEventStarts(client: Client, now: Date): Promise<void>
 			const key = `${target.kind}:${target.chatMid}|daily|${dailyDelivery.dateKey}`;
 			if (eventPushStore.hasNotified(key) || permissionStore.isBotStopped(target)) continue;
 			try {
+				warnNotificationDelay(target, "daily", dailyDelivery.dueAt, now);
 				if (!await prepareSquareTargetBestEffort(client, target.chatMid)) continue;
 				await sendSquareThreadWithRoot(client, target.chatMid, rootText, bodyText);
 				markSquareChatAccessible(client, target.chatMid);
@@ -237,11 +259,19 @@ export function startEventPushScheduler(
 		const client = getClient();
 		if (!client) return;
 		running = true;
+		const startedAt = Date.now();
 		try {
 			await check(client, new Date());
 		} catch (error) {
 			console.error("[push:event] scheduler check failed", error);
 		} finally {
+			const elapsedMs = Date.now() - startedAt;
+			if (elapsedMs >= Math.max(30_000, intervalMs * 2)) {
+				console.warn("[push:event] scheduler check was slow", {
+					elapsedMs,
+					intervalMs,
+				});
+			}
 			running = false;
 			if (rerunRequested && !signal.aborted) {
 				rerunRequested = false;

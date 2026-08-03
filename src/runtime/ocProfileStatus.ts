@@ -198,7 +198,7 @@ export class OcProfileStatusManager {
 						},
 					},
 				} as never),
-				{ priority: "high" },
+				{ priority: "normal", scope: `profile:${squareMid}` },
 			);
 			const updated = (response as unknown as { squareMember?: SquareMemberRecord }).squareMember;
 			this.members.set(squareMid, updated ?? { ...member, displayName });

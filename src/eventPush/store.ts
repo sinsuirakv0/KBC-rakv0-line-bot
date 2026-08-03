@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { LineDestination } from "../commands/shared.js";
 import { appConfig } from "../config.js";
+import { DeferredSync } from "../storage/deferredSync.js";
 import { githubContentsClient } from "../storage/githubContents.js";
 
 export interface EventPushSubscription {
@@ -94,6 +95,10 @@ class EventPushStore {
 	private subscriptionsSha: string | undefined;
 	private stateSha: string | undefined;
 	private saveQueue: Promise<void> = Promise.resolve();
+	private readonly stateRemoteSync = new DeferredSync({
+		label: "event-push-state",
+		operation: () => this.writeStateGithub(),
+	});
 
 	async initialize(): Promise<void> {
 		await Promise.all([
@@ -227,7 +232,8 @@ class EventPushStore {
 		if (additions.length === 0) return;
 		this.state.notifiedKeys.push(...additions);
 		this.state.notifiedKeys = this.state.notifiedKeys.slice(-5_000);
-		await this.saveState();
+		await this.writeLocal(appConfig.eventPushStateFile, this.state);
+		this.stateRemoteSync.schedule();
 	}
 
 	private async upsert(
@@ -314,18 +320,14 @@ class EventPushStore {
 		});
 	}
 
-	private async saveState(): Promise<void> {
-		await this.enqueue(async () => {
-			await this.writeLocal(appConfig.eventPushStateFile, this.state);
-			if (githubContentsClient.enabled) {
-				this.stateSha = await githubContentsClient.write(
-					appConfig.eventPushStateGithubPath,
-					`${JSON.stringify(this.state, null, 2)}\n`,
-					"Update LINE event-start notification state",
-					this.stateSha,
-				);
-			}
-		});
+	private async writeStateGithub(): Promise<void> {
+		if (!githubContentsClient.enabled) return;
+		this.stateSha = await githubContentsClient.write(
+			appConfig.eventPushStateGithubPath,
+			`${JSON.stringify(this.state, null, 2)}\n`,
+			"Update LINE event-start notification state",
+			this.stateSha,
+		);
 	}
 
 	private async enqueue(operation: () => Promise<void>): Promise<void> {

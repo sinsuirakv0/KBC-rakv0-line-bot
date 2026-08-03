@@ -29,22 +29,26 @@ async function sendReminder(client: Client, reminder: PushReminder): Promise<"se
 	if (permissionStore.isBotStopped(reminder)) return "stopped";
 	const { text, contentMetadata } = reminderMessage(reminder);
 	if (reminder.kind === "square") {
-		await lineApiQueue.run("reminder:square", () =>
-			client.base.square.sendMessage({
+		await lineApiQueue.run(
+			"reminder:square",
+			() => client.base.square.sendMessage({
 				squareChatMid: reminder.chatMid,
 				text,
 				contentMetadata,
-			})
+			}),
+			{ priority: "high", scope: `square:${reminder.chatMid}` },
 		);
 		return "sent";
 	}
-	await lineApiQueue.run("reminder:talk", () =>
-		client.base.talk.sendMessage({
+	await lineApiQueue.run(
+		"reminder:talk",
+		() => client.base.talk.sendMessage({
 			to: reminder.chatMid,
 			text,
 			contentMetadata,
 			e2ee: reminder.encrypted,
-		})
+		}),
+		{ priority: "high", scope: `talk:${reminder.chatMid}` },
 	);
 	return "sent";
 }

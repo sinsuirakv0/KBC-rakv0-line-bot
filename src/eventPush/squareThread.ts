@@ -74,8 +74,10 @@ export async function sendSquareThreadWithRoot(
 	rootText: string,
 	bodyText: string,
 ): Promise<void> {
-	const root = await lineApiQueue.run("event-push:thread-root", () =>
-		client.base.square.sendMessage({ squareChatMid: chatMid, text: rootText })
+	const root = await lineApiQueue.run(
+		"event-push:thread-root",
+		() => client.base.square.sendMessage({ squareChatMid: chatMid, text: rootText }),
+		{ priority: "high", scope: `square:${chatMid}` },
 	);
 	const rootMessageId = messageIdFromSquareSendResult(root);
 	if (!rootMessageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
@@ -90,8 +92,9 @@ export async function sendSquareThreadWithRoot(
 		console.warn("[push:event:daily] joinSquareThread failed; trying thread send anyway", error);
 	}
 	for (const text of splitText(bodyText)) {
-		await lineApiQueue.run("event-push:thread-text", async () =>
-			client.base.square.sendSquareThreadMessage({
+		await lineApiQueue.run(
+			"event-push:thread-text",
+			async () => client.base.square.sendSquareThreadMessage({
 				request: {
 					reqSeq: await client.base.getReqseq("sq"),
 					chatMid,
@@ -105,7 +108,8 @@ export async function sendSquareThreadWithRoot(
 						},
 					},
 				},
-			})
+			}),
+			{ priority: "high", scope: `square:${chatMid}` },
 		);
 	}
 }

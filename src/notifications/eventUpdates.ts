@@ -88,16 +88,20 @@ export async function notifyScheduleUpdate(
 				continue;
 			}
 			if (target.kind === "square") {
-				await lineApiQueue.run("event-update:square", () =>
-					client.base.square.sendMessage({ squareChatMid: target.chatMid, text })
+				await lineApiQueue.run(
+					"event-update:square",
+					() => client.base.square.sendMessage({ squareChatMid: target.chatMid, text }),
+					{ priority: "high", scope: `square:${target.chatMid}` },
 				);
 			} else {
-				await lineApiQueue.run("event-update:talk", () =>
-					client.base.talk.sendMessage({
+				await lineApiQueue.run(
+					"event-update:talk",
+					() => client.base.talk.sendMessage({
 						to: target.chatMid,
 						text,
 						e2ee: target.encrypted,
-					})
+					}),
+					{ priority: "high", scope: `talk:${target.chatMid}` },
 				);
 			}
 			sent++;
