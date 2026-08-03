@@ -96,6 +96,9 @@ async function statusText(destination: LineDestination): Promise<string> {
 
 export const pushCommand: LineCommand = {
 	name: "push",
+	policy: {
+		priority: "high",
+	},
 	async execute({ message, args }) {
 		const action = args[0]?.toLowerCase();
 		if (action === "help") {

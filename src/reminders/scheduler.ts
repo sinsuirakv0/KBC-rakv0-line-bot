@@ -1,7 +1,7 @@
-import type { Client } from "@evex/linejs";
+﻿import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
 import { permissionStore } from "../permissions/store.js";
-import { lineApiQueue } from "../runtime/lineApiQueue.js";
+import { lineApiNotificationScope, lineApiQueue } from "../runtime/lineApiQueue.js";
 import { pushReminderStore, type PushReminder } from "./store.js";
 
 function mentionLabel(reminder: PushReminder): string {
@@ -36,7 +36,10 @@ async function sendReminder(client: Client, reminder: PushReminder): Promise<"se
 				text,
 				contentMetadata,
 			}),
-			{ priority: "high", scope: `square:${reminder.chatMid}` },
+			{
+				priority: "critical",
+				scope: lineApiNotificationScope("square", reminder.chatMid),
+			},
 		);
 		return "sent";
 	}
@@ -48,7 +51,10 @@ async function sendReminder(client: Client, reminder: PushReminder): Promise<"se
 			contentMetadata,
 			e2ee: reminder.encrypted,
 		}),
-		{ priority: "high", scope: `talk:${reminder.chatMid}` },
+		{
+			priority: "critical",
+			scope: lineApiNotificationScope("talk", reminder.chatMid),
+		},
 	);
 	return "sent";
 }

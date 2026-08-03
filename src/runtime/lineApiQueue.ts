@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { appConfig } from "../config.js";
 
-export type LineApiPriority = "high" | "normal";
+export type LineApiPriority = "critical" | "high" | "normal";
 
 export interface LineApiQueueRunOptions {
 	priority?: LineApiPriority;
@@ -19,6 +19,7 @@ interface QueuedLineApiTask {
 }
 
 interface LineApiScopeQueue {
+	critical: QueuedLineApiTask[];
 	high: QueuedLineApiTask[];
 	normal: QueuedLineApiTask[];
 	active?: QueuedLineApiTask;
@@ -31,6 +32,7 @@ export interface LineApiQueueSnapshot {
 	activeCount: number;
 	maxConcurrent: number;
 	oldestActiveMs: number;
+	pendingCritical: number;
 	pendingHigh: number;
 	pendingNormal: number;
 }
@@ -42,7 +44,17 @@ export class LineApiQueueFullError extends Error {
 	}
 }
 
-class LineApiQueue {
+const priorityRank: Record<LineApiPriority, number> = {
+	critical: 0,
+	high: 1,
+	normal: 2,
+};
+
+export function lineApiNotificationScope(kind: "square" | "talk", chatMid: string): string {
+	return `notification:${kind}:${chatMid}`;
+}
+
+export class LineApiQueue {
 	private readonly priorityContext = new AsyncLocalStorage<LineApiPriority>();
 	private readonly scopes = new Map<string, LineApiScopeQueue>();
 	private activeCount = 0;
@@ -59,13 +71,20 @@ class LineApiQueue {
 	): Promise<T> {
 		const resolved = this.resolveOptions(options);
 		const pending = this.pendingCount();
+		const queueLimit = appConfig.lineApiQueueLimit;
+		const criticalReserve = Math.min(
+			queueLimit - 1,
+			appConfig.lineApiCriticalPriorityReserve,
+		);
 		const highReserve = Math.min(
-			appConfig.lineApiQueueLimit - 1,
+			Math.max(0, queueLimit - criticalReserve - 1),
 			appConfig.lineApiHighPriorityReserve,
 		);
-		const acceptedLimit = resolved.priority === "high"
-			? appConfig.lineApiQueueLimit
-			: appConfig.lineApiQueueLimit - highReserve;
+		const acceptedLimit = resolved.priority === "critical"
+			? queueLimit
+			: resolved.priority === "high"
+				? queueLimit - criticalReserve
+				: queueLimit - criticalReserve - highReserve;
 		if (pending >= acceptedLimit) throw new LineApiQueueFullError(pending);
 
 		return new Promise<T>((resolve, reject) => {
@@ -79,7 +98,8 @@ class LineApiQueue {
 				reject,
 			};
 			const queue = this.scopeQueue(resolved.scope);
-			if (task.priority === "high") queue.high.push(task);
+			if (task.priority === "critical") queue.critical.push(task);
+			else if (task.priority === "high") queue.high.push(task);
 			else queue.normal.push(task);
 			this.drain();
 		});
@@ -96,6 +116,7 @@ class LineApiQueue {
 			activeCount: this.activeCount,
 			maxConcurrent: appConfig.lineApiMaxConcurrent,
 			oldestActiveMs: active.length === 0 ? 0 : Math.max(0, now - active[0].activeStartedAt),
+			pendingCritical: this.pendingCount("critical"),
 			pendingHigh: this.pendingCount("high"),
 			pendingNormal: this.pendingCount("normal"),
 		};
@@ -114,7 +135,7 @@ class LineApiQueue {
 	private scopeQueue(scope: string): LineApiScopeQueue {
 		let queue = this.scopes.get(scope);
 		if (!queue) {
-			queue = { high: [], normal: [], availableAt: 0 };
+			queue = { critical: [], high: [], normal: [], availableAt: 0 };
 			this.scopes.set(scope, queue);
 		}
 		return queue;
@@ -123,6 +144,7 @@ class LineApiQueue {
 	private pendingCount(priority?: LineApiPriority): number {
 		let count = 0;
 		for (const queue of this.scopes.values()) {
+			if (!priority || priority === "critical") count += queue.critical.length;
 			if (!priority || priority === "high") count += queue.high.length;
 			if (!priority || priority === "normal") count += queue.normal.length;
 		}
@@ -133,6 +155,13 @@ class LineApiQueue {
 		while (this.activeCount < appConfig.lineApiMaxConcurrent) {
 			const selected = this.nextTask(Date.now());
 			if (!selected) return;
+			const criticalReserve = Math.min(
+				Math.max(0, appConfig.lineApiMaxConcurrent - 1),
+				appConfig.lineApiCriticalConcurrencyReserve,
+			);
+			const ordinaryLimit = appConfig.lineApiMaxConcurrent - criticalReserve;
+			if (selected.task.priority !== "critical" && this.activeCount >= ordinaryLimit) return;
+			this.dequeue(selected.queue, selected.task.priority);
 			this.start(selected.queue, selected.task);
 		}
 	}
@@ -141,20 +170,23 @@ class LineApiQueue {
 		let selected: { queue: LineApiScopeQueue; task: QueuedLineApiTask } | undefined;
 		for (const queue of this.scopes.values()) {
 			if (queue.active || queue.availableAt > now) continue;
-			const task = queue.high[0] ?? queue.normal[0];
+			const task = queue.critical[0] ?? queue.high[0] ?? queue.normal[0];
 			if (!task) continue;
 			if (
 				!selected ||
-				(task.priority === "high" && selected.task.priority !== "high") ||
+				priorityRank[task.priority] < priorityRank[selected.task.priority] ||
 				(task.priority === selected.task.priority && task.sequence < selected.task.sequence)
 			) {
 				selected = { queue, task };
 			}
 		}
-		if (!selected) return undefined;
-		if (selected.task.priority === "high") selected.queue.high.shift();
-		else selected.queue.normal.shift();
 		return selected;
+	}
+
+	private dequeue(queue: LineApiScopeQueue, priority: LineApiPriority): void {
+		if (priority === "critical") queue.critical.shift();
+		else if (priority === "high") queue.high.shift();
+		else queue.normal.shift();
 	}
 
 	private start(queue: LineApiScopeQueue, task: QueuedLineApiTask): void {
@@ -205,7 +237,13 @@ class LineApiQueue {
 	private cleanupScopes(): void {
 		const now = Date.now();
 		for (const [scope, queue] of this.scopes) {
-			if (!queue.active && queue.high.length === 0 && queue.normal.length === 0 && queue.availableAt <= now) {
+			if (
+				!queue.active &&
+				queue.critical.length === 0 &&
+				queue.high.length === 0 &&
+				queue.normal.length === 0 &&
+				queue.availableAt <= now
+			) {
 				this.scopes.delete(scope);
 			}
 		}

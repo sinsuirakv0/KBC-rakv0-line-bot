@@ -92,6 +92,11 @@ export const appConfig = {
 		integer: true,
 	}),
 	lineApiQueueLimit: numberEnv("LINE_API_QUEUE_LIMIT", 100, { min: 20, max: 500, integer: true }),
+	lineApiCriticalPriorityReserve: numberEnv("LINE_API_CRITICAL_PRIORITY_RESERVE", 10, {
+		min: 1,
+		max: 100,
+		integer: true,
+	}),
 	lineApiHighPriorityReserve: numberEnv("LINE_API_HIGH_PRIORITY_RESERVE", 20, {
 		min: 1,
 		max: 100,
@@ -105,6 +110,11 @@ export const appConfig = {
 	lineApiMaxConcurrent: numberEnv("LINE_API_MAX_CONCURRENT", 2, {
 		min: 1,
 		max: 4,
+		integer: true,
+	}),
+	lineApiCriticalConcurrencyReserve: numberEnv("LINE_API_CRITICAL_CONCURRENCY_RESERVE", 1, {
+		min: 0,
+		max: 3,
 		integer: true,
 	}),
 	lineApiStallWarnMs: numberEnv("LINE_API_STALL_WARN_MS", 15_000, {

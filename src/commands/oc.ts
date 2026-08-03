@@ -19,7 +19,7 @@ import {
 	permissionStore,
 	targetFromDestination,
 } from "../permissions/store.js";
-import { lineApiQueue } from "../runtime/lineApiQueue.js";
+import { lineApiNotificationScope, lineApiQueue } from "../runtime/lineApiQueue.js";
 import { argValue } from "./permissionArgs.js";
 import { sendLong, type LineCommand, type ReplyableLineMessage } from "./shared.js";
 
@@ -1903,7 +1903,11 @@ async function sendKickSummaryToModRoom(
 			message.client.base.square.sendMessage({
 				squareChatMid: modRoomChatMid,
 				text: lines.join("\n"),
-			})
+			}),
+			{
+				priority: "critical",
+				scope: lineApiNotificationScope("square", modRoomChatMid),
+			},
 		);
 	} catch (error) {
 		console.warn("[oc] kick mod room log send failed", {

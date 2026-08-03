@@ -1,7 +1,7 @@
 ﻿import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
 import { permissionStore } from "../permissions/store.js";
-import { lineApiQueue } from "../runtime/lineApiQueue.js";
+import { lineApiNotificationScope, lineApiQueue } from "../runtime/lineApiQueue.js";
 import {
 	isSquareChatAccessPaused,
 	markSquareChatAccessible,
@@ -71,7 +71,10 @@ async function sendToTarget(
 			await lineApiQueue.run(
 				"event-push:square",
 				() => client.base.square.sendMessage({ squareChatMid: target.chatMid, text }),
-				{ priority: "high", scope: `square:${target.chatMid}` },
+				{
+					priority: "critical",
+					scope: lineApiNotificationScope("square", target.chatMid),
+				},
 			);
 			markSquareChatAccessible(client, target.chatMid);
 		} catch (error) {
@@ -89,7 +92,10 @@ async function sendToTarget(
 			text,
 			e2ee: target.encrypted,
 		}),
-		{ priority: "high", scope: `talk:${target.chatMid}` },
+		{
+			priority: "critical",
+			scope: lineApiNotificationScope("talk", target.chatMid),
+		},
 	);
 	return "sent";
 }
@@ -216,7 +222,16 @@ export async function checkEventStarts(client: Client, now: Date): Promise<void>
 			try {
 				warnNotificationDelay(target, "daily", dailyDelivery.dueAt, now);
 				if (!await prepareSquareTargetBestEffort(client, target.chatMid)) continue;
-				await sendSquareThreadWithRoot(client, target.chatMid, rootText, bodyText);
+				await sendSquareThreadWithRoot(
+					client,
+					target.chatMid,
+					rootText,
+					bodyText,
+					{
+						priority: "critical",
+						scope: lineApiNotificationScope("square", target.chatMid),
+					},
+				);
 				markSquareChatAccessible(client, target.chatMid);
 				deliveredKeys.push(key);
 			} catch (error) {

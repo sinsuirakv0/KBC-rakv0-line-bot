@@ -1,6 +1,6 @@
 ﻿import type { Client } from "@evex/linejs";
 import { permissionStore } from "../permissions/store.js";
-import { lineApiQueue } from "../runtime/lineApiQueue.js";
+import { lineApiNotificationScope, lineApiQueue } from "../runtime/lineApiQueue.js";
 import { enqueueScheduleUpdateDetails } from "../scheduleUpdates/processor.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
 
@@ -104,7 +104,10 @@ async function deliverText(
 				await lineApiQueue.run(
 					"event-update:square",
 					() => client.base.square.sendMessage({ squareChatMid: target.chatMid, text }),
-					{ priority: "high", scope: `square:${target.chatMid}` },
+					{
+						priority: "critical",
+						scope: lineApiNotificationScope("square", target.chatMid),
+					},
 				);
 			} else {
 				await lineApiQueue.run(
@@ -114,7 +117,10 @@ async function deliverText(
 						text,
 						e2ee: target.encrypted,
 					}),
-					{ priority: "high", scope: `talk:${target.chatMid}` },
+					{
+						priority: "critical",
+						scope: lineApiNotificationScope("talk", target.chatMid),
+					},
 				);
 			}
 			sent++;

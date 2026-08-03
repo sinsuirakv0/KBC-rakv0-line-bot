@@ -1,12 +1,25 @@
 ﻿import type { Client } from "@evex/linejs";
 
-import { lineApiQueue } from "../runtime/lineApiQueue.js";
+import {
+	lineApiQueue,
+	type LineApiQueueRunOptions,
+} from "../runtime/lineApiQueue.js";
 
 const MAX_MESSAGE_LENGTH = 1_600;
 
 export interface SquareThreadDestination {
 	chatMid: string;
 	threadMid: string;
+}
+
+function threadQueueOptions(
+	chatMid: string,
+	options?: LineApiQueueRunOptions,
+): LineApiQueueRunOptions {
+	return {
+		priority: options?.priority ?? "high",
+		scope: options?.scope ?? `square:${chatMid}`,
+	};
 }
 
 function messageIdFromSquareSendResult(value: unknown): string | undefined {
@@ -77,21 +90,31 @@ export async function createSquareThreadWithRoot(
 	client: Client,
 	chatMid: string,
 	rootText: string,
+	options?: LineApiQueueRunOptions,
 ): Promise<SquareThreadDestination> {
+	const queueOptions = threadQueueOptions(chatMid, options);
 	const root = await lineApiQueue.run(
 		"event-push:thread-root",
 		() => client.base.square.sendMessage({ squareChatMid: chatMid, text: rootText }),
-		{ priority: "high", scope: `square:${chatMid}` },
+		queueOptions,
 	);
 	const rootMessageId = messageIdFromSquareSendResult(root);
 	if (!rootMessageId) throw new Error("スレッド親メッセージIDを取得できませんでした");
-	const response = await client.base.square.getSquareThreadMid({
-		request: { chatMid, messageId: rootMessageId },
-	});
+	const response = await lineApiQueue.run(
+		"event-push:get-thread",
+		() => client.base.square.getSquareThreadMid({
+			request: { chatMid, messageId: rootMessageId },
+		}),
+		queueOptions,
+	);
 	const threadMid = response.threadMid;
 	if (!threadMid) throw new Error("スレッドMIDを取得できませんでした");
 	try {
-		await client.base.square.joinSquareThread({ request: { chatMid, threadMid } });
+		await lineApiQueue.run(
+			"event-push:join-thread",
+			() => client.base.square.joinSquareThread({ request: { chatMid, threadMid } }),
+			queueOptions,
+		);
 	} catch (error) {
 		console.warn("[push:event:daily] joinSquareThread failed; trying thread send anyway", error);
 	}
@@ -102,7 +125,9 @@ export async function sendSquareThreadText(
 	client: Client,
 	destination: SquareThreadDestination,
 	text: string,
+	options?: LineApiQueueRunOptions,
 ): Promise<void> {
+	const queueOptions = threadQueueOptions(destination.chatMid, options);
 	for (const chunk of splitText(text)) {
 		await lineApiQueue.run(
 			"event-push:thread-text",
@@ -121,7 +146,7 @@ export async function sendSquareThreadText(
 					},
 				},
 			}),
-			{ priority: "high", scope: `square:${destination.chatMid}` },
+			queueOptions,
 		);
 	}
 }
@@ -131,7 +156,8 @@ export async function sendSquareThreadWithRoot(
 	chatMid: string,
 	rootText: string,
 	bodyText: string,
+	options?: LineApiQueueRunOptions,
 ): Promise<void> {
-	const destination = await createSquareThreadWithRoot(client, chatMid, rootText);
-	await sendSquareThreadText(client, destination, bodyText);
+	const destination = await createSquareThreadWithRoot(client, chatMid, rootText, options);
+	await sendSquareThreadText(client, destination, bodyText, options);
 }

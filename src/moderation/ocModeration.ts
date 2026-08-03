@@ -14,7 +14,7 @@ import {
 	type OcModerationCaseType,
 } from "./ocModerationCases.js";
 import { permissionStore, targetFromDestination, type PermissionTarget } from "../permissions/store.js";
-import { lineApiQueue } from "../runtime/lineApiQueue.js";
+import { lineApiNotificationScope, lineApiQueue } from "../runtime/lineApiQueue.js";
 import { ocModerationSettingsStore } from "./ocModerationSettings.js";
 import {
 	blockedOcUrlComponent,
@@ -758,7 +758,10 @@ async function sendMentionNotice(message: OpenChatModerationMessage, notice: str
 				text,
 				contentMetadata: mentionMetadata(0, prefix.length, message.senderMid),
 			}),
-			"high",
+			{
+				priority: "critical",
+				scope: lineApiNotificationScope("square", message.squareChatMid),
+			},
 		);
 	} catch (error) {
 		console.warn("[oc-moderation] notice send failed", error);
@@ -772,7 +775,10 @@ async function sendPlainNotice(message: OpenChatModerationMessage, notice: strin
 				squareChatMid: message.squareChatMid,
 				text: notice,
 			}),
-			"high",
+			{
+				priority: "critical",
+				scope: lineApiNotificationScope("square", message.squareChatMid),
+			},
 		);
 	} catch (error) {
 		console.warn("[oc-moderation] notice send failed", error);
@@ -838,7 +844,10 @@ async function sendModRoomLog(
 				squareChatMid: modRoomChatMid,
 				text,
 			}),
-			"high",
+			{
+				priority: "critical",
+				scope: lineApiNotificationScope("square", modRoomChatMid),
+			},
 		);
 		const messageId = squareSendMessageId(sent);
 		if (caseId && messageId) {
@@ -1105,7 +1114,10 @@ async function sendLeftSoonMainNotice(
 					`参加時間: ${formatParticipationDuration(info.stayMs)}`,
 				].join("\n"),
 			}),
-			"high",
+			{
+				priority: "critical",
+				scope: lineApiNotificationScope("square", squareChatMid),
+			},
 		);
 	} catch (error) {
 		console.warn("[oc-left-soon] automatic ban notice send failed", {
@@ -1144,7 +1156,10 @@ async function sendDangerWordMainNotice(
 				squareChatMid: message.squareChatMid,
 				text,
 			}),
-			"high",
+			{
+				priority: "critical",
+				scope: lineApiNotificationScope("square", message.squareChatMid),
+			},
 		);
 	} catch (error) {
 		console.warn("[oc-moderation] danger word main notice failed", error);

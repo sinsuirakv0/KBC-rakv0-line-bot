@@ -5,7 +5,7 @@ import type { Client } from "@evex/linejs";
 import { appConfig } from "../config.js";
 import { createSquareThreadWithRoot, sendSquareThreadText } from "../eventPush/squareThread.js";
 import { permissionStore } from "../permissions/store.js";
-import { lineApiQueue } from "../runtime/lineApiQueue.js";
+import { lineApiNotificationScope, lineApiQueue } from "../runtime/lineApiQueue.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
 import { fetchCurrentEventTsv } from "./ponos.js";
 import {
@@ -106,7 +106,10 @@ async function sendTalkText(
 	await lineApiQueue.run(
 		"schedule-update-details:talk",
 		() => client.base.talk.sendMessage({ to: target.chatMid, text, e2ee: target.encrypted }),
-		{ priority: "high", scope: `talk:${target.chatMid}` },
+		{
+			priority: "critical",
+			scope: lineApiNotificationScope("talk", target.chatMid),
+		},
 	);
 }
 
@@ -118,8 +121,19 @@ async function deliverDetails(client: Client, preview: ScheduleUpdatePreview): P
 		if (permissionStore.isBotStopped(target)) continue;
 		try {
 			if (target.kind === "square") {
-				const thread = await createSquareThreadWithRoot(client, target.chatMid, rootText);
-				for (const message of messages) await sendSquareThreadText(client, thread, message);
+				const queueOptions = {
+					priority: "critical" as const,
+					scope: lineApiNotificationScope("square", target.chatMid),
+				};
+				const thread = await createSquareThreadWithRoot(
+					client,
+					target.chatMid,
+					rootText,
+					queueOptions,
+				);
+				for (const message of messages) {
+					await sendSquareThreadText(client, thread, message, queueOptions);
+				}
 			} else {
 				await sendTalkText(client, target, rootText);
 				for (const message of messages) await sendTalkText(client, target, message);

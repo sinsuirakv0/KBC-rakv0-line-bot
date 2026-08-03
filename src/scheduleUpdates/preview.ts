@@ -331,7 +331,7 @@ function addedRows<T extends { raw: string }>(current: T[], previous: T[]): T[] 
 }
 
 function isDisplayable(header: EventHeader, referenceAt: Date): boolean {
-	if (header.endDate === "20300101") return false;
+	if (header.endDate === "20300101") return true;
 	return parseDate(header.endDate, header.endTime) > referenceAt;
 }
 
