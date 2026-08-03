@@ -4,6 +4,11 @@ import { lineApiQueue } from "../runtime/lineApiQueue.js";
 
 const MAX_MESSAGE_LENGTH = 1_600;
 
+export interface SquareThreadDestination {
+	chatMid: string;
+	threadMid: string;
+}
+
 function messageIdFromSquareSendResult(value: unknown): string | undefined {
 	const result = value as {
 		createdSquareMessage?: { message?: { id?: string } };
@@ -68,12 +73,11 @@ function splitText(text: string): string[] {
 	return chunks;
 }
 
-export async function sendSquareThreadWithRoot(
+export async function createSquareThreadWithRoot(
 	client: Client,
 	chatMid: string,
 	rootText: string,
-	bodyText: string,
-): Promise<void> {
+): Promise<SquareThreadDestination> {
 	const root = await lineApiQueue.run(
 		"event-push:thread-root",
 		() => client.base.square.sendMessage({ squareChatMid: chatMid, text: rootText }),
@@ -91,25 +95,43 @@ export async function sendSquareThreadWithRoot(
 	} catch (error) {
 		console.warn("[push:event:daily] joinSquareThread failed; trying thread send anyway", error);
 	}
-	for (const text of splitText(bodyText)) {
+	return { chatMid, threadMid };
+}
+
+export async function sendSquareThreadText(
+	client: Client,
+	destination: SquareThreadDestination,
+	text: string,
+): Promise<void> {
+	for (const chunk of splitText(text)) {
 		await lineApiQueue.run(
 			"event-push:thread-text",
 			async () => client.base.square.sendSquareThreadMessage({
 				request: {
 					reqSeq: await client.base.getReqseq("sq"),
-					chatMid,
-					threadMid,
+					chatMid: destination.chatMid,
+					threadMid: destination.threadMid,
 					threadMessage: {
 						message: {
-							to: threadMid,
-							text,
+							to: destination.threadMid,
+							text: chunk,
 							contentType: "NONE",
 							toType: "SQUARE_THREAD",
 						},
 					},
 				},
 			}),
-			{ priority: "high", scope: `square:${chatMid}` },
+			{ priority: "high", scope: `square:${destination.chatMid}` },
 		);
 	}
+}
+
+export async function sendSquareThreadWithRoot(
+	client: Client,
+	chatMid: string,
+	rootText: string,
+	bodyText: string,
+): Promise<void> {
+	const destination = await createSquareThreadWithRoot(client, chatMid, rootText);
+	await sendSquareThreadText(client, destination, bodyText);
 }

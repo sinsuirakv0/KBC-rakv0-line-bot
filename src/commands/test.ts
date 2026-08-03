@@ -4,6 +4,8 @@ import { notifyScheduleUpdate } from "../notifications/eventUpdates.js";
 import { formatSquareEventDebugLog } from "../runtime/squareEventDebug.js";
 import { probeRecentSquareHistory } from "../runtime/squareHistoryProbe.js";
 import { pushSubscriptionStore } from "../subscriptions/store.js";
+import { createSquareThreadWithRoot, sendSquareThreadText } from "../eventPush/squareThread.js";
+import { buildScheduleUpdatePreview } from "../scheduleUpdates/preview.js";
 
 const EVENT_REPO_TREE_API =
 	"https://api.github.com/repos/sinsuirakv0/KBC-rakv0-event/git/trees/main?recursive=1";
@@ -50,6 +52,44 @@ function buildHistoryUrl(unix: number): string {
 	return url.toString();
 }
 
+function testPreviewRootText(preview: Awaited<ReturnType<typeof buildScheduleUpdatePreview>>): string {
+	return [
+		"【テスト】スケジュール更新詳細",
+		`種類: ${preview.sourceTypes.join(", ") || "なし"}`,
+		"更新内容をスレッドに送信します",
+		preview.historyUrl,
+	].join("\n");
+}
+
+async function sendScheduleUpdatePreview(
+	message: Parameters<LineCommand["execute"]>[0]["message"],
+	requestedUnix?: number,
+): Promise<void> {
+	if (message.destination.kind !== "square") {
+		await message.reply("この表示テストはスレッドを作成できるOpenChat内で実行してください。");
+		return;
+	}
+
+	await message.reply("履歴TSVを取得・変換して、追加イベントを準備しています...");
+	const preview = await buildScheduleUpdatePreview(requestedUnix);
+	const thread = await createSquareThreadWithRoot(
+		message.client,
+		message.destination.chatMid,
+		testPreviewRootText(preview),
+	);
+	if (preview.sections.length === 0) {
+		await sendSquareThreadText(message.client, thread, "追加されたイベント\n\n追加は見つかりませんでした。");
+	} else {
+		for (const [index, section] of preview.sections.entries()) {
+			const title = index === 0 ? "追加されたイベント\n\n" : "";
+			await sendSquareThreadText(message.client, thread, `${title}${section.text}`);
+		}
+	}
+	await message.send(
+		`表示テストを送信しました。\n履歴: ${preview.historyUnix}\n追加: ${preview.sections.map((section) => `${section.type}:${section.count}`).join(", ") || "なし"}`,
+	);
+}
+
 export const testCommand: LineCommand = {
 	name: "test",
 	async execute({ message, args }) {
@@ -60,6 +100,8 @@ export const testCommand: LineCommand = {
 				"!test event-update",
 				"  最新のスケジュール更新履歴を使って、登録済みの通知先へテスト通知を送信します。",
 				"  このトークで使う前に !push skd を実行して通知先へ登録してください。",
+				"!test schedule-update [Unix時刻]",
+				"  最新または指定した履歴TSVを前回分と比較し、追加イベントをOpenChatの新規スレッドへ表示します。",
 				"!test thread [本文]",
 				"  実行メッセージのスレッドへ送信できるか検証します。",
 				"!test thread-log [件数]",
@@ -71,6 +113,22 @@ export const testCommand: LineCommand = {
 		}
 
 		const action = args[0]?.toLowerCase();
+		if (action === "schedule-update" || action === "schedule-preview") {
+			const unixText = args[1];
+			if (unixText && !/^\d+$/.test(unixText)) {
+				await message.reply("Unix時刻は整数で指定してください。例: !test schedule-update 1783044866");
+				return;
+			}
+			try {
+				await sendScheduleUpdatePreview(message, unixText ? Number.parseInt(unixText, 10) : undefined);
+			} catch (error) {
+				const reason = error instanceof Error ? error.message : String(error);
+				console.error("[test-schedule-update] failed", error);
+				await message.reply(`表示テストに失敗しました: ${reason}`);
+			}
+			return;
+		}
+
 		if (action === "thread") {
 			const text = args.slice(1).join(" ").trim() || `thread test ${new Date().toISOString()}`;
 			if (!message.sendThread) {
@@ -112,7 +170,7 @@ export const testCommand: LineCommand = {
 		}
 
 		if (action !== "event-update") {
-			await message.reply("使い方: !test event-update / !test thread / !test thread-log / !test oc-history");
+			await message.reply("使い方: !test event-update / !test schedule-update [Unix時刻] / !test thread / !test thread-log / !test oc-history");
 			return;
 		}
 		if (!pushSubscriptionStore.has(message.destination)) {
