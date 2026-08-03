@@ -95,6 +95,14 @@ export interface ScheduleUpdatePreview {
 	sections: ScheduleUpdateSection[];
 }
 
+export type EventTsvTextByType = Partial<Record<EventTsvType, string>>;
+
+export interface ScheduleUpdatePreviewInput {
+	historyUnix: number;
+	current: EventTsvTextByType;
+	previous: EventTsvTextByType;
+}
+
 function buildHistoryUrl(unix: number): string {
 	const url = new URL(EVENT_SITE_URL);
 	url.searchParams.set("tab", "history");
@@ -127,6 +135,24 @@ async function fetchRawHistoryFiles(): Promise<RawHistoryFile[]> {
 			return parsed ? [parsed] : [];
 		})
 		.filter((entry) => Number.isSafeInteger(entry.unix) && entry.unix > 0);
+}
+
+export async function fetchPreviousEventTsv(
+	beforeUnix: number,
+	types: readonly EventTsvType[] = EVENT_TYPES,
+): Promise<EventTsvTextByType> {
+	const files = await fetchRawHistoryFiles();
+	const selected = types.flatMap((type) => {
+		const file = files
+			.filter((candidate) => candidate.type === type && candidate.unix < beforeUnix)
+			.sort((left, right) => right.unix - left.unix)[0];
+		return file ? [file] : [];
+	});
+	const entries = await Promise.all(selected.map(async (file) => [
+		file.type,
+		await fetchText(`raw/${file.type}_${file.unix}.tsv`, 0),
+	] as const));
+	return Object.fromEntries(entries) as EventTsvTextByType;
 }
 
 function selectHistoryFiles(
@@ -304,9 +330,9 @@ function addedRows<T extends { raw: string }>(current: T[], previous: T[]): T[] 
 	return current.filter((entry) => !previousRows.has(entry.raw));
 }
 
-function isDisplayable(header: EventHeader): boolean {
+function isDisplayable(header: EventHeader, referenceAt: Date): boolean {
 	if (header.endDate === "20300101") return false;
-	return parseDate(header.endDate, header.endTime) > new Date();
+	return parseDate(header.endDate, header.endTime) > referenceAt;
 }
 
 function formatScheduleDate(date: Date): string {
@@ -399,18 +425,22 @@ async function loadNames(types: EventTsvType[]): Promise<NameMaps> {
 	return { gatya: { rare, event, normal }, sale, mission, item };
 }
 
-export async function buildScheduleUpdatePreview(requestedUnix?: number): Promise<ScheduleUpdatePreview> {
-	const files = await fetchRawHistoryFiles();
-	if (files.length === 0) throw new Error("履歴TSVが見つかりません");
-	const { historyUnix, current, previous } = selectHistoryFiles(files, requestedUnix);
-	const texts = await Promise.all(current.map(async (file) => ({
-		file,
-		current: await fetchText(`raw/${file.type}_${file.unix}.tsv`, 0),
-		previous: previous.has(file.type)
-			? fetchText(`raw/${file.type}_${previous.get(file.type)!.unix}.tsv`, 0)
-			: Promise.resolve(""),
-	})));
-	const sourceTypes = current.map((file) => file.type);
+export async function buildScheduleUpdatePreviewFromTsv(
+	input: ScheduleUpdatePreviewInput,
+): Promise<ScheduleUpdatePreview> {
+	const historyUnix = input.historyUnix;
+	if (!Number.isSafeInteger(historyUnix) || historyUnix <= 0) {
+		throw new Error("履歴Unix時刻が不正です");
+	}
+	const referenceAt = new Date(historyUnix * 1_000);
+	const sourceTypes = EVENT_TYPES.filter((type) =>
+		typeof input.current[type] === "string" && input.current[type] !== input.previous[type]
+	);
+	const texts = sourceTypes.map((type) => ({
+		type,
+		current: input.current[type] ?? "",
+		previous: input.previous[type] ?? "",
+	}));
 	const names = await loadNames(sourceTypes);
 	const rows: Record<ScheduleUpdateSectionType, DisplayRow[]> = {
 		gatya: [],
@@ -420,9 +450,9 @@ export async function buildScheduleUpdatePreview(requestedUnix?: number): Promis
 	};
 
 	for (const text of texts) {
-		if (text.file.type === "gatya") {
-			for (const block of addedRows(parseGatyaTsv(text.current), parseGatyaTsv(await text.previous))) {
-				if (!isDisplayable(block.header) || block.header.gachaType === 2 || block.header.gachaType === 3) continue;
+		if (text.type === "gatya") {
+			for (const block of addedRows(parseGatyaTsv(text.current), parseGatyaTsv(text.previous))) {
+				if (!isDisplayable(block.header, referenceAt) || block.header.gachaType === 2 || block.header.gachaType === 3) continue;
 				const start = parseDate(block.header.startDate, block.header.startTime);
 				const period = formatPeriod(block.header);
 				for (const gacha of block.gachas) {
@@ -432,9 +462,9 @@ export async function buildScheduleUpdatePreview(requestedUnix?: number): Promis
 			continue;
 		}
 
-		if (text.file.type === "sale") {
-			for (const entry of addedRows(parseSaleTsv(text.current), parseSaleTsv(await text.previous))) {
-				if (!isDisplayable(entry.header)) continue;
+		if (text.type === "sale") {
+			for (const entry of addedRows(parseSaleTsv(text.current), parseSaleTsv(text.previous))) {
+				if (!isDisplayable(entry.header, referenceAt)) continue;
 				const start = parseDate(entry.header.startDate, entry.header.startTime);
 				const period = formatPeriod(entry.header);
 				for (const id of entry.stageIds) {
@@ -445,8 +475,8 @@ export async function buildScheduleUpdatePreview(requestedUnix?: number): Promis
 			continue;
 		}
 
-		for (const entry of addedRows(parseItemTsv(text.current), parseItemTsv(await text.previous))) {
-			if (!isDisplayable(entry.header)) continue;
+		for (const entry of addedRows(parseItemTsv(text.current), parseItemTsv(text.previous))) {
+			if (!isDisplayable(entry.header, referenceAt)) continue;
 			const start = parseDate(entry.header.startDate, entry.header.startTime);
 			const category = GATYA_ITEM_GIFT_TYPES.has(entry.gift.giftType) ? "gatya" : "item";
 			const line = category === "gatya"
@@ -467,4 +497,25 @@ export async function buildScheduleUpdatePreview(requestedUnix?: number): Promis
 		sourceTypes,
 		sections,
 	};
+}
+
+export async function buildScheduleUpdatePreview(requestedUnix?: number): Promise<ScheduleUpdatePreview> {
+	const files = await fetchRawHistoryFiles();
+	if (files.length === 0) throw new Error("履歴TSVが見つかりません");
+	const selected = selectHistoryFiles(files, requestedUnix);
+	const pairs = await Promise.all(selected.current.map(async (file) => {
+		const previousFile = selected.previous.get(file.type);
+		return {
+			type: file.type,
+			current: await fetchText(`raw/${file.type}_${file.unix}.tsv`, 0),
+			previous: previousFile
+				? await fetchText(`raw/${file.type}_${previousFile.unix}.tsv`, 0)
+				: "",
+		};
+	}));
+	return buildScheduleUpdatePreviewFromTsv({
+		historyUnix: selected.historyUnix,
+		current: Object.fromEntries(pairs.map((pair) => [pair.type, pair.current])) as EventTsvTextByType,
+		previous: Object.fromEntries(pairs.map((pair) => [pair.type, pair.previous])) as EventTsvTextByType,
+	});
 }

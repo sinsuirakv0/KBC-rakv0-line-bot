@@ -126,6 +126,12 @@ export const appConfig = {
 	enableSquare: boolEnv("ENABLE_SQUARE", true),
 	port: Number(process.env.PORT || process.env.EVENT_UPDATE_PORT || 3000),
 	eventUpdateSecret: process.env.EVENT_UPDATE_SECRET || "",
+	ponosJwtCacheFile: path.resolve(process.env.PONOS_JWT_CACHE_FILE || "./storage/ponos-jwt.json"),
+	scheduleUpdateSettleMs: numberEnv("SCHEDULE_UPDATE_SETTLE_MS", 25_000, {
+		min: 0,
+		max: 120_000,
+		integer: true,
+	}),
 	pushSubscriptionsFile: path.resolve(
 		process.env.PUSH_SUBSCRIPTIONS_FILE || "./storage/push-subscriptions.json",
 	),
