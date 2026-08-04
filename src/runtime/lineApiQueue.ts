@@ -44,6 +44,13 @@ export class LineApiQueueFullError extends Error {
 	}
 }
 
+export class LineApiQueuePausedError extends Error {
+	constructor(readonly reason: string) {
+		super(`LINE API queue is paused: ${reason}`);
+		this.name = "LineApiQueuePausedError";
+	}
+}
+
 const priorityRank: Record<LineApiPriority, number> = {
 	critical: 0,
 	high: 1,
@@ -59,6 +66,7 @@ export class LineApiQueue {
 	private readonly scopes = new Map<string, LineApiScopeQueue>();
 	private activeCount = 0;
 	private sequence = 0;
+	private pausedReason: string | undefined;
 
 	withPriority<T>(priority: LineApiPriority, operation: () => Promise<T>): Promise<T> {
 		return this.priorityContext.run(priority, operation);
@@ -69,6 +77,7 @@ export class LineApiQueue {
 		operation: () => Promise<T>,
 		options?: LineApiPriority | LineApiQueueRunOptions,
 	): Promise<T> {
+		if (this.pausedReason) throw new LineApiQueuePausedError(this.pausedReason);
 		const resolved = this.resolveOptions(options);
 		const pending = this.pendingCount();
 		const queueLimit = appConfig.lineApiQueueLimit;
@@ -103,6 +112,37 @@ export class LineApiQueue {
 			else queue.normal.push(task);
 			this.drain();
 		});
+	}
+
+	isPaused(): boolean {
+		return this.pausedReason !== undefined;
+	}
+
+	pause(reason: string): void {
+		const normalizedReason = reason.trim() || "session-unavailable";
+		if (this.pausedReason) return;
+		this.pausedReason = normalizedReason;
+		let cancelled = 0;
+		for (const queue of this.scopes.values()) {
+			const pending = [...queue.critical, ...queue.high, ...queue.normal];
+			queue.critical.length = 0;
+			queue.high.length = 0;
+			queue.normal.length = 0;
+			for (const task of pending) {
+				cancelled += 1;
+				task.reject(new LineApiQueuePausedError(normalizedReason));
+			}
+		}
+		console.warn("[line-api] queue paused", { reason: normalizedReason, cancelled });
+	}
+
+	resume(): void {
+		if (!this.pausedReason) return;
+		const reason = this.pausedReason;
+		this.pausedReason = undefined;
+		console.log("[line-api] queue resumed", { reason });
+		this.cleanupScopes();
+		this.drain();
 	}
 
 	snapshot(now = Date.now()): LineApiQueueSnapshot {
@@ -152,6 +192,7 @@ export class LineApiQueue {
 	}
 
 	private drain(): void {
+		if (this.pausedReason) return;
 		while (this.activeCount < appConfig.lineApiMaxConcurrent) {
 			const selected = this.nextTask(Date.now());
 			if (!selected) return;
@@ -206,7 +247,10 @@ export class LineApiQueue {
 		slowTimer.unref?.();
 
 		void Promise.resolve()
-			.then(task.operation)
+			.then(() => {
+				if (this.pausedReason) throw new LineApiQueuePausedError(this.pausedReason);
+				return task.operation();
+			})
 			.then(task.resolve, task.reject)
 			.finally(() => {
 				clearTimeout(slowTimer);

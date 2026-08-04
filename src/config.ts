@@ -169,8 +169,10 @@ export const appConfig = {
 		min: 5 * 60_000,
 		integer: true,
 	}),
-	loginRestrictedRetryMs: numberEnv("LINE_LOGIN_RESTRICTED_RETRY_MS", 6 * 60 * 60_000, {
-		min: 30 * 60_000,
+	// LINE側で利用停止を受けた場合は、全APIを止めて5分後にだけ再接続を試す。
+	loginRestrictedRetryMs: numberEnv("LINE_LOGIN_RESTRICTED_RETRY_MS", 5 * 60_000, {
+		min: 5 * 60_000,
+		max: 5 * 60_000,
 		integer: true,
 	}),
 	loginRateLimitRetryMs: numberEnv("LINE_LOGIN_RATE_LIMIT_RETRY_MS", 60 * 60_000, {

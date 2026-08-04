@@ -181,6 +181,7 @@ export class OcProfileStatusManager {
 	}
 
 	private async applySquare(squareMid: string): Promise<void> {
+		if (lineApiQueue.isPaused()) return;
 		const client = this.client;
 		const member = this.members.get(squareMid);
 		const displayName = this.desiredName(squareMid);

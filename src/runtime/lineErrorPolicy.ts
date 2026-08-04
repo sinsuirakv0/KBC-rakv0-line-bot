@@ -114,10 +114,13 @@ export class LoginRetryPolicy {
 		if (classification.kind === "account-restricted") base = this.restrictedAccountDelayMs;
 		if (classification.kind === "rate-limited") base = this.rateLimitDelayMs;
 		const jitter = 0.9 + Math.max(0, Math.min(1, this.random())) * 0.2;
+		const delayMs = classification.kind === "account-restricted"
+			? base
+			: Math.round(base * jitter);
 		return {
 			...classification,
 			attempt: this.attempt,
-			delayMs: Math.max(this.baseDelayMs, Math.round(base * jitter)),
+			delayMs: Math.max(this.baseDelayMs, delayMs),
 		};
 	}
 }

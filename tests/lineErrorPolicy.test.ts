@@ -40,3 +40,18 @@ test("login retry policy backs off permanent failures", () => {
 		30 * 60_000,
 	);
 });
+
+test("account restrictions wait for the configured five-minute retry", () => {
+	const policy = new LoginRetryPolicy(
+		15_000,
+		5 * 60_000,
+		30 * 60_000,
+		5 * 60_000,
+		60 * 60_000,
+		() => 0.5,
+	);
+	assert.equal(
+		policy.next(new Error("AUTHENTICATION_FAILED: suspended user")).delayMs,
+		5 * 60_000,
+	);
+});

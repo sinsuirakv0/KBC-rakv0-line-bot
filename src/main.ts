@@ -29,6 +29,7 @@ import { runtimeStore } from "./runtime/store.js";
 import { startMemoryGuard, type MemoryPressureSnapshot } from "./runtime/memoryGuard.js";
 import { lineHealth } from "./runtime/lineHealth.js";
 import {
+	classifyLineError,
 	compactLineError,
 	isUnsupportedLineError,
 	LoginRetryPolicy,
@@ -2069,8 +2070,10 @@ async function runSession(
 	client: Client,
 	storage: SyncedLineStorage,
 	shutdownSignal: AbortSignal,
+	onReady?: () => void,
 ): Promise<void> {
 	const profile = await client.getMyProfile();
+	lineApiQueue.resume();
 	console.log(`[line] logged in as ${profile.displayName} (${profile.mid})`);
 	const squareSyncOwnerState = await storage.ensureSquareSyncOwner(profile.mid);
 	console.log(`[line-storage] square sync owner ${squareSyncOwnerState}`, {
@@ -2109,9 +2112,22 @@ async function runSession(
 	const sessionFailure = new Promise<never>((_resolve, reject) => {
 		rejectSession = reject;
 	});
+	let apiPausedForRestriction = false;
+	const pauseLineApiForRestriction = (error: unknown): boolean => {
+		if (classifyLineError(error).kind !== "account-restricted") return false;
+		if (apiPausedForRestriction) return true;
+		apiPausedForRestriction = true;
+		lineApiQueue.pause("account-restricted");
+		ocProfileStatusManager.unbind(client);
+		console.error("[line] account restriction detected; LINE API is paused until retry", {
+			error: compactError(error),
+		});
+		return true;
+	};
 	const onFatal = (source: string, error: unknown) => {
 		if (failed || controller.signal.aborted) return;
 		failed = true;
+		pauseLineApiForRestriction(error);
 		sessionStop = { source, error };
 		controller.abort();
 		const sessionError = new Error(`[${source}] ${compactError(error)}`);
@@ -2184,6 +2200,10 @@ async function runSession(
 						trigger,
 						error: compactError(error),
 					});
+					return;
+				}
+				if (pauseLineApiForRestriction(error)) {
+					onFatal("authentication-verification", error);
 					return;
 				}
 				authFailureCount += 1;
@@ -2278,6 +2298,7 @@ async function runSession(
 	}
 
 	console.log("[app] bot is listening");
+	onReady?.();
 	let eventLoopCheckedAt = Date.now();
 	const eventLoopMonitor = setInterval(() => {
 		const now = Date.now();
@@ -2323,14 +2344,14 @@ async function runSession(
 	}, 5 * 60_000);
 	let nameScanRunning = false;
 	const nameScan = setInterval(() => {
-		if (nameScanRunning || controller.signal.aborted) return;
+		if (nameScanRunning || controller.signal.aborted || lineApiQueue.isPaused()) return;
 		if (!runtimeWorkload.canRunBackground()) {
 			console.log("[name-history] periodic scan deferred for foreground activity");
 			return;
 		}
 		nameScanRunning = true;
 		void runtimeWorkload.runBackground("member-name-scan", async () => {
-			if (controller.signal.aborted) return;
+			if (controller.signal.aborted || lineApiQueue.isPaused()) return;
 			await memberNameHistoryStore.scanKnownSquareNames(client);
 		})
 			.catch((error) => {
@@ -2356,7 +2377,7 @@ async function runSession(
 			error: undefined,
 		};
 		const finalReason = finalStop.error === undefined ? "正常終了" : compactError(finalStop.error);
-		if (!shutdownSignal.aborted) {
+		if (!shutdownSignal.aborted && !apiPausedForRestriction) {
 			await Promise.race([
 				ocProfileStatusManager.setGlobalStatus("restarting"),
 				sleep(5_000),
@@ -2375,11 +2396,12 @@ async function runSession(
 
 async function main(): Promise<void> {
 	let activeClient: Client | null = null;
+	const getAvailableLineClient = (): Client | null => lineApiQueue.isPaused() ? null : activeClient;
 	const shutdownController = new AbortController();
 	let shutdownRequested = false;
 	let memoryRestartRequested = false;
 	let memoryForceExitTimer: NodeJS.Timeout | undefined;
-	const eventUpdateServer = startEventUpdateServer(() => activeClient);
+	const eventUpdateServer = startEventUpdateServer(getAvailableLineClient);
 	const requestShutdown = (
 		status: "restarting" | "stopped",
 		reason?: unknown,
@@ -2475,9 +2497,9 @@ async function main(): Promise<void> {
 			console.log(`[startup] ${name} ${state}`);
 		},
 	});
-	const eventPushScheduler = startEventPushScheduler(() => activeClient, shutdownController.signal);
-	startPushReminderScheduler(() => activeClient, shutdownController.signal);
-	startMessageLogAutoHistoryScheduler(() => activeClient, shutdownController.signal);
+	const eventPushScheduler = startEventPushScheduler(getAvailableLineClient, shutdownController.signal);
+	startPushReminderScheduler(getAvailableLineClient, shutdownController.signal);
+	startMessageLogAutoHistoryScheduler(getAvailableLineClient, shutdownController.signal);
 	startMessageLogRemoteSyncScheduler(shutdownController.signal);
 	startMemberEventLogRemoteSyncScheduler(shutdownController.signal);
 	const storage = await initializeLineStorage();
@@ -2493,12 +2515,11 @@ async function main(): Promise<void> {
 		retryPolicy: loginRetryPolicy,
 		stableResetMs: appConfig.sessionStableResetMs,
 		create: () => createLineClient(storage),
-		run: (client, signal) => runSession(client, storage, signal),
+		run: (client, signal) => runSession(client, storage, signal, () => eventPushScheduler.wake()),
 		onActiveChange(client) {
 			const previousClient = activeClient;
 			activeClient = client;
 			if (!client && previousClient) ocProfileStatusManager.unbind(previousClient);
-			if (client) eventPushScheduler.wake();
 		},
 		onRetry(retry) {
 			console.error("[line] session stopped; automatic login will retry", {
