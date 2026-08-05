@@ -7,6 +7,7 @@ import {
 	sameOcUrlRule,
 	type OcUrlAllowRule,
 } from "./ocUrlPolicy.js";
+import { isOcMuteActive, type OcMuteEntry } from "./ocMute.js";
 
 export interface OcModerationSetting {
 	squareMid: string;
@@ -21,6 +22,7 @@ export interface OcModerationSetting {
 	modRoomSetAt?: string;
 	modRoomSetBy?: string;
 	urlAllowRules: OcUrlAllowRule[];
+	mutes: OcMuteEntry[];
 	updatedAt: string;
 	updatedBy?: string;
 }
@@ -83,8 +85,39 @@ function emptySetting(squareMid: string): OcModerationSetting {
 		modRoomSetAt: undefined,
 		modRoomSetBy: undefined,
 		urlAllowRules: [],
+		mutes: [],
 		updatedAt: "",
 	};
+}
+
+function parseMutes(value: unknown): OcMuteEntry[] {
+	if (!Array.isArray(value)) return [];
+	const byMemberMid = new Map<string, OcMuteEntry>();
+	for (const mute of value) {
+		const item = mute as Partial<OcMuteEntry>;
+		if (
+			typeof item.memberMid !== "string" ||
+			!/^p[0-9a-f]{8,}$/i.test(item.memberMid) ||
+			typeof item.mutedAt !== "string" ||
+			typeof item.mutedBy !== "string"
+		) continue;
+		if (typeof item.expiresAt === "string" && !Number.isFinite(new Date(item.expiresAt).getTime())) {
+			continue;
+		}
+		const expiresAt = typeof item.expiresAt === "string" ? item.expiresAt : undefined;
+		const entry: OcMuteEntry = {
+			memberMid: item.memberMid,
+			displayName: typeof item.displayName === "string" && item.displayName.trim()
+				? item.displayName.trim().slice(0, 80)
+				: undefined,
+			mutedAt: item.mutedAt,
+			mutedBy: item.mutedBy,
+			expiresAt,
+		};
+		if (!isOcMuteActive(entry)) continue;
+		byMemberMid.set(entry.memberMid, entry);
+	}
+	return [...byMemberMid.values()];
 }
 
 function parseSetupSessions(value: unknown): OcSetupSession[] {
@@ -163,6 +196,7 @@ function parseSettings(value: unknown): OcModerationSettingsFile {
 			modRoomSetAt: typeof item.modRoomSetAt === "string" ? item.modRoomSetAt : undefined,
 			modRoomSetBy: typeof item.modRoomSetBy === "string" ? item.modRoomSetBy : undefined,
 			urlAllowRules: parseOcUrlAllowRules(item.urlAllowRules),
+			mutes: parseMutes(item.mutes),
 			updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : nowIso(),
 			updatedBy: typeof item.updatedBy === "string" ? item.updatedBy : undefined,
 		});
@@ -213,6 +247,7 @@ class OcModerationSettingsStore {
 		return {
 			...value,
 			urlAllowRules: value.urlAllowRules.map((rule) => ({ ...rule })),
+			mutes: value.mutes.map((mute) => ({ ...mute })),
 		};
 	}
 
@@ -222,6 +257,7 @@ class OcModerationSettingsStore {
 			.map((setting) => ({
 				...setting,
 				urlAllowRules: setting.urlAllowRules.map((rule) => ({ ...rule })),
+				mutes: setting.mutes.map((mute) => ({ ...mute })),
 			}));
 	}
 
@@ -229,7 +265,55 @@ class OcModerationSettingsStore {
 		return this.data.settings.map((setting) => ({
 			...setting,
 			urlAllowRules: setting.urlAllowRules.map((rule) => ({ ...rule })),
+			mutes: setting.mutes.map((mute) => ({ ...mute })),
 		}));
+	}
+
+	activeMute(squareMid: string, memberMid: string, now = Date.now()): OcMuteEntry | undefined {
+		const setting = this.data.settings.find((item) => item.squareMid === squareMid);
+		if (!setting) return undefined;
+		this.cleanupExpiredMutes(setting, now);
+		const entry = setting.mutes.find((mute) => mute.memberMid === memberMid);
+		return entry ? { ...entry } : undefined;
+	}
+
+	listMutes(squareMid: string, now = Date.now()): OcMuteEntry[] {
+		const setting = this.data.settings.find((item) => item.squareMid === squareMid);
+		if (!setting) return [];
+		this.cleanupExpiredMutes(setting, now);
+		return setting.mutes.map((mute) => ({ ...mute }));
+	}
+
+	setMute(
+		squareMid: string,
+		input: Omit<OcMuteEntry, "mutedAt">,
+	): { result: "set" | "updated"; entry: OcMuteEntry } {
+		const setting = this.ensureSetting(squareMid, input.mutedBy);
+		const entry: OcMuteEntry = {
+			...input,
+			mutedAt: nowIso(),
+		};
+		const index = setting.mutes.findIndex((mute) => mute.memberMid === entry.memberMid);
+		const result = index >= 0 ? "updated" : "set";
+		if (index >= 0) setting.mutes[index] = entry;
+		else setting.mutes.push(entry);
+		setting.updatedAt = entry.mutedAt;
+		setting.updatedBy = input.mutedBy;
+		this.scheduleSave();
+		return { result, entry: { ...entry } };
+	}
+
+	removeMute(squareMid: string, memberMid: string, updatedBy: string): OcMuteEntry | undefined {
+		const setting = this.data.settings.find((item) => item.squareMid === squareMid);
+		if (!setting) return undefined;
+		this.cleanupExpiredMutes(setting);
+		const index = setting.mutes.findIndex((mute) => mute.memberMid === memberMid);
+		if (index < 0) return undefined;
+		const [entry] = setting.mutes.splice(index, 1);
+		setting.updatedAt = nowIso();
+		setting.updatedBy = updatedBy;
+		this.scheduleSave();
+		return { ...entry };
 	}
 
 	urlAllowRules(squareMid: string): OcUrlAllowRule[] {
@@ -557,6 +641,14 @@ class OcModerationSettingsStore {
 			this.data.settings.push(setting);
 		}
 		return setting;
+	}
+
+	private cleanupExpiredMutes(setting: OcModerationSetting, now = Date.now()): void {
+		const active = setting.mutes.filter((mute) => isOcMuteActive(mute, now));
+		if (active.length === setting.mutes.length) return;
+		setting.mutes = active;
+		setting.updatedAt = nowIso();
+		this.scheduleSave();
 	}
 
 	private cleanupExpiredSetupSessions(): void {

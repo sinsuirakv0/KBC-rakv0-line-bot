@@ -6,6 +6,11 @@ import {
 import { ocKickHistoryStore } from "../moderation/ocKickHistory.js";
 import { ocMemberActivityStore } from "../moderation/ocMemberActivity.js";
 import { ocModerationSettingsStore } from "../moderation/ocModerationSettings.js";
+import {
+	formatOcMuteRemaining,
+	formatOcMuteUntil,
+	parseOcMuteExpiration,
+} from "../moderation/ocMute.js";
 import { kickAndBanSquareMember } from "../moderation/ocSquareBan.js";
 import {
 	createOcUrlAllowRule,
@@ -74,6 +79,12 @@ function adminHelpText(): string {
 		"  許可ルールの確認/削除",
 		"!oc media / !oc media del",
 		"  画像/動画連投削除のON/OFF",
+		"!oc mute @ユーザー 170",
+		"  指定したメンバーの発言を170分間削除",
+		"!oc mute @ユーザー 8/7-0:17 / inf",
+		"  JSTの終了日時、または手動解除までミュート",
+		"!oc mute list / !oc mute @ユーザー del",
+		"  ミュート一覧の確認 / 解除",
 		"!oc identity [@ユーザー|userID:<p...>]",
 		"  OC内の識別材料を取得し、過去スナップショットと照合",
 		"!oc identity list",
@@ -179,7 +190,10 @@ function collectKickTargets(args: string[], mentions: string[]): { mids: string[
 	for (let index = 1; index < args.length; index++) {
 		const arg = args[index];
 		const lower = arg.toLowerCase();
-		const keyed = argValue([arg], "userID") || argValue([arg], "userId") || argValue([arg], "userid");
+		const keyed = argValue([arg], "userID") ||
+			argValue([arg], "userId") ||
+			argValue([arg], "userid") ||
+			argValue([arg], "mid");
 		if (keyed && keyed.startsWith("p")) {
 			mids.add(keyed);
 			continue;
@@ -200,6 +214,44 @@ function collectKickTargets(args: string[], mentions: string[]): { mids: string[
 	return {
 		mids: [...mids],
 		reason: reasonParts.join(" ").trim(),
+	};
+}
+
+function collectMuteInput(
+	args: string[],
+	mentions: string[],
+): { memberMid?: string; action: string; multiple: boolean } {
+	const mids = new Set<string>();
+	for (const mid of mentions) {
+		if (isUserIdToken(mid)) mids.add(mid);
+	}
+
+	const actionParts: string[] = [];
+	for (let index = 1; index < args.length; index++) {
+		const arg = args[index];
+		const lower = arg.toLowerCase();
+		const keyed = argValue([arg], "userID") || argValue([arg], "userId") || argValue([arg], "userid");
+		if (keyed && isUserIdToken(keyed)) {
+			mids.add(keyed);
+			continue;
+		}
+		if ((lower === "userid:" || lower === "userid" || lower === "mid:" || lower === "mid") && isUserIdToken(args[index + 1] ?? "")) {
+			mids.add(args[index + 1]);
+			index += 1;
+			continue;
+		}
+		if (isUserIdToken(arg)) {
+			mids.add(arg);
+			continue;
+		}
+		if (arg.startsWith("@")) continue;
+		actionParts.push(arg);
+	}
+
+	return {
+		memberMid: mids.size === 1 ? [...mids][0] : undefined,
+		action: actionParts.join(" ").trim(),
+		multiple: mids.size > 1,
 	};
 }
 
@@ -327,6 +379,7 @@ function setupStatusLines(squareMid: string): string[] {
 				: "無効"
 		}`,
 		`短時間一斉参加監視: ${enabledText(settings.joinCohortWatchEnabled)}`,
+		`ミュート中: ${settings.mutes.length}人`,
 		`副官部屋: ${settings.modRoomChatMid ? `設定済み (${shortId(settings.modRoomChatMid)})` : "未設定"}`,
 		`即抜け記録: 参加 ${activity.lastJoinAt ? formatJst(activity.lastJoinAt) : "未記録"} / 退会 ${activity.lastLeaveAt ? formatJst(activity.lastLeaveAt) : "未記録"}`,
 		`即抜け追跡: ${activity.activeMembers}人 / 記録 ${activity.records}人`,
@@ -1918,6 +1971,157 @@ async function sendKickSummaryToModRoom(
 	}
 }
 
+async function muteTargetName(
+	command: Parameters<LineCommand["execute"]>[0],
+	memberMid: string,
+): Promise<string> {
+	try {
+		const response = await lineApiQueue.run("oc:mute-member-name", () =>
+			command.message.client.base.square.getSquareMember({ squareMemberMid: memberMid }), "high");
+		const displayName = response.squareMember.displayName?.trim();
+		return displayName || memberMid;
+	} catch (error) {
+		console.warn("[oc] mute target name lookup failed", { memberMid, error });
+		return memberMid;
+	}
+}
+
+async function sendMuteLogToModRoom(
+	command: Parameters<LineCommand["execute"]>[0],
+	operation: "設定" | "更新" | "解除",
+	targetName: string,
+	targetMid: string,
+	period: string,
+): Promise<void> {
+	const { message } = command;
+	if (message.destination.kind !== "square") return;
+	const settings = ocModerationSettingsStore.snapshot(message.destination.scopeMid);
+	if (!settings.modRoomChatMid || settings.modRoomChatMid === message.destination.chatMid) return;
+	const modRoomChatMid = settings.modRoomChatMid;
+	const actorName = message.destination.senderName || message.destination.senderMid;
+	const text = [
+		"【OCミュート】",
+		`操作: ${operation}`,
+		`実行トーク: ${shortId(message.destination.chatMid)}`,
+		`実行者: ${actorName} (${message.destination.senderMid})`,
+		`対象: ${targetName} (${targetMid})`,
+		`期間: ${period}`,
+	].join("\n");
+	try {
+		await lineApiQueue.run("oc:mute-mod-room-log", () =>
+			message.client.base.square.sendMessage({
+				squareChatMid: modRoomChatMid,
+				text,
+			}),
+			{
+				priority: "critical",
+				scope: lineApiNotificationScope("square", modRoomChatMid),
+			},
+		);
+	} catch (error) {
+		console.warn("[oc] mute mod room log send failed", {
+			squareMid: message.destination.scopeMid,
+			modRoomChatMid,
+			error,
+		});
+	}
+}
+
+function muteCommandHelp(): string {
+	return [
+		"!oc mute @ユーザー 時間",
+		"!oc mute userID:<p...> 時間（MID:<p...>でも可）",
+		"時間: 170（170分） / 0:17（次の0:17まで） / 8/7（8月7日0:00まで） / 8/7-0:17 / inf",
+		"!oc mute @ユーザー del",
+		"!oc mute list",
+	].join("\n");
+}
+
+async function executeMute(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
+	const { message, args } = command;
+	if (message.destination.kind !== "square") {
+		await message.send("このコマンドはOpenChatで実行してください。");
+		return;
+	}
+	if (!await canManageOpenChatSettings(command)) {
+		await message.send("実行権限がありません。BOT管理者/モデレーター、またはこのOCの管理者/副官のみ実行できます。");
+		return;
+	}
+
+	const subAction = args[1]?.normalize("NFKC").toLowerCase();
+	if (!subAction || subAction === "help") {
+		await message.send(muteCommandHelp());
+		return;
+	}
+	if (subAction === "list" || subAction === "一覧") {
+		const entries = ocModerationSettingsStore.listMutes(message.destination.scopeMid);
+		if (entries.length === 0) {
+			await message.send("現在ミュート中のメンバーはいません。");
+			return;
+		}
+		await message.send([
+			"ミュート中のメンバー",
+			...entries.map((entry, index) =>
+				`${index + 1}. ${entry.displayName || entry.memberMid}\n残り時間: ${formatOcMuteRemaining(entry)} (${formatOcMuteUntil(entry)})`
+			),
+		].join("\n\n"));
+		return;
+	}
+
+	const input = collectMuteInput(args, message.mentionMids);
+	if (input.multiple) {
+		await message.send("ミュートできる対象は一度に1人です。\n" + muteCommandHelp());
+		return;
+	}
+	if (!input.memberMid) {
+		await message.send("対象ユーザーをメンションするか userID:<p...> を指定してください。\n" + muteCommandHelp());
+		return;
+	}
+
+	const action = input.action.normalize("NFKC").toLowerCase();
+	if (action === "del" || action === "解除") {
+		const removed = ocModerationSettingsStore.removeMute(
+			message.destination.scopeMid,
+			input.memberMid,
+			message.destination.senderMid,
+		);
+		if (!removed) {
+			await message.send("このメンバーは現在ミュートされていません。");
+			return;
+		}
+		void ocModerationSettingsStore.flush().catch((error) => {
+			console.warn("[oc] mute removal save failed", error);
+		});
+		const targetName = removed.displayName || await muteTargetName(command, input.memberMid);
+		await sendMuteLogToModRoom(command, "解除", targetName, input.memberMid, "解除済み");
+		await message.send(`${targetName} のミュートを解除しました。`);
+		return;
+	}
+
+	const expiration = parseOcMuteExpiration(input.action);
+	if (!expiration.ok) {
+		await message.send(`${expiration.error}\n${muteCommandHelp()}`);
+		return;
+	}
+	const targetName = await muteTargetName(command, input.memberMid);
+	const saved = ocModerationSettingsStore.setMute(message.destination.scopeMid, {
+		memberMid: input.memberMid,
+		displayName: targetName === input.memberMid ? undefined : targetName,
+		mutedBy: message.destination.senderMid,
+		expiresAt: expiration.expiresAt,
+	});
+	void ocModerationSettingsStore.flush().catch((error) => {
+		console.warn("[oc] mute save failed", error);
+	});
+	const period = `${formatOcMuteUntil(saved.entry)}（残り${formatOcMuteRemaining(saved.entry)}）`;
+	await sendMuteLogToModRoom(command, saved.result === "set" ? "設定" : "更新", targetName, input.memberMid, period);
+	await message.send([
+		`${targetName} をミュートしました。`,
+		`期間: ${period}`,
+		"対象の新規発言は削除されます。",
+	].join("\n"));
+}
+
 async function executeKick(command: Parameters<LineCommand["execute"]>[0]): Promise<void> {
 	const { message, args } = command;
 	const currentTarget = targetFromDestination(message.destination);
@@ -2050,6 +2254,10 @@ export const ocCommand: LineCommand = {
 		}
 		if (action === "probe" || action === "apitest" || action === "sqtest") {
 			await executeProbe(command);
+			return;
+		}
+		if (action === "mute") {
+			await executeMute(command);
 			return;
 		}
 		if (action === "kick") {

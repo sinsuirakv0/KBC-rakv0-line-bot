@@ -16,6 +16,7 @@ import {
 import { permissionStore, targetFromDestination, type PermissionTarget } from "../permissions/store.js";
 import { lineApiNotificationScope, lineApiQueue } from "../runtime/lineApiQueue.js";
 import { ocModerationSettingsStore } from "./ocModerationSettings.js";
+import { formatOcMuteRemaining, type OcMuteEntry } from "./ocMute.js";
 import {
 	blockedOcUrlComponent,
 	createOcUrlAllowRule,
@@ -119,6 +120,8 @@ const COHORT_JOIN_WINDOW_MS = 2 * 60_000;
 const COHORT_MIN_MEMBERS = 3;
 const COHORT_WATCH_MS = 30 * 60_000;
 const ROLE_CACHE_MS = 5 * 60_000;
+const MUTE_WARNING_INTERVAL_MS = 60_000;
+const MUTE_WARNING_DELETE_DELAY_MS = 15_000;
 const MEMBER_CACHE_MAX = 5_000;
 const MEMBER_CACHE_RETAIN = 4_000;
 const LOGGED_COHORTS_MAX = 2_000;
@@ -146,6 +149,7 @@ const memberCache = new Map<string, { summary: SquareMemberSummary; expiresAt: n
 const mediaBurstHistory = new Map<string, MediaHistoryItem[]>();
 const mediaGroupWarnings = new Map<string, number>();
 const mediaWindowWarnings = new Map<string, number>();
+const muteWarnings = new Map<string, number>();
 const handledMessageIds = new Map<string, number>();
 const handledPostIds = new Map<string, number>();
 const noteScanRequests = new Map<string, Promise<boolean>>();
@@ -248,6 +252,24 @@ function containsUrlLike(text: string | undefined): boolean {
 
 function mediaBurstKey(message: OpenChatModerationMessage): string {
 	return `${message.squareMid}:${message.senderMid}`;
+}
+
+function muteWarningKey(message: OpenChatModerationMessage): string {
+	return `${message.squareMid}:${message.senderMid}`;
+}
+
+function reserveMuteWarning(message: OpenChatModerationMessage): boolean {
+	const key = muteWarningKey(message);
+	const now = Date.now();
+	const lastWarnedAt = muteWarnings.get(key);
+	if (lastWarnedAt !== undefined && now - lastWarnedAt < MUTE_WARNING_INTERVAL_MS) return false;
+	muteWarnings.set(key, now);
+	if (muteWarnings.size < 1_000) return true;
+	const minimum = now - MUTE_WARNING_INTERVAL_MS;
+	for (const [warningKey, warnedAt] of muteWarnings) {
+		if (warnedAt < minimum) muteWarnings.delete(warningKey);
+	}
+	return true;
 }
 
 function messageRefKey(ref: SquareMessageRef): string {
@@ -803,6 +825,62 @@ function squareSendMessageId(value: unknown): string | undefined {
 		result.squareMessage?.message?.id ??
 		result.message?.id ??
 		result.id;
+}
+
+function scheduleMuteWarningDeletion(
+	client: Client,
+	squareChatMid: string,
+	messageId: string,
+): void {
+	const timer = setTimeout(() => {
+		void deleteSquareMessageRef(client, { squareChatMid, messageId }, "mute-warning-expired")
+			.catch((error) => {
+				console.warn("[oc-moderation] mute warning deletion failed", {
+					squareChatMid,
+					messageId,
+					error,
+				});
+			});
+	}, MUTE_WARNING_DELETE_DELAY_MS);
+	timer.unref();
+}
+
+async function sendMuteWarning(message: OpenChatModerationMessage, mute: OcMuteEntry): Promise<void> {
+	if (!reserveMuteWarning(message)) return;
+	const prefix = await mentionPrefix(message);
+	const text = [
+		prefix,
+		"現在ミュートされています。",
+		"残り時間まで待つか、手動解除をお待ちください。",
+		`残り時間: ${formatOcMuteRemaining(mute)}`,
+	].join("\n");
+	try {
+		const sent = await lineApiQueue.run("oc-moderation:mute-warning", () =>
+			message.client.base.square.sendMessage({
+				squareChatMid: message.squareChatMid,
+				text,
+				contentMetadata: mentionMetadata(0, prefix.length, message.senderMid),
+			}),
+			{
+				priority: "critical",
+				scope: lineApiNotificationScope("square", message.squareChatMid),
+			},
+		);
+		const messageId = squareSendMessageId(sent);
+		if (messageId) scheduleMuteWarningDeletion(message.client, message.squareChatMid, messageId);
+		else {
+			console.warn("[oc-moderation] mute warning message id was not returned", {
+				squareChatMid: message.squareChatMid,
+				targetMid: message.senderMid,
+			});
+		}
+	} catch (error) {
+		console.warn("[oc-moderation] mute warning send failed", {
+			squareChatMid: message.squareChatMid,
+			targetMid: message.senderMid,
+			error,
+		});
+	}
 }
 
 async function sendModRoomLog(
@@ -1488,7 +1566,9 @@ async function handleLeftSoonDecision(
 export async function handleOpenChatModeration(message: OpenChatModerationMessage): Promise<boolean> {
 	if (wasHandled(message)) return true;
 	const settings = ocModerationSettingsStore.snapshot(message.squareMid);
+	const mute = ocModerationSettingsStore.activeMute(message.squareMid, message.senderMid);
 	if (
+		!mute &&
 		!settings.linkDeleteEnabled &&
 		!settings.mediaBurstDeleteEnabled &&
 		!settings.leftSoonMonitoringEnabled &&
@@ -1498,6 +1578,11 @@ export async function handleOpenChatModeration(message: OpenChatModerationMessag
 
 	// LINE OCのAuto-replyなど、Square member MIDではない送信元は対象外。
 	if (!isSquareMemberMid(message.senderMid)) return false;
+	if (mute) {
+		const deleted = await deleteSquareMessage(message, "mute");
+		if (deleted) await sendMuteWarning(message, mute);
+		return true;
+	}
 	if (await isPrivilegedSender(message)) return false;
 
 	let senderName: string | undefined;
