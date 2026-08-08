@@ -102,50 +102,27 @@ function detailMessages(preview: ScheduleUpdatePreview): string[] {
 	);
 }
 
-async function sendTalkText(
-	client: Client,
-	target: { chatMid: string; encrypted: boolean },
-	text: string,
-): Promise<void> {
-	try {
-		await lineApiQueue.run(
-			"schedule-update-details:talk",
-			() => client.base.talk.sendMessage({ to: target.chatMid, text, e2ee: target.encrypted }),
-			{
-				priority: "critical",
-				scope: lineApiNotificationScope("talk", target.chatMid),
-			},
-		);
-	} finally {
-		await waitScheduleUpdateSendInterval();
-	}
-}
-
 async function deliverDetails(client: Client, preview: ScheduleUpdatePreview): Promise<number> {
 	const rootText = detailRootText(preview);
 	const messages = detailMessages(preview);
 	let sent = 0;
 	for (const target of pushSubscriptionStore.list()) {
+		if (target.kind !== "square") continue;
 		if (permissionStore.isBotStopped(target)) continue;
 		try {
-			if (target.kind === "square") {
-				const queueOptions = {
-					priority: "critical" as const,
-					scope: lineApiNotificationScope("square", target.chatMid),
-					waitAfterRequest: waitScheduleUpdateSendInterval,
-				};
-				const thread = await createSquareThreadWithRoot(
-					client,
-					target.chatMid,
-					rootText,
-					queueOptions,
-				);
-				for (const message of messages) {
-					await sendSquareThreadText(client, thread, message, queueOptions);
-				}
-			} else {
-				await sendTalkText(client, target, rootText);
-				for (const message of messages) await sendTalkText(client, target, message);
+			const queueOptions = {
+				priority: "critical" as const,
+				scope: lineApiNotificationScope("square", target.chatMid),
+				waitAfterRequest: waitScheduleUpdateSendInterval,
+			};
+			const thread = await createSquareThreadWithRoot(
+				client,
+				target.chatMid,
+				rootText,
+				queueOptions,
+			);
+			for (const message of messages) {
+				await sendSquareThreadText(client, thread, message, queueOptions);
 			}
 			sent++;
 		} catch (error) {

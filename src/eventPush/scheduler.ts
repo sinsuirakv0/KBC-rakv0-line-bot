@@ -65,38 +65,24 @@ async function sendToTarget(
 	text: string,
 ): Promise<"sent" | "stopped" | "unavailable"> {
 	if (permissionStore.isBotStopped(target)) return "stopped";
-	if (target.kind === "square") {
-		if (!await prepareSquareTargetBestEffort(client, target.chatMid)) return "unavailable";
-		try {
-			await lineApiQueue.run(
-				"event-push:square",
-				() => client.base.square.sendMessage({ squareChatMid: target.chatMid, text }),
-				{
-					priority: "critical",
-					scope: lineApiNotificationScope("square", target.chatMid),
-				},
-			);
-			markSquareChatAccessible(client, target.chatMid);
-		} catch (error) {
-			if (pauseSquareChatAccess(client, target.chatMid, error, "event-push:send")) {
-				return "unavailable";
-			}
-			throw error;
+	if (target.kind !== "square") return "unavailable";
+	if (!await prepareSquareTargetBestEffort(client, target.chatMid)) return "unavailable";
+	try {
+		await lineApiQueue.run(
+			"event-push:square",
+			() => client.base.square.sendMessage({ squareChatMid: target.chatMid, text }),
+			{
+				priority: "critical",
+				scope: lineApiNotificationScope("square", target.chatMid),
+			},
+		);
+		markSquareChatAccessible(client, target.chatMid);
+	} catch (error) {
+		if (pauseSquareChatAccess(client, target.chatMid, error, "event-push:send")) {
+			return "unavailable";
 		}
-		return "sent";
+		throw error;
 	}
-	await lineApiQueue.run(
-		"event-push:talk",
-		() => client.base.talk.sendMessage({
-			to: target.chatMid,
-			text,
-			e2ee: target.encrypted,
-		}),
-		{
-			priority: "critical",
-			scope: lineApiNotificationScope("talk", target.chatMid),
-		},
-	);
 	return "sent";
 }
 

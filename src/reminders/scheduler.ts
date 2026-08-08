@@ -27,33 +27,18 @@ function reminderMessage(reminder: PushReminder): { text: string; contentMetadat
 
 async function sendReminder(client: Client, reminder: PushReminder): Promise<"sent" | "stopped"> {
 	if (permissionStore.isBotStopped(reminder)) return "stopped";
+	if (reminder.kind !== "square") return "stopped";
 	const { text, contentMetadata } = reminderMessage(reminder);
-	if (reminder.kind === "square") {
-		await lineApiQueue.run(
-			"reminder:square",
-			() => client.base.square.sendMessage({
-				squareChatMid: reminder.chatMid,
-				text,
-				contentMetadata,
-			}),
-			{
-				priority: "critical",
-				scope: lineApiNotificationScope("square", reminder.chatMid),
-			},
-		);
-		return "sent";
-	}
 	await lineApiQueue.run(
-		"reminder:talk",
-		() => client.base.talk.sendMessage({
-			to: reminder.chatMid,
+		"reminder:square",
+		() => client.base.square.sendMessage({
+			squareChatMid: reminder.chatMid,
 			text,
 			contentMetadata,
-			e2ee: reminder.encrypted,
 		}),
 		{
 			priority: "critical",
-			scope: lineApiNotificationScope("talk", reminder.chatMid),
+			scope: lineApiNotificationScope("square", reminder.chatMid),
 		},
 	);
 	return "sent";

@@ -80,7 +80,7 @@ function adminHelpText(): string {
 		"!oc media / !oc media del",
 		"  画像/動画連投削除のON/OFF",
 		"!oc mute @ユーザー 170",
-		"  指定したメンバーの発言を170分間削除",
+		"  指定したメンバーの発言を170分間削除（OC管理者/BOTモデレーター以上）",
 		"!oc mute @ユーザー 8/7-0:17 / inf",
 		"  JSTの終了日時、または手動解除までミュート",
 		"!oc mute list / !oc mute @ユーザー del",
@@ -380,6 +380,7 @@ function setupStatusLines(squareMid: string): string[] {
 		}`,
 		`短時間一斉参加監視: ${enabledText(settings.joinCohortWatchEnabled)}`,
 		`ミュート中: ${settings.mutes.length}人`,
+		`本OC: ${settings.mainChatMid ? `設定済み (${shortId(settings.mainChatMid)})` : "未設定"}`,
 		`副官部屋: ${settings.modRoomChatMid ? `設定済み (${shortId(settings.modRoomChatMid)})` : "未設定"}`,
 		`即抜け記録: 参加 ${activity.lastJoinAt ? formatJst(activity.lastJoinAt) : "未記録"} / 退会 ${activity.lastLeaveAt ? formatJst(activity.lastLeaveAt) : "未記録"}`,
 		`即抜け追跡: ${activity.activeMembers}人 / 記録 ${activity.records}人`,
@@ -440,6 +441,22 @@ async function canManageOpenChatSettings(command: Parameters<LineCommand["execut
 		return roleRank(member.squareMember.role) >= roleRank("CO_ADMIN");
 	} catch (error) {
 		console.warn(`[oc] failed to resolve setting actor role for ${message.destination.senderMid}`, error);
+		return false;
+	}
+}
+
+async function canManageOpenChatMute(command: Parameters<LineCommand["execute"]>[0]): Promise<boolean> {
+	const { message } = command;
+	const currentTarget = targetFromDestination(message.destination);
+	if (currentTarget && permissionStore.hasAtLeast(currentTarget, message.destination.senderMid, "mod")) return true;
+	if (message.destination.kind !== "square") return false;
+	try {
+		const member = await message.client.base.square.getSquareMember({
+			squareMemberMid: message.destination.senderMid,
+		});
+		return roleRank(member.squareMember.role) >= roleRank("ADMIN");
+	} catch (error) {
+		console.warn(`[oc] failed to resolve mute actor role for ${message.destination.senderMid}`, error);
 		return false;
 	}
 }
@@ -1128,6 +1145,7 @@ function setupMenuText(squareMid: string): string {
 		"8. 自動処理系をOFF（副官部屋は維持）",
 		"9. 現在の設定を確認",
 		"10. 危険語処分時に原因メッセージをLINEへ自動通報（SCAM）",
+		"11. 本OCとして保存するトークを番号で選択",
 		"",
 		"現在:",
 		...setupStatusLines(squareMid),
@@ -1242,6 +1260,11 @@ async function applySetupSelection(
 			applyJoinCohort(false);
 		} else if (number === 9) {
 			lines.push("", "現在:", ...setupStatusLines(squareMid));
+		} else if (number === 11) {
+			if (disable) {
+				const result = ocModerationSettingsStore.clearMainChat(squareMid, actorMid);
+				lines.push(result === "unchanged" ? "本OC: 変更なし（未設定）" : "本OC設定: 解除");
+			}
 		} else {
 			lines.push(`${number}: 対応していない番号です。`);
 		}
@@ -1466,6 +1489,16 @@ interface MemberMessageTargetSelectionSession {
 const MEMBER_MESSAGE_SELECTION_TTL_MS = 10 * 60_000;
 const memberMessageTargetSessions = new Map<string, MemberMessageTargetSelectionSession>();
 
+interface MainChatTargetSelectionSession {
+	squareMid: string;
+	promptChatMid: string;
+	createdBy: string;
+	expiresAt: number;
+	options: MemberMessageTargetOption[];
+}
+
+const mainChatTargetSessions = new Map<string, MainChatTargetSelectionSession>();
+
 function isMainSquareChatType(type: SquareRole): boolean {
 	return type === 4 || type === "SQUARE_DEFAULT";
 }
@@ -1566,7 +1599,7 @@ async function addSquareChatOption(
 }
 
 async function addSquareChatByMid(
-	command: Parameters<LineCommand["execute"]>[0],
+	message: ReplyableLineMessage,
 	options: Map<string, MemberMessageTargetOption>,
 	squareMid: string,
 	squareChatMid: string | undefined,
@@ -1575,7 +1608,7 @@ async function addSquareChatByMid(
 ): Promise<void> {
 	if (!squareChatMid || (options.has(squareChatMid) && !extra.fallbackName && extra.type === undefined)) return;
 	try {
-		const response = await command.message.client.base.square.getSquareChat({ squareChatMid });
+		const response = await message.client.base.square.getSquareChat({ squareChatMid });
 		await addSquareChatOption(options, (response as { squareChat?: unknown }).squareChat, squareMid, mode, extra);
 	} catch (error) {
 		console.warn("[oc] failed to resolve member message target chat", { squareChatMid, mode, error });
@@ -1583,14 +1616,14 @@ async function addSquareChatByMid(
 }
 
 async function addDefaultSquareChatOption(
-	command: Parameters<LineCommand["execute"]>[0],
+	message: ReplyableLineMessage,
 	options: Map<string, MemberMessageTargetOption>,
 	squareMid: string,
 	fromSquareChatMid: string,
 	mode: MemberMessageMode,
 ): Promise<void> {
 	try {
-		const response = await command.message.client.base.livetalk.getSquareInfoByChatMid({
+		const response = await message.client.base.livetalk.getSquareInfoByChatMid({
 			request: { squareChatMid: fromSquareChatMid },
 		});
 		const raw = response as { defaultChatMid?: unknown; squareName?: unknown };
@@ -1598,7 +1631,7 @@ async function addDefaultSquareChatOption(
 		if (!defaultChatMid) return;
 
 		const fallbackName = valueString(raw.squareName) ?? "本OC";
-		await addSquareChatByMid(command, options, squareMid, defaultChatMid, mode, {
+		await addSquareChatByMid(message, options, squareMid, defaultChatMid, mode, {
 			fallbackName,
 			type: "SQUARE_DEFAULT",
 		});
@@ -1622,10 +1655,9 @@ async function addDefaultSquareChatOption(
 }
 
 async function memberMessageTargetOptions(
-	command: Parameters<LineCommand["execute"]>[0],
+	message: ReplyableLineMessage,
 	mode: MemberMessageMode,
 ): Promise<MemberMessageTargetOption[]> {
-	const { message } = command;
 	const squareMid = message.destination.scopeMid;
 	const options = new Map<string, MemberMessageTargetOption>();
 	try {
@@ -1651,12 +1683,25 @@ async function memberMessageTargetOptions(
 		console.warn("[oc] failed to fetch joined square chats", error);
 	}
 
-	await addDefaultSquareChatOption(command, options, squareMid, message.destination.chatMid, mode);
-	await addSquareChatByMid(command, options, squareMid, message.destination.chatMid, mode);
+	await addDefaultSquareChatOption(message, options, squareMid, message.destination.chatMid, mode);
+	await addSquareChatByMid(message, options, squareMid, message.destination.chatMid, mode);
 	const settings = ocModerationSettingsStore.snapshot(squareMid);
-	await addSquareChatByMid(command, options, squareMid, settings.modRoomChatMid, mode);
+	await addSquareChatByMid(message, options, squareMid, settings.modRoomChatMid, mode);
+	await addSquareChatByMid(message, options, squareMid, settings.mainChatMid, mode, {
+		fallbackName: "本OC",
+		type: "SQUARE_DEFAULT",
+	});
+	if (settings.mainChatMid && !options.has(settings.mainChatMid)) {
+		options.set(settings.mainChatMid, {
+			squareMid,
+			squareChatMid: settings.mainChatMid,
+			name: "本OC",
+			type: "SQUARE_DEFAULT",
+			configured: Boolean(memberMessageSetting(mode, settings.mainChatMid)),
+		});
+	}
 	for (const setting of memberMessageSettings(mode).filter((item) => item.squareMid === squareMid)) {
-		await addSquareChatByMid(command, options, squareMid, setting.squareChatMid, mode);
+		await addSquareChatByMid(message, options, squareMid, setting.squareChatMid, mode);
 	}
 
 	const sorted = [...options.values()]
@@ -1686,15 +1731,22 @@ function cleanupMemberMessageTargetSessions(): void {
 	for (const [messageId, session] of memberMessageTargetSessions) {
 		if (session.expiresAt <= now) memberMessageTargetSessions.delete(messageId);
 	}
+	for (const [messageId, session] of mainChatTargetSessions) {
+		if (session.expiresAt <= now) mainChatTargetSessions.delete(messageId);
+	}
+}
+
+function selectedChatTarget(options: MemberMessageTargetOption[], text: string): MemberMessageTargetOption | undefined {
+	const normalized = text.normalize("NFKC").trim().toLowerCase();
+	const number = Number(normalized.match(/^\d+/)?.[0] ?? Number.NaN);
+	if (Number.isInteger(number) && number >= 1 && number <= options.length) {
+		return options[number - 1];
+	}
+	return undefined;
 }
 
 function selectedMemberTarget(session: MemberMessageTargetSelectionSession, text: string): MemberMessageTargetOption | undefined {
-	const normalized = text.normalize("NFKC").trim().toLowerCase();
-	const number = Number(normalized.match(/^\d+/)?.[0] ?? Number.NaN);
-	if (Number.isInteger(number) && number >= 1 && number <= session.options.length) {
-		return session.options[number - 1];
-	}
-	return undefined;
+	return selectedChatTarget(session.options, text);
 }
 
 async function applyMemberMessageSetting(
@@ -1749,7 +1801,7 @@ async function sendMemberMessageTargetSelection(
 ): Promise<void> {
 	const { message } = command;
 	const labels = MEMBER_MESSAGE_LABELS[mode];
-	const options = await memberMessageTargetOptions(command, mode);
+	const options = await memberMessageTargetOptions(message, mode);
 	if (options.length === 0) {
 		await message.send(`送信先候補を取得できませんでした。対象トーク本体で !oc ${labels.command} を実行してください。`);
 		return;
@@ -1777,6 +1829,34 @@ async function sendMemberMessageTargetSelection(
 	});
 }
 
+async function sendMainChatTargetSelection(
+	message: ReplyableLineMessage,
+): Promise<void> {
+	const options = await memberMessageTargetOptions(message, "join");
+	if (options.length === 0) {
+		await message.send("本OC候補を取得できませんでした。botが本OCまたはサブOCに参加しているか確認してください。");
+		return;
+	}
+	const sentId = await message.send([
+		"本OCとして保存するトークを選択してください。",
+		"このメッセージに番号でリプライすると、GitHub保存対象と即抜け監視の本OCを設定します。",
+		"",
+		...options.map((option, index) => memberTargetLine(option, index)),
+	].join("\n"));
+	if (!sentId) {
+		await message.send("選択メッセージIDを取得できなかったため、もう一度 !oc setup を実行してください。");
+		return;
+	}
+	cleanupMemberMessageTargetSessions();
+	mainChatTargetSessions.set(sentId, {
+		squareMid: message.destination.scopeMid,
+		promptChatMid: message.destination.chatMid,
+		createdBy: message.destination.senderMid,
+		expiresAt: Date.now() + MEMBER_MESSAGE_SELECTION_TTL_MS,
+		options,
+	});
+}
+
 async function sendMemberMessageStatus(
 	command: Parameters<LineCommand["execute"]>[0],
 	mode: MemberMessageMode,
@@ -1784,7 +1864,7 @@ async function sendMemberMessageStatus(
 	const { message } = command;
 	const labels = MEMBER_MESSAGE_LABELS[mode];
 	const current = memberMessageSetting(mode, message.destination.chatMid);
-	const currentTarget = (await memberMessageTargetOptions(command, mode)).find((option) =>
+	const currentTarget = (await memberMessageTargetOptions(message, mode)).find((option) =>
 		option.squareChatMid === message.destination.chatMid
 	);
 	if (!current) {
@@ -1834,7 +1914,7 @@ async function executeMemberMessage(command: Parameters<LineCommand["execute"]>[
 	const target: MemberMessageTargetOption = {
 		squareMid: message.destination.scopeMid,
 		squareChatMid: message.destination.chatMid,
-		name: (await memberMessageTargetOptions(command, mode)).find((option) => option.squareChatMid === message.destination.chatMid)
+		name: (await memberMessageTargetOptions(message, mode)).find((option) => option.squareChatMid === message.destination.chatMid)
 			?.name ?? "このトーク",
 		type: undefined,
 		configured: Boolean(memberMessageSetting(mode, message.destination.chatMid)),
@@ -1844,6 +1924,7 @@ async function executeMemberMessage(command: Parameters<LineCommand["execute"]>[
 
 export async function handleOcSetupReply(messageText: string, message: ReplyableLineMessage): Promise<boolean> {
 	if (message.destination.kind !== "square" || !message.replyToMessageId) return false;
+	cleanupMemberMessageTargetSessions();
 	const targetSession = memberMessageTargetSessions.get(message.replyToMessageId);
 	if (targetSession) {
 		const labels = MEMBER_MESSAGE_LABELS[targetSession.mode];
@@ -1868,6 +1949,36 @@ export async function handleOcSetupReply(messageText: string, message: Replyable
 		await applyMemberMessageSetting(message, targetSession.parsed, target, targetSession.mode);
 		return true;
 	}
+	const mainTargetSession = mainChatTargetSessions.get(message.replyToMessageId);
+	if (mainTargetSession) {
+		if (
+			mainTargetSession.squareMid !== message.destination.scopeMid ||
+			mainTargetSession.promptChatMid !== message.destination.chatMid
+		) return false;
+		if (!await canRunOpenChatSetupMessage(message)) {
+			await message.send(setupPermissionDeniedText());
+			return true;
+		}
+		const target = selectedChatTarget(mainTargetSession.options, messageText);
+		if (!target) {
+			await message.send("番号で指定してください。");
+			return true;
+		}
+		mainChatTargetSessions.delete(message.replyToMessageId);
+		const result = ocModerationSettingsStore.setMainChat(
+			mainTargetSession.squareMid,
+			target.squareChatMid,
+			message.destination.senderMid,
+		);
+		await ocModerationSettingsStore.flush();
+		await message.send([
+			result === "unchanged" ? "本OC設定は変更ありません。" : "本OCを設定しました。",
+			`選択: ${target.name}`,
+			`MID: ${target.squareChatMid}`,
+			"GitHub保存対象と即抜け監視の本OCに使用します。",
+		].join("\n"));
+		return true;
+	}
 	const session = ocModerationSettingsStore.findSetupSession(
 		message.replyToMessageId,
 		message.destination.scopeMid,
@@ -1884,7 +1995,23 @@ export async function handleOcSetupReply(messageText: string, message: Replyable
 		await message.send("番号を指定してください。例: 1 2 3 / off 1 2 / 9");
 		return true;
 	}
-	await message.send(await applySetupSelection(message, selection.numbers, selection.disable));
+	const wantsMainChatSelection = selection.numbers.includes(11);
+	const regularNumbers = selection.numbers.filter((number) => number !== 11);
+	if (regularNumbers.length > 0) {
+		await message.send(await applySetupSelection(message, regularNumbers, selection.disable));
+	}
+	if (wantsMainChatSelection) {
+		if (selection.disable) {
+			const result = ocModerationSettingsStore.clearMainChat(
+				message.destination.scopeMid,
+				message.destination.senderMid,
+			);
+			await ocModerationSettingsStore.flush();
+			await message.send(result === "unchanged" ? "本OCは未設定です。" : "本OC設定を解除しました。");
+		} else {
+			await sendMainChatTargetSelection(message);
+		}
+	}
 	return true;
 }
 
@@ -2043,8 +2170,8 @@ async function executeMute(command: Parameters<LineCommand["execute"]>[0]): Prom
 		await message.send("このコマンドはOpenChatで実行してください。");
 		return;
 	}
-	if (!await canManageOpenChatSettings(command)) {
-		await message.send("実行権限がありません。BOT管理者/モデレーター、またはこのOCの管理者/副官のみ実行できます。");
+	if (!await canManageOpenChatMute(command)) {
+		await message.send("実行権限がありません。OC管理者、またはBOTモデレーター以上のみ実行できます。");
 		return;
 	}
 

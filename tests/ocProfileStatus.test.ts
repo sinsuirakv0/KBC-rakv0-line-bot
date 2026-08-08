@@ -5,7 +5,7 @@ import { OcProfileStatusManager } from "../src/runtime/ocProfileStatus.js";
 const SQUARE_MID = "s00000000000000000000000000000000";
 const MEMBER_MID = "p00000000000000000000000000000000";
 
-test("OC profile status restores the base name and applies state suffixes", async () => {
+test("OC profile status restores the base name and only applies restart or stop suffixes", async () => {
 	const updates: string[] = [];
 	const member = {
 		squareMemberMid: MEMBER_MID,
@@ -51,10 +51,6 @@ test("OC profile status restores the base name and applies state suffixes", asyn
 	await manager.bind(client as never, storage as never);
 	assert.deepEqual(updates, ["超健康bot Munin"]);
 
-	manager.setEnergySaving(SQUARE_MID, true);
-	await manager.flush();
-	assert.equal(updates.at(-1), "超健康bot Munin (省エネ中)");
-
 	await manager.setGlobalStatus("stopped");
 	assert.equal(updates.at(-1), "超健康bot Munin (停止中)");
 
@@ -62,5 +58,5 @@ test("OC profile status restores the base name and applies state suffixes", asyn
 	assert.equal(updates.at(-1), "超健康bot Munin (停止中)");
 
 	await manager.setGlobalStatus(undefined);
-	assert.equal(updates.at(-1), "超健康bot Munin (省エネ中)");
+	assert.equal(updates.at(-1), "超健康bot Munin");
 });

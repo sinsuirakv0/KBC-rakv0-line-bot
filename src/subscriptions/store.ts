@@ -99,7 +99,11 @@ class PushSubscriptionStore {
 	}
 
 	list(): PushSubscription[] {
-		return this.data.subscriptions.map((item) => ({ ...item }));
+		// 旧来の個人・グループ登録は保存したまま無効化する。誤送信を防ぎつつ、
+		// 将来的なデータ移行時に手作業で参照できるようにする。
+		return this.data.subscriptions
+			.filter((item) => item.kind === "square")
+			.map((item) => ({ ...item }));
 	}
 
 	has(destination: Pick<LineDestination, "kind" | "chatMid">): boolean {
@@ -108,15 +112,13 @@ class PushSubscriptionStore {
 	}
 
 	async subscribe(destination: LineDestination): Promise<boolean> {
-		if (destination.chatType === "USER") {
-			throw new Error("個人チャットはスケジュール更新通知の通知先に登録できません");
-		}
+		if (destination.kind !== "square") throw new Error("このBOTはOpenChatでのみ利用できます");
 		const key = targetKey(destination);
 		if (this.data.subscriptions.some((item) => targetKey(item) === key)) return false;
 		this.data.subscriptions.push({
 			kind: destination.kind,
 			chatMid: destination.chatMid,
-			chatType: destination.chatType,
+			chatType: "SQUARE",
 			encrypted: destination.encrypted,
 			registeredBy: destination.senderMid,
 			registeredAt: new Date().toISOString(),

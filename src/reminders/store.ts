@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+﻿import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { LineDestination } from "../commands/shared.js";
@@ -97,7 +97,7 @@ class PushReminderStore {
 	listDue(now: Date): PushReminder[] {
 		const nowMs = now.getTime();
 		return this.data.reminders
-			.filter((item) => Date.parse(item.remindAt) <= nowMs)
+			.filter((item) => item.kind === "square" && Date.parse(item.remindAt) <= nowMs)
 			.map((item) => ({ ...item }));
 	}
 
@@ -106,6 +106,7 @@ class PushReminderStore {
 		remindAt: Date;
 		message: string;
 	}): Promise<PushReminder> {
+		if (input.destination.kind !== "square") throw new Error("このBOTはOpenChatでのみ利用できます");
 		const reminder: PushReminder = {
 			id: randomUUID(),
 			kind: input.destination.kind,

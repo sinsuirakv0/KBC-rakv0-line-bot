@@ -1,4 +1,4 @@
-import fs from "node:fs/promises";
+﻿import fs from "node:fs/promises";
 import path from "node:path";
 import type { LineDestination } from "../commands/shared.js";
 import { appConfig } from "../config.js";
@@ -110,14 +110,17 @@ class EventPushStore {
 	}
 
 	list(): EventPushSubscription[] {
-		return this.subscriptions.subscriptions.map((item) => ({
+		return this.subscriptions.subscriptions
+			.filter((item) => item.kind === "square")
+			.map((item) => ({
 			...item,
 			eventIds: [...item.eventIds],
 			advanceMinutesByEvent: { ...item.advanceMinutesByEvent },
-		}));
+			}));
 	}
 
 	get(destination: Pick<LineDestination, "kind" | "chatMid">): EventPushSubscription | undefined {
+		if (destination.kind !== "square") return undefined;
 		const key = targetKey(destination);
 		const found = this.subscriptions.subscriptions.find((item) => targetKey(item) === key);
 		return found
@@ -243,6 +246,7 @@ class EventPushStore {
 		allEvents: boolean,
 		daily: boolean,
 	): Promise<void> {
+		if (destination.kind !== "square") throw new Error("このBOTはOpenChatでのみ利用できます");
 		const key = targetKey(destination);
 		const value: EventPushSubscription = {
 			kind: destination.kind,

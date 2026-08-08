@@ -483,7 +483,7 @@ async function executeBotControl(
 			await permissionStore.flush();
 			await ocProfileStatusManager.setGlobalStatus("stopped");
 			await message.send(result === "stopped"
-				? "全体停止しました。全てのトークルーム/個人チャットでbotは動作しません。"
+				? "全体停止しました。全てのOpenChatでbotは動作しません。"
 				: "すでに全体停止中です。");
 			return;
 		}
@@ -753,7 +753,7 @@ export const botCommand: LineCommand = {
 			`メモリ使用率: ${(status.systemUsedRatio * 100).toFixed(1)}%`,
 			`プロセスRSS: ${formatBytes(status.rssBytes)}`,
 			`ヒープ: ${formatBytes(status.heapUsedBytes)} / ${formatBytes(status.heapTotalBytes)}`,
-			`Talk受信: ${formatReceiverHealth(receiverHealth.talk)}`,
+			"個人・グループ受信: 無効（OC専用）",
 			`OC受信: ${formatReceiverHealth(receiverHealth.square)}`,
 			`参加/退出通知監視: ${formatMemberMessageHealth(receiverHealth.memberMessage)}`,
 			`このプロセスの再ログイン回数: ${Math.max(0, receiverHealth.sessionStarts - 1)}`,

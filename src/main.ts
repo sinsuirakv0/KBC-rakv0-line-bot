@@ -49,7 +49,6 @@ import {
 	type TalkSyncResponse,
 } from "./runtime/talkSync.js";
 import { lineApiQueue } from "./runtime/lineApiQueue.js";
-import { ocPollingActivity } from "./runtime/ocPollingPolicy.js";
 import { ocProfileStatusManager } from "./runtime/ocProfileStatus.js";
 import { markSquareChatAccessible } from "./runtime/squareChatAccess.js";
 import { ForegroundQueueFullError, runtimeWorkload } from "./runtime/workload.js";
@@ -834,13 +833,6 @@ async function handleSquareMessage(
 		threadMid,
 		chatMid,
 	);
-	const sourceCreatedAt = rawMessage?.createdTime === undefined
-		? Date.now()
-		: Number(rawMessage.createdTime);
-	ocPollingActivity.recordMessage(
-		target.destination.scopeMid,
-		Number.isFinite(sourceCreatedAt) ? sourceCreatedAt : Date.now(),
-	);
 	ocModerationSettingsStore.rememberLeftSoonSourceChat(
 		target.destination.scopeMid,
 		target.destination.chatMid,
@@ -904,7 +896,6 @@ async function handleSquareMessage(
 		return;
 	}
 	if (threadMid) recordSquareHandlerDebug(`square command dispatch id=${rawMessage?.id ?? "(none)"} text=${shortDebugText(squareText)}`);
-	ocPollingActivity.recordCommand(target.destination.scopeMid);
 	await dispatchText("square", squareText, target);
 	void resolveSenderName(client, "square", message.from.id)
 		.then((name) => {
@@ -2263,7 +2254,9 @@ async function runSession(
 		return supervisor;
 	};
 
-	if (appConfig.enableTalk) {
+	if (!appConfig.enableTalk) {
+		console.log("[app] OpenChat-only mode: Talk receiver disabled");
+	} else {
 		startReceiver(
 			"talk",
 			1_000,

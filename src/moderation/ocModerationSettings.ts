@@ -15,6 +15,9 @@ export interface OcModerationSetting {
 	mediaBurstDeleteEnabled: boolean;
 	leftSoonMonitoringEnabled: boolean;
 	leftSoonSourceChatMid?: string;
+	mainChatMid?: string;
+	mainChatSetAt?: string;
+	mainChatSetBy?: string;
 	dangerWordAutoKickEnabled: boolean;
 	dangerWordAutoReportEnabled: boolean;
 	joinCohortWatchEnabled: boolean;
@@ -78,6 +81,9 @@ function emptySetting(squareMid: string): OcModerationSetting {
 		mediaBurstDeleteEnabled: false,
 		leftSoonMonitoringEnabled: false,
 		leftSoonSourceChatMid: undefined,
+		mainChatMid: undefined,
+		mainChatSetAt: undefined,
+		mainChatSetBy: undefined,
 		dangerWordAutoKickEnabled: false,
 		dangerWordAutoReportEnabled: false,
 		joinCohortWatchEnabled: false,
@@ -189,6 +195,9 @@ function parseSettings(value: unknown): OcModerationSettingsFile {
 			leftSoonSourceChatMid: typeof item.leftSoonSourceChatMid === "string"
 				? item.leftSoonSourceChatMid
 				: undefined,
+			mainChatMid: typeof item.mainChatMid === "string" ? item.mainChatMid : undefined,
+			mainChatSetAt: typeof item.mainChatSetAt === "string" ? item.mainChatSetAt : undefined,
+			mainChatSetBy: typeof item.mainChatSetBy === "string" ? item.mainChatSetBy : undefined,
 			dangerWordAutoKickEnabled: item.dangerWordAutoKickEnabled === true,
 			dangerWordAutoReportEnabled: item.dangerWordAutoReportEnabled === true,
 			joinCohortWatchEnabled: item.joinCohortWatchEnabled === true,
@@ -478,6 +487,31 @@ class OcModerationSettingsStore {
 		setting.updatedBy = updatedBy;
 		this.scheduleSave();
 		return "set";
+	}
+
+	setMainChat(squareMid: string, squareChatMid: string, updatedBy: string): "set" | "unchanged" {
+		const setting = this.ensureSetting(squareMid, updatedBy);
+		if (setting.mainChatMid === squareChatMid) return "unchanged";
+		const updatedAt = nowIso();
+		setting.mainChatMid = squareChatMid;
+		setting.mainChatSetAt = updatedAt;
+		setting.mainChatSetBy = updatedBy;
+		setting.updatedAt = updatedAt;
+		setting.updatedBy = updatedBy;
+		this.scheduleSave();
+		return "set";
+	}
+
+	clearMainChat(squareMid: string, updatedBy: string): "cleared" | "unchanged" {
+		const setting = this.data.settings.find((item) => item.squareMid === squareMid);
+		if (!setting?.mainChatMid) return "unchanged";
+		setting.mainChatMid = undefined;
+		setting.mainChatSetAt = undefined;
+		setting.mainChatSetBy = undefined;
+		setting.updatedAt = nowIso();
+		setting.updatedBy = updatedBy;
+		this.scheduleSave();
+		return "cleared";
 	}
 
 	clearModRoom(squareMid: string, updatedBy: string): "cleared" | "unchanged" {

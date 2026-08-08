@@ -1,8 +1,7 @@
 ﻿import type { Client } from "@evex/linejs";
 import type { SyncedLineStorage } from "../storage/lineStorage.js";
 import { lineHealth } from "../runtime/lineHealth.js";
-import { ocPollingActivity, type OcPollingMode } from "../runtime/ocPollingPolicy.js";
-import { ocProfileStatusManager } from "../runtime/ocProfileStatus.js";
+import { fixedOcPollingDecision } from "../runtime/ocPollingPolicy.js";
 import {
 	isSquareChatAccessPaused,
 	markSquareChatAccessible,
@@ -27,21 +26,19 @@ interface ChatPollingState {
 	ignoreBefore: number;
 	retryAfter: number;
 	nextPollAt: number;
-	mode?: OcPollingMode;
-	intervalMs?: number;
 }
 
 interface WatchedMemberMessageChat {
 	squareMid: string;
 	squareChatMid: string;
 	updatedAt: string;
-	featuresEnabled: boolean;
 }
 
 const ERROR_RETRY_MS = 30_000;
 const WATCH_SETTINGS_REFRESH_MS = 60_000;
 const LOOP_MAX_SLEEP_MS = 1_000;
 const LOOP_MIN_SLEEP_MS = 100;
+const MEMBER_POLL_INTERVAL_MS = fixedOcPollingDecision().intervalMs;
 
 function rawObject(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value)
@@ -335,13 +332,9 @@ function mergeWatchedChats(settings: WatchedMemberMessageChat[]): WatchedMemberM
 			continue;
 		}
 		if (Number.isFinite(nextAt) && nextAt > currentAt) {
-			byChatMid.set(setting.squareChatMid, {
-				...setting,
-				featuresEnabled: current.featuresEnabled || setting.featuresEnabled,
-			});
+			byChatMid.set(setting.squareChatMid, { ...setting });
 			continue;
 		}
-		current.featuresEnabled = current.featuresEnabled || setting.featuresEnabled;
 	}
 	return [...byChatMid.values()];
 }
@@ -356,7 +349,6 @@ function configuredMemberMessageChats(): WatchedMemberMessageChat[] {
 			squareMid: setting.squareMid,
 			squareChatMid: setting.squareChatMid,
 			updatedAt: setting.updatedAt,
-			featuresEnabled: true,
 		})),
 	);
 }
@@ -401,6 +393,7 @@ function leftSoonSourceChatMids(
 	configured: WatchedMemberMessageChat[],
 ): string[] {
 	const mids = new Set<string>();
+	if (setting.mainChatMid) mids.add(setting.mainChatMid);
 	if (setting.leftSoonSourceChatMid) mids.add(setting.leftSoonSourceChatMid);
 	if (setting.modRoomChatMid) mids.add(setting.modRoomChatMid);
 	for (const chat of configured) {
@@ -428,7 +421,6 @@ async function discoverModerationMonitoringChats(
 				squareMid: setting.squareMid,
 				squareChatMid,
 				updatedAt: setting.updatedAt,
-				featuresEnabled: setting.leftSoonMonitoringEnabled || Boolean(setting.modRoomChatMid),
 			});
 			continue;
 		}
@@ -488,18 +480,6 @@ export async function listenOpenChatJoinMessageEvents(
 			states.delete(squareChatMid);
 			await storage.clearSquareChatSyncToken(squareChatMid).catch(() => {});
 		}
-		const energyBySquare = new Map<string, boolean>();
-		for (const setting of settings) {
-			const decision = ocPollingActivity.decision(setting.squareMid, setting.featuresEnabled);
-			const current = energyBySquare.get(setting.squareMid);
-			energyBySquare.set(
-				setting.squareMid,
-				current === undefined ? decision.energySaving : current && decision.energySaving,
-			);
-		}
-		for (const [squareMid, energySaving] of energyBySquare) {
-			ocProfileStatusManager.setEnergySaving(squareMid, energySaving);
-		}
 		for (const setting of settings) {
 			let state = states.get(setting.squareChatMid);
 			if (!state) {
@@ -516,27 +496,9 @@ export async function listenOpenChatJoinMessageEvents(
 					persistedSyncToken: Boolean(state.syncToken),
 				});
 			}
-			const decision = ocPollingActivity.decision(
-				setting.squareMid,
-				setting.featuresEnabled,
-			);
-			if (state.mode !== decision.mode) {
-				if (state.intervalMs === undefined || decision.intervalMs < state.intervalMs) {
-					state.nextPollAt = 0;
-				}
-				console.log("[oc-member-message:chat-poll] mode changed", {
-					squareMid: setting.squareMid,
-					squareChatMid: setting.squareChatMid,
-					mode: decision.mode,
-					intervalMs: decision.intervalMs,
-					recentMessageCount: decision.recentMessageCount,
-				});
-				state.mode = decision.mode;
-				state.intervalMs = decision.intervalMs;
-			}
 			if (Date.now() >= state.nextPollAt) {
 				await pollChat(client, storage, setting, state);
-				state.nextPollAt = Date.now() + decision.intervalMs;
+				state.nextPollAt = Date.now() + MEMBER_POLL_INTERVAL_MS;
 			}
 			if (signal.aborted) break;
 		}

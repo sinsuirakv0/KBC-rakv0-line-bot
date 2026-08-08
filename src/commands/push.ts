@@ -32,11 +32,11 @@ function pushHelpText(): string {
 		"!push status",
 		"  このトークの通知設定を表示します。スケジュール更新通知とイベント開始通知の両方を確認できます。",
 		"!push skd",
-		"  このグループ/OCを、gatya/sale/item更新検知の通知先に登録します。個人チャットは登録できません。",
+		"  このOCを、gatya/sale/item更新検知の通知先に登録します。",
 		"!push skd del",
 		"  このトークのスケジュール更新通知を解除します。",
 		"!push event",
-		"  この個人/グループ/OCを、イベント開始通知先として登録します。",
+		"  このOCを、イベント開始通知先として登録します。",
 		"!push event <イベントID> [-分数]",
 		"  通知するイベントIDを追加します。開催時刻と終了10分前に通知します。",
 		"  -5 のように指定すると、開催5分前の通知も追加します。再指定すると上書きします。",
@@ -100,6 +100,10 @@ export const pushCommand: LineCommand = {
 		priority: "high",
 	},
 	async execute({ message, args }) {
+		if (message.destination.kind !== "square") {
+			await message.send("このBOTはOpenChatでのみ利用できます。");
+			return;
+		}
 		const action = args[0]?.toLowerCase();
 		if (action === "help") {
 			await message.send(pushHelpText());
@@ -136,7 +140,7 @@ export const pushCommand: LineCommand = {
 					"!push skd",
 					"",
 					"!push skd",
-					"  このグループ/OCを、gatya/sale/item更新検知の通知先に登録します。",
+					"  このOCを、gatya/sale/item更新検知の通知先に登録します。",
 					"!push skd del",
 					"  このトークのスケジュール更新通知を解除します。",
 					"!push status",
@@ -179,7 +183,7 @@ export const pushCommand: LineCommand = {
 					"!push event",
 					"",
 					"!push event",
-					"  この個人/グループ/OCをイベント開始通知先として登録します。",
+					"  このOCをイベント開始通知先として登録します。",
 					"!push event <イベントID> [-分数]",
 					"  通知するイベントIDを追加します。イベントIDはsale.jsonのstageIdsから判定します。",
 					"  stageIdsに102または112を含む場合、その2ID以外は表示・通知しません。",

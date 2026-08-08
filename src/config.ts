@@ -132,7 +132,8 @@ export const appConfig = {
 		min: 5_000,
 		integer: true,
 	}),
-	enableTalk: boolEnv("ENABLE_TALK", true),
+	// このBOTはOpenChat専用。個人・グループの受信器は環境変数で再有効化しない。
+	enableTalk: false,
 	enableSquare: boolEnv("ENABLE_SQUARE", true),
 	port: Number(process.env.PORT || process.env.EVENT_UPDATE_PORT || 3000),
 	eventUpdateSecret: process.env.EVENT_UPDATE_SECRET || "",
@@ -224,36 +225,8 @@ export const appConfig = {
 		integer: true,
 	}),
 	ocMemberMessageRetryMs: Number(process.env.OC_MEMBER_MESSAGE_RETRY_MS || 5_000),
-	ocMemberPollActiveMs: numberEnv("OC_MEMBER_POLL_ACTIVE_MS", 2_000, {
-		min: 1_000,
-		max: 60_000,
-		integer: true,
-	}),
-	ocMemberPollEcoMs: numberEnv("OC_MEMBER_POLL_ECO_MS", 5_000, {
-		min: 2_000,
-		max: 5 * 60_000,
-		integer: true,
-	}),
-	ocMemberPollInactiveMs: numberEnv("OC_MEMBER_POLL_INACTIVE_MS", 60_000, {
-		min: 5_000,
-		max: 30 * 60_000,
-		integer: true,
-	}),
-	ocMemberPollCommandBoostMs: numberEnv("OC_MEMBER_POLL_COMMAND_BOOST_MS", 5 * 60_000, {
-		min: 60_000,
-		max: 60 * 60_000,
-		integer: true,
-	}),
-	ocMemberPollQuietWindowMs: numberEnv("OC_MEMBER_POLL_QUIET_WINDOW_MS", 10 * 60_000, {
-		min: 60_000,
-		max: 60 * 60_000,
-		integer: true,
-	}),
-	ocMemberPollQuietMessageThreshold: numberEnv("OC_MEMBER_POLL_QUIET_MESSAGE_THRESHOLD", 5, {
-		min: 1,
-		max: 1_000,
-		integer: true,
-	}),
+	// OCの参加・退出イベントは省エネ切替なしで常に2秒間隔で監視する。
+	ocMemberPollIntervalMs: 2_000,
 	ocProfileStatusEnabled: boolEnv("OC_PROFILE_STATUS_ENABLED", true),
 	eventPushSubscriptionsFile: path.resolve(
 		process.env.EVENT_PUSH_SUBSCRIPTIONS_FILE || "./storage/event-push-subscriptions.json",

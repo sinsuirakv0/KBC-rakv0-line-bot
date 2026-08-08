@@ -3,7 +3,7 @@ import { appConfig } from "../config.js";
 import type { SyncedLineStorage } from "../storage/lineStorage.js";
 import { lineApiQueue } from "./lineApiQueue.js";
 
-export type OcProfileStatus = "normal" | "energy-saving" | "restarting" | "stopped";
+export type OcProfileStatus = "normal" | "restarting" | "stopped";
 
 interface SquareMemberRecord {
 	squareMemberMid: string;
@@ -21,7 +21,6 @@ interface StoredProfileNames {
 
 const STORAGE_KEY = "kbcOcProfileNamesV1";
 const STATUS_SUFFIX: Record<Exclude<OcProfileStatus, "normal">, string> = {
-	"energy-saving": " (省エネ中)",
 	restarting: " (再起動中)",
 	stopped: " (停止中)",
 };
@@ -55,7 +54,6 @@ export class OcProfileStatusManager {
 	private storage: SyncedLineStorage | undefined;
 	private readonly members = new Map<string, SquareMemberRecord>();
 	private readonly baseNames = new Map<string, string>();
-	private readonly energySavingSquares = new Set<string>();
 	private globalStatus: "restarting" | "stopped" | undefined;
 	private queue: Promise<void> = Promise.resolve();
 
@@ -81,17 +79,6 @@ export class OcProfileStatusManager {
 		this.members.clear();
 	}
 
-	setEnergySaving(squareMid: string, enabled: boolean): void {
-		const changed = enabled
-			? !this.energySavingSquares.has(squareMid)
-			: this.energySavingSquares.has(squareMid);
-		if (!changed) return;
-		if (enabled) this.energySavingSquares.add(squareMid);
-		else this.energySavingSquares.delete(squareMid);
-		if (!appConfig.ocProfileStatusEnabled) return;
-		void this.enqueue(() => this.applySquare(squareMid));
-	}
-
 	async setGlobalStatus(status: "restarting" | "stopped" | undefined): Promise<void> {
 		if (this.globalStatus === "stopped" && status === "restarting") {
 			await this.queue;
@@ -107,9 +94,9 @@ export class OcProfileStatusManager {
 		await this.queue;
 	}
 
-	private desiredStatus(squareMid: string): OcProfileStatus {
+	private desiredStatus(_squareMid: string): OcProfileStatus {
 		if (this.globalStatus) return this.globalStatus;
-		return this.energySavingSquares.has(squareMid) ? "energy-saving" : "normal";
+		return "normal";
 	}
 
 	private desiredName(squareMid: string): string | undefined {

@@ -52,7 +52,7 @@ export function introText(snapshot: RuntimeEnvironmentSnapshot): string {
 		`CPU: ${displayCpuModel(snapshot.cpuModel)}`,
 		`割り当て: ${displayCpuAllocation(snapshot)} / メモリ${displayMemoryAllocation(snapshot)}`,
 		"保存先: GitHub連携ストレージ",
-		"状態: 省エネでがんばってます",
+		"状態: OC専用でがんばってます",
 		"",
 		"まだ育成途中ですが、健康第一で働きます！",
 		"コマンド一覧は !help をどうぞ。",

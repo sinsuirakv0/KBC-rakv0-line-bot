@@ -95,34 +95,20 @@ async function deliverText(
 	let stopped = 0;
 	const failures: string[] = [];
 	for (const target of pushSubscriptionStore.list()) {
+		if (target.kind !== "square") continue;
 		try {
 			if (permissionStore.isBotStopped(target)) {
 				stopped++;
 				continue;
 			}
-			if (target.kind === "square") {
-				await lineApiQueue.run(
-					"event-update:square",
-					() => client.base.square.sendMessage({ squareChatMid: target.chatMid, text }),
-					{
-						priority: "critical",
-						scope: lineApiNotificationScope("square", target.chatMid),
-					},
-				);
-			} else {
-				await lineApiQueue.run(
-					"event-update:talk",
-					() => client.base.talk.sendMessage({
-						to: target.chatMid,
-						text,
-						e2ee: target.encrypted,
-					}),
-					{
-						priority: "critical",
-						scope: lineApiNotificationScope("talk", target.chatMid),
-					},
-				);
-			}
+			await lineApiQueue.run(
+				"event-update:square",
+				() => client.base.square.sendMessage({ squareChatMid: target.chatMid, text }),
+				{
+					priority: "critical",
+					scope: lineApiNotificationScope("square", target.chatMid),
+				},
+			);
 			sent++;
 		} catch (error) {
 			failures.push(`${target.kind}:${target.chatMid} ${String(error)}`);

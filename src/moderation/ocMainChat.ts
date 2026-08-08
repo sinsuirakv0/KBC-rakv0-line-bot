@@ -5,6 +5,7 @@ import {
 	markSquareChatAccessible,
 	pauseSquareChatAccess,
 } from "../runtime/squareChatAccess.js";
+import { ocModerationSettingsStore } from "./ocModerationSettings.js";
 
 const MAIN_CHAT_CACHE_MS = 6 * 60 * 60_000;
 
@@ -59,6 +60,11 @@ export async function resolveMainSquareChatMid(
 	squareMid: string,
 	sourceChatMid?: string,
 ): Promise<string | undefined> {
+	const configuredMainChatMid = ocModerationSettingsStore.snapshot(squareMid).mainChatMid;
+	if (configuredMainChatMid) {
+		// GitHubから復元した設定をAPI探索より優先し、サブOCを本OCと誤認しない。
+		return cacheMainChatMid(client, squareMid, configuredMainChatMid);
+	}
 	const cached = cacheFor(client).get(squareMid);
 	if (cached && cached.expiresAt > Date.now()) return cached.chatMid;
 	if (!sourceChatMid) return undefined;
